@@ -1,0 +1,10 @@
+.env
+credentials.json
+__pycache__/
+*.pyc
+data/
+*.json
+!requirements.txt
+*.tar.gz
+*.tar
+venv/
