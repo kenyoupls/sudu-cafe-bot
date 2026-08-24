@@ -274,7 +274,7 @@ def update_monthly_expenses(month: str = None) -> bool:
             except (ValueError, TypeError):
                 qty = 0
             try:
-                total = float(row.get("Total (RM)", 0) or 0)
+                total = float(row.get("Total (RM)", 0) or row.get("Amount (RM)", 0) or 0)
             except (ValueError, TypeError):
                 total = 0
             cat = row.get("Category", "ingredients")
