@@ -1,0 +1,28 @@
+# Secrets — NEVER commit
+.env
+credentials.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files (local to VM)
+data/
+*.json
+!requirements.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Deploy artifacts
+*.tar.gz
+*.tar
