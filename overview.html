@@ -1,0 +1,501 @@
+<title>Café Manager Bot</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #faf9f6;
+  --surface: #f0eeea;
+  --surface-raised: #ffffff;
+  --text: #2c2a26;
+  --text-secondary: #6b6760;
+  --accent: #c05621;
+  --accent-light: #fef0e4;
+  --border: #ddd9d2;
+  --green: #2d8a4e;
+  --green-bg: #eaf5ee;
+  --red: #c53030;
+  --red-bg: #fef0f0;
+  --blue: #2b6cb0;
+  --blue-bg: #ebf4ff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1a1916;
+    --surface: #24221e;
+    --surface-raised: #2e2c27;
+    --text: #e8e4dc;
+    --text-secondary: #9a9488;
+    --accent: #e07837;
+    --accent-light: #3a2a1e;
+    --border: #3a3832;
+    --green: #48bb78;
+    --green-bg: #1e2e22;
+    --red: #fc8181;
+    --red-bg: #2e1e1e;
+    --blue: #63b3ed;
+    --blue-bg: #1e2630;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #1a1916;
+  --surface: #24221e;
+  --surface-raised: #2e2c27;
+  --text: #e8e4dc;
+  --text-secondary: #9a9488;
+  --accent: #e07837;
+  --accent-light: #3a2a1e;
+  --border: #3a3832;
+  --green: #48bb78;
+  --green-bg: #1e2e22;
+  --red: #fc8181;
+  --red-bg: #2e1e1e;
+  --blue: #63b3ed;
+  --blue-bg: #1e2630;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page { max-width: 820px; margin: 0 auto; padding: 2.5rem 1.5rem 4rem; }
+
+header {
+  text-align: center;
+  margin-bottom: 3rem;
+  padding-bottom: 2rem;
+  border-bottom: 1px solid var(--border);
+}
+header h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.4rem;
+}
+header .sub {
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+}
+header .tag {
+  display: inline-block;
+  background: var(--accent-light);
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+  margin-top: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Architecture diagram */
+.diagram-wrap {
+  margin: 0 0 2.5rem;
+  overflow-x: auto;
+}
+.diagram-wrap figcaption {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  margin-top: 0.6rem;
+  text-align: center;
+}
+.diagram-wrap svg text {
+  font-family: 'DM Sans', system-ui, sans-serif;
+}
+.diagram-wrap svg .mono {
+  font-family: 'DM Mono', monospace;
+}
+
+/* Module grid */
+.section-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  letter-spacing: -0.01em;
+}
+
+.modules {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 2.5rem;
+}
+.mod {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem 1.1rem;
+}
+.mod-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.mod-icon {
+  font-size: 1.15rem;
+  flex-shrink: 0;
+}
+.mod-name {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+.mod-desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.mod-cmds {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+.cmd {
+  font-family: 'DM Mono', monospace;
+  font-size: 0.7rem;
+  background: var(--surface);
+  color: var(--text-secondary);
+  padding: 0.15rem 0.4rem;
+  border-radius: 3px;
+}
+
+/* Schedule table */
+.schedule {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin-bottom: 2.5rem;
+}
+.schedule th {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+.schedule td {
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.schedule tr:last-child td { border-bottom: none; }
+.time-badge {
+  font-family: 'DM Mono', monospace;
+  font-size: 0.78rem;
+}
+
+/* Hosting options */
+.hosting {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 2.5rem;
+}
+.host-card {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem;
+}
+.host-card.recommended {
+  border-color: var(--accent);
+  border-width: 2px;
+}
+.host-card .host-name {
+  font-weight: 600;
+  font-size: 0.92rem;
+  margin-bottom: 0.25rem;
+}
+.host-card .host-price {
+  font-size: 0.78rem;
+  color: var(--green);
+  font-weight: 500;
+  margin-bottom: 0.35rem;
+}
+.host-card .host-desc {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+.host-card .rec-badge {
+  font-size: 0.68rem;
+  background: var(--accent);
+  color: #fff;
+  padding: 0.12rem 0.45rem;
+  border-radius: 3px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-left: 0.4rem;
+  vertical-align: middle;
+}
+
+/* Setup steps */
+.steps {
+  counter-reset: step;
+  margin-bottom: 2rem;
+}
+.step {
+  display: flex;
+  gap: 0.9rem;
+  margin-bottom: 1.2rem;
+  align-items: flex-start;
+}
+.step::before {
+  counter-increment: step;
+  content: counter(step);
+  flex-shrink: 0;
+  width: 1.6rem;
+  height: 1.6rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 50%;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-top: 0.1rem;
+}
+.step-content {
+  flex: 1;
+}
+.step-title {
+  font-weight: 600;
+  font-size: 0.92rem;
+  margin-bottom: 0.15rem;
+}
+.step-desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+.step-desc code {
+  font-family: 'DM Mono', monospace;
+  font-size: 0.78rem;
+  background: var(--surface);
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+}
+
+/* Flow diagram */
+.flow-section { margin-bottom: 2.5rem; }
+
+@media (max-width: 600px) {
+  .page { padding: 1.5rem 1rem 3rem; }
+  header h1 { font-size: 1.4rem; }
+  .modules { grid-template-columns: 1fr; }
+  .hosting { grid-template-columns: 1fr; }
+}
+</style>
+
+<div class="page">
+  <header>
+    <h1>Cafe Manager Bot</h1>
+    <p class="sub">A Telegram bot that runs your cafe — cleaning, stock, shifts, events, content, and more.</p>
+    <span class="tag">Free to host &amp; run</span>
+  </header>
+
+  <!-- Architecture Diagram -->
+  <div class="flow-section">
+    <h2 class="section-title">How It Works</h2>
+    <figure class="diagram-wrap">
+      <svg viewBox="0 0 760 320" role="img" aria-label="Architecture: Telegram group sends messages to Bot Server, which reads/writes JSON storage and sends scheduled reminders back to the group." style="max-width:100%;height:auto;">
+        <!-- Telegram Group -->
+        <rect x="20" y="110" width="160" height="100" rx="6" fill="var(--blue-bg)" stroke="var(--blue)" stroke-width="1.5"/>
+        <text x="100" y="148" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">Telegram Group</text>
+        <text x="100" y="170" text-anchor="middle" fill="var(--text-secondary)" font-size="10.5">Staff send commands</text>
+        <text x="100" y="186" text-anchor="middle" fill="var(--text-secondary)" font-size="10.5">&amp; natural language</text>
+
+        <!-- Arrow: Group → Bot -->
+        <line x1="180" y1="145" x2="270" y2="145" stroke="currentColor" stroke-width="1.5" stroke-dasharray="none"/>
+        <polygon points="270,145 262,140 262,150" fill="currentColor"/>
+        <text x="225" y="138" text-anchor="middle" fill="var(--text-secondary)" font-size="9.5" class="mono">/commands</text>
+
+        <!-- Arrow: Bot → Group -->
+        <line x1="270" y1="175" x2="180" y2="175" stroke="var(--accent)" stroke-width="1.5"/>
+        <polygon points="180,175 188,170 188,180" fill="var(--accent)"/>
+        <text x="225" y="195" text-anchor="middle" fill="var(--accent)" font-size="9.5">reminders</text>
+
+        <!-- Bot Server -->
+        <rect x="275" y="80" width="200" height="160" rx="6" fill="var(--surface-raised)" stroke="var(--accent)" stroke-width="2"/>
+        <text x="375" y="112" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="700">Bot Server</text>
+        <text x="375" y="134" text-anchor="middle" fill="var(--text-secondary)" font-size="10">Command handlers</text>
+        <text x="375" y="150" text-anchor="middle" fill="var(--text-secondary)" font-size="10">Keyword router (NLP lite)</text>
+        <text x="375" y="166" text-anchor="middle" fill="var(--text-secondary)" font-size="10">Scheduled job queue</text>
+        <text x="375" y="182" text-anchor="middle" fill="var(--text-secondary)" font-size="10">Interactive buttons</text>
+        <text x="375" y="198" text-anchor="middle" fill="var(--text-secondary)" font-size="10">Checklist state mgmt</text>
+        <!-- Python label -->
+        <text x="375" y="224" text-anchor="middle" fill="var(--text-secondary)" font-size="8.5" class="mono">python-telegram-bot v21</text>
+
+        <!-- Arrow: Bot → Storage -->
+        <line x1="475" y1="160" x2="555" y2="160" stroke="currentColor" stroke-width="1.5"/>
+        <polygon points="555,160 547,155 547,165" fill="currentColor"/>
+        <text x="515" y="152" text-anchor="middle" fill="var(--text-secondary)" font-size="9.5" class="mono">read/write</text>
+
+        <!-- Storage -->
+        <rect x="560" y="110" width="170" height="100" rx="6" fill="var(--green-bg)" stroke="var(--green)" stroke-width="1.5"/>
+        <text x="645" y="148" text-anchor="middle" fill="var(--text)" font-size="13" font-weight="600">JSON Storage</text>
+        <text x="645" y="168" text-anchor="middle" fill="var(--text-secondary)" font-size="10">Stock, shifts, hours,</text>
+        <text x="645" y="184" text-anchor="middle" fill="var(--text-secondary)" font-size="10">events, shopping, logs</text>
+
+        <!-- Scheduled Jobs label -->
+        <rect x="275" y="270" width="200" height="36" rx="5" fill="var(--accent-light)" stroke="var(--accent)" stroke-width="1" stroke-dasharray="4 2"/>
+        <text x="375" y="293" text-anchor="middle" fill="var(--accent)" font-size="10.5" font-weight="500">Cleaning · Stock · Checklists · Shifts · Content</text>
+
+        <!-- Arrow: Jobs → Bot -->
+        <line x1="375" y1="270" x2="375" y2="240" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="4 2"/>
+        <polygon points="375,240 370,248 380,248" fill="var(--accent)"/>
+        <text x="415" y="258" fill="var(--accent)" font-size="9" class="mono">triggers</text>
+      </svg>
+      <figcaption>Staff interact via the Telegram group. The bot processes commands, routes natural language, and fires scheduled reminders. All data persists in local JSON.</figcaption>
+    </figure>
+  </div>
+
+  <!-- Module Grid -->
+  <h2 class="section-title">Feature Modules</h2>
+  <div class="modules">
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">🧹</span><span class="mod-name">Cleaning</span></div>
+      <p class="mod-desc">Scheduled cleaning rounds with zone buttons. Staff tap to confirm. Tracks what's done and what's left.</p>
+      <div class="mod-cmds"><span class="cmd">/clean</span><span class="cmd">/cleanstatus</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">📦</span><span class="mod-name">Stock &amp; Inventory</span></div>
+      <p class="mod-desc">Interactive stock check across 8 categories. OK / LOW / OUT buttons. Auto-adds low items to shopping list.</p>
+      <div class="mod-cmds"><span class="cmd">/stock</span><span class="cmd">/stockcheck</span><span class="cmd">/lowstock</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">✅</span><span class="mod-name">Checklists</span></div>
+      <p class="mod-desc">Interactive opening (10 items) and closing (11 items) checklists with tap-to-mark and completion tracking.</p>
+      <div class="mod-cmds"><span class="cmd">/open</span><span class="cmd">/close</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">👥</span><span class="mod-name">Staff &amp; Shifts</span></div>
+      <p class="mod-desc">Staff registry, weekly shift schedule, and auto-reminders 30 minutes before each shift starts.</p>
+      <div class="mod-cmds"><span class="cmd">/shifts</span><span class="cmd">/addshift</span><span class="cmd">/staff</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">🕐</span><span class="mod-name">Operating Hours</span></div>
+      <p class="mod-desc">Set regular hours by day. Override with holiday/school-break hours on specific dates.</p>
+      <div class="mod-cmds"><span class="cmd">/hours</span><span class="cmd">/sethours</span><span class="cmd">/holiday</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">📅</span><span class="mod-name">Events</span></div>
+      <p class="mod-desc">Plan upcoming events with dates and details. Auto-reminders for today's and tomorrow's events.</p>
+      <div class="mod-cmds"><span class="cmd">/events</span><span class="cmd">/addevent</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">🛒</span><span class="mod-name">Shopping List</span></div>
+      <p class="mod-desc">Shared buy list with urgency flags. Low-stock items auto-added. Mark items as bought.</p>
+      <div class="mod-cmds"><span class="cmd">/buy</span><span class="cmd">/addbuy</span><span class="cmd">/bought</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">📱</span><span class="mod-name">Content Ideas</span></div>
+      <p class="mod-desc">Daily content nudge from a pool of 15 ideas. Tracks what's been posted to avoid repeats.</p>
+      <div class="mod-cmds"><span class="cmd">/content</span><span class="cmd">/contentlog</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">💬</span><span class="mod-name">Natural Language</span></div>
+      <p class="mod-desc">Staff can type naturally — "cleaned toilets", "running low on milk" — and the bot routes it to the right action.</p>
+      <div class="mod-cmds"><span class="cmd">just type</span></div>
+    </div>
+    <div class="mod">
+      <div class="mod-header"><span class="mod-icon">📊</span><span class="mod-name">Reports</span></div>
+      <p class="mod-desc">Daily dashboard and weekly overview. Shows checklist status, cleaning, stock, shifts, events at a glance.</p>
+      <div class="mod-cmds"><span class="cmd">/today</span><span class="cmd">/week</span></div>
+    </div>
+  </div>
+
+  <!-- Scheduled Reminders -->
+  <h2 class="section-title">Auto-Scheduled Reminders</h2>
+  <div style="overflow-x:auto; margin-bottom: 2.5rem;">
+    <table class="schedule">
+      <thead>
+        <tr><th>Time</th><th>Reminder</th><th>Frequency</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><span class="time-badge">7:30 AM</span></td><td>Opening checklist</td><td>Daily</td></tr>
+        <tr><td><span class="time-badge">8:00 AM</span></td><td>Morning stock check + event reminders</td><td>Daily</td></tr>
+        <tr><td><span class="time-badge">9:00 AM</span></td><td>Content idea nudge</td><td>Daily</td></tr>
+        <tr><td><span class="time-badge">10, 1, 4, 7</span></td><td>Cleaning round reminders</td><td>4x daily</td></tr>
+        <tr><td><span class="time-badge">Every 5m</span></td><td>Shift start alerts (30 min before)</td><td>Continuous</td></tr>
+        <tr><td><span class="time-badge">9:00 PM</span></td><td>Closing checklist</td><td>Daily</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Free Hosting -->
+  <h2 class="section-title">Free Hosting Options</h2>
+  <div class="hosting">
+    <div class="host-card recommended">
+      <div class="host-name">Koyeb <span class="rec-badge">Easiest</span></div>
+      <div class="host-price">Free forever</div>
+      <p class="host-desc">Connect GitHub, pick Dockerfile, set env vars. Always-on, no cold starts. Best for getting started fast.</p>
+    </div>
+    <div class="host-card recommended">
+      <div class="host-name">Oracle Cloud <span class="rec-badge">Best VM</span></div>
+      <div class="host-price">Free forever (ARM VM)</div>
+      <p class="host-desc">4 CPU, 24 GB RAM always-free VM. Full control. Runs anything. Needs SSH setup.</p>
+    </div>
+    <div class="host-card">
+      <div class="host-name">Google Cloud Run</div>
+      <div class="host-price">Free tier (2M req/mo)</div>
+      <p class="host-desc">Serverless containers. May need webhook mode for best fit. Good if you use Google already.</p>
+    </div>
+    <div class="host-card">
+      <div class="host-name">Railway</div>
+      <div class="host-price">$5/mo credit</div>
+      <p class="host-desc">GitHub deploy in 2 clicks. Simple but credit runs out eventually on heavy use.</p>
+    </div>
+  </div>
+
+  <!-- Quick Start -->
+  <h2 class="section-title">Quick Start</h2>
+  <div class="steps">
+    <div class="step">
+      <div class="step-content">
+        <div class="step-title">Get a bot token</div>
+        <p class="step-desc">Message <code>@BotFather</code> on Telegram → <code>/newbot</code> → copy the token</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-content">
+        <div class="step-title">Add bot to your cafe group</div>
+        <p class="step-desc">Add it as a member, then send <code>/setup</code> to get the Group Chat ID</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-content">
+        <div class="step-title">Set environment variables</div>
+        <p class="step-desc"><code>TELEGRAM_BOT_TOKEN</code>, <code>GROUP_CHAT_ID</code>, <code>CAFE_NAME</code>, <code>TIMEZONE</code></p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-content">
+        <div class="step-title">Deploy to free host</div>
+        <p class="step-desc">Push to GitHub → connect to Koyeb or Oracle Cloud → bot goes live</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-content">
+        <div class="step-title">Register staff and shifts</div>
+        <p class="step-desc"><code>/addstaff Sarah barista</code> → <code>/addshift mon Sarah 8:00-16:00</code></p>
+      </div>
+    </div>
+  </div>
+
+  <div style="text-align:center;padding-top:1rem;border-top:1px solid var(--border);">
+    <p style="font-size:0.82rem;color:var(--text-secondary);">3 files &middot; ~900 lines of Python &middot; Zero monthly cost</p>
+  </div>
+</div>
