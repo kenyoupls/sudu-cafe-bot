@@ -244,29 +244,30 @@ def _normalize_item_name(name: str) -> str:
 
 def update_monthly_expenses(month: str = None) -> bool:
     """
-    Aggregate Expenses Detail into the Expenses tab by item per month.
-    E.g. if milk was bought 3 times (10 + 12 + 7), Expenses shows: August, Milk, 29, RM total.
-    Overwrites existing rows for that month so it's always current.
+    Aggregate ALL months from Expenses Detail into the Expenses tab.
+    Groups by month + item, sorted newest month first, then alphabetical.
+    Rebuilds the entire Expenses tab each time so it's always in sync.
     """
     ss = _get_spreadsheet()
     if ss is None:
         return False
 
-    if month is None:
-        month = _now().date().strftime("%Y-%m")
-
     try:
-        # Read all expense detail rows for this month
         ws_detail = ss.worksheet("Expenses Detail")
         all_rows = ws_detail.get_all_records()
-        month_rows = [r for r in all_rows if str(r.get("Date", "")).startswith(month)]
 
-        if not month_rows:
-            return True  # Nothing to aggregate
+        if not all_rows:
+            return True
 
-        # Aggregate by item (normalized name for dedup)
-        agg = {}  # {norm_key: {qty: int, total: float, category: str, display_name: str}}
-        for row in month_rows:
+        # Aggregate by (month, item) across ALL months
+        # Key: (month_str, norm_name) → {qty, total, category, display_name}
+        agg = {}
+        for row in all_rows:
+            date_str = str(row.get("Date", ""))
+            if len(date_str) < 7:
+                continue  # skip bad dates
+            row_month = date_str[:7]  # "2026-08"
+
             item = row.get("Item", "Unknown")
             norm = _normalize_item_name(item)
             try:
@@ -279,32 +280,24 @@ def update_monthly_expenses(month: str = None) -> bool:
                 total = 0
             cat = row.get("Category", "ingredients")
 
-            if norm not in agg:
-                agg[norm] = {"qty": 0, "total": 0, "category": cat, "display_name": item}
-            agg[norm]["qty"] += qty
-            agg[norm]["total"] += total
+            key = (row_month, norm)
+            if key not in agg:
+                agg[key] = {"qty": 0, "total": 0, "category": cat, "display_name": item}
+            agg[key]["qty"] += qty
+            agg[key]["total"] += total
 
-        # Write to Expenses tab — clear this month's rows and rewrite
-        ws_exp = ss.worksheet("Expenses")
-        existing = ws_exp.get_all_values()
-
-        # Keep header + rows from OTHER months
-        header = existing[0] if existing else [
+        # Build rows sorted by month (newest first), then item name
+        now_str = _now().isoformat()
+        header = [
             "Month", "Item", "Total Qty", "Total Spent (RM)",
             "Category", "Updated At"
         ]
-        other_rows = []
-        if len(existing) > 1:
-            for row in existing[1:]:
-                if row and row[0] != month:
-                    other_rows.append(row)
-
-        # Build new rows for this month
-        now_str = _now().isoformat()
-        new_rows = []
-        for norm_key, data in sorted(agg.items(), key=lambda x: x[1]["display_name"]):
-            new_rows.append([
-                month,
+        data_rows = []
+        for (row_month, norm_key), data in sorted(
+            agg.items(), key=lambda x: (-x[0][0].__hash__, x[1]["display_name"])
+        ):
+            data_rows.append([
+                row_month,
                 data["display_name"],
                 data["qty"],
                 f"{data['total']:.2f}",
@@ -312,14 +305,18 @@ def update_monthly_expenses(month: str = None) -> bool:
                 now_str,
             ])
 
-        # Combine: header + other months + this month (newest month first)
-        all_data = [header] + new_rows + other_rows
+        # Sort: newest month first, then alphabetical within month
+        data_rows.sort(key=lambda r: (-r[0].replace("-", "").__hash__, r[1].lower()))
+        # Actually use a proper sort: reverse month string, then item name
+        data_rows.sort(key=lambda r: r[1].lower())          # secondary: item A-Z
+        data_rows.sort(key=lambda r: r[0], reverse=True)    # primary: month newest first
 
+        ws_exp = ss.worksheet("Expenses")
         ws_exp.clear()
-        ws_exp.update("A1", all_data)
+        ws_exp.update("A1", [header] + data_rows)
         ws_exp.format("A1:F1", {"textFormat": {"bold": True}})
 
-        logger.info(f"Updated monthly expenses for {month}: {len(new_rows)} items")
+        logger.info(f"Updated expenses: {len(data_rows)} rows across {len(set(k[0] for k in agg))} months")
         return True
 
     except Exception as e:
