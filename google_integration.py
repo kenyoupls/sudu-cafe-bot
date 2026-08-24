@@ -117,7 +117,7 @@ def _ensure_worksheets(spreadsheet):
     if "Expenses Detail" not in existing:
         ws = spreadsheet.add_worksheet("Expenses Detail", rows=5000, cols=12)
         ws.append_row([
-            "Date", "Item", "Qty", "Unit Price (RM)",
+            "Date", "Item", "Qty", "Amount (RM)",
             "Total (RM)", "Category", "Supplier", "Paid By",
             "Receipt Link", "Recorded By", "Notes", "Created At"
         ])
@@ -179,13 +179,18 @@ def log_expense_detail(
     item_name: str,
     qty: int = 1,
     unit_price: float = 0,
+    amount: float = None,
     category: str = "ingredients",
     paid_by: str = "",
     receipt_link: str = "",
     recorded_by: str = "",
     notes: str = "",
 ) -> bool:
-    """Log a single expense item to the Expenses Detail sheet."""
+    """Log a single expense item to the Expenses Detail sheet.
+
+    amount = actual total paid for this line (after discount proration).
+             If not provided, falls back to qty * unit_price.
+    """
     ss = _get_spreadsheet()
     if ss is None:
         return False
@@ -195,7 +200,8 @@ def log_expense_detail(
     if cat not in ("ingredients", "useables", "one-off"):
         cat = "ingredients"
 
-    total = qty * unit_price
+    # Use the pre-calculated amount (discount-adjusted) if provided
+    total = amount if amount is not None else qty * unit_price
 
     try:
         ws = ss.worksheet("Expenses Detail")
@@ -203,7 +209,7 @@ def log_expense_detail(
             expense_date,
             item_name,
             qty,
-            f"{unit_price:.2f}",
+            f"{total:.2f}",
             f"{total:.2f}",
             cat.capitalize(),
             supplier,

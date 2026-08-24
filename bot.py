@@ -1634,27 +1634,36 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         expense_date = receipt_data.get("date", now_sg().date().isoformat())
         detail_count = 0
 
+        # Use receipt's final total — the amount actually paid
+        receipt_total = float(receipt_data.get("total") or 0)
+
+        import re as _re
         for item in items:
             item_name = item.get("name", "")
             qty = item.get("qty", 0)
             price = item.get("price", 0)
             category = item.get("category", "ingredients")
-            # Parse qty — handle strings like "2", "1 bag", etc.
             try:
-                import re as _re
                 qty_nums = _re.findall(r'[\d.]+', str(qty))
                 qty_int = int(float(qty_nums[0])) if qty_nums else 1
             except (ValueError, IndexError):
                 qty_int = 1
+
             if item_name:
+                # For single-item receipts: log the receipt total directly
+                # For multi-item: log qty * unit_price per item
+                if len(items) == 1 and receipt_total > 0:
+                    item_amount = receipt_total
+                else:
+                    item_amount = qty_int * (float(price) if price else 0)
+
                 try:
-                    # Log individual item to Expenses Detail
                     logged_detail = log_expense_detail(
                         expense_date=expense_date,
                         supplier=supplier,
                         item_name=item_name,
                         qty=qty_int,
-                        unit_price=float(price) if price else 0,
+                        amount=item_amount,
                         category=category or "ingredients",
                         paid_by=paid_by,
                         receipt_link=drive_link or "",
@@ -1667,7 +1676,6 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                 except Exception as e:
                     logger.error(f"Expense detail error for {item_name}: {e}")
 
-                # Also update local stock tracker with actual qty
                 store.update_stock(item_name, str(qty_int), f"Receipt ({receipt_user})")
 
         if items:
@@ -1761,26 +1769,36 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         expense_date = receipt_data.get("date", now_sg().date().isoformat())
         detail_count = 0
 
+        # Use receipt's final total — the amount actually paid
+        receipt_total = float(receipt_data.get("total") or 0)
+
+        import re as _re
         for item in items:
             item_name = item.get("name", "")
             qty = item.get("qty", 0)
             price = item.get("price", 0)
             category = item.get("category", "ingredients")
-            # Parse qty — handle strings like "2", "1 bag", etc.
             try:
-                import re as _re
                 qty_nums = _re.findall(r'[\d.]+', str(qty))
                 qty_int = int(float(qty_nums[0])) if qty_nums else 1
             except (ValueError, IndexError):
                 qty_int = 1
+
             if item_name:
+                # For single-item receipts: log the receipt total directly
+                # For multi-item: log qty * unit_price per item
+                if len(items) == 1 and receipt_total > 0:
+                    item_amount = receipt_total
+                else:
+                    item_amount = qty_int * (float(price) if price else 0)
+
                 try:
                     logged_detail = log_expense_detail(
                         expense_date=expense_date,
                         supplier=supplier,
                         item_name=item_name,
                         qty=qty_int,
-                        unit_price=float(price) if price else 0,
+                        amount=item_amount,
                         category=category or "ingredients",
                         paid_by=paid_by,
                         receipt_link=drive_link or "",
@@ -1793,7 +1811,6 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Expense detail error for {item_name}: {e}")
 
-                # Update local stock with actual qty (not "OK")
                 store.update_stock(item_name, str(qty_int), f"Receipt ({receipt_user})")
 
         if items:
