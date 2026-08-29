@@ -120,6 +120,16 @@ STOCK_CATEGORIES = [
     "📦 Other Supplies",
 ]
 
+# ─── Item Categories (for receipt items) ──────────────────
+ITEM_CATEGORIES = {
+    "ingredients":  "🧂 Ingredients",
+    "consumables":  "🧻 Consumables",
+    "one-off":      "🧪 One-off",
+    "equipment":    "🔧 Equipment",
+    "marketing":    "📢 Marketing",
+}
+DEFAULT_CATEGORY = "ingredients"
+
 # ─── Opening Checklist ──────────────────────────────────────
 OPENING_CHECKLIST = [
     "Turn on lights & AC",

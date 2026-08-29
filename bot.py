@@ -1714,14 +1714,17 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str) -> str:
     _r_subtotal = float(receipt_data.get('subtotal') or 0)
     _r_discount = float(receipt_data.get('discount') or 0)
 
+    from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
     items_text = ""
     for item in receipt_data.get("items", []):
         _item_price = float(item.get('price') or 0)
         _item_qty = item.get('qty', '?')
+        _item_cat = item.get('category', DEFAULT_CATEGORY)
+        _cat_label = ITEM_CATEGORIES.get(_item_cat, ITEM_CATEGORIES.get(DEFAULT_CATEGORY, ""))
         items_text += (
             f"\n  \U0001f4e6 {item.get('name', '?')} "
             f"x{_item_qty} "
-            f"@ RM{_item_price:.2f}"
+            f"@ RM{_item_price:.2f} [{_cat_label}]"
         )
 
     paid_by = receipt_data.get("paid_by", "") or name
@@ -1741,11 +1744,16 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str) -> str:
 
 
 def _receipt_confirm_buttons():
-    """Return the standard confirm/amend button row."""
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm & Save", callback_data="receipt:confirm"),
-        InlineKeyboardButton("✏️ Change", callback_data="receipt:change"),
-    ]])
+    """Return the standard confirm/amend button rows."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Confirm & Save", callback_data="receipt:confirm"),
+            InlineKeyboardButton("✏️ Change", callback_data="receipt:change"),
+        ],
+        [
+            InlineKeyboardButton("🏷️ Change Category", callback_data="receipt:chgcat"),
+        ],
+    ])
 
 
 async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2090,6 +2098,19 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.chat_data["pending_receipt_changing"] = True
         return
 
+    if action == "chgcat":
+        await cb_receipt_chgcat(update, ctx)
+        return
+
+    if action == "back":
+        confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"])
+        await query.edit_message_text(
+            confirm_msg,
+            reply_markup=_receipt_confirm_buttons(),
+            parse_mode="Markdown",
+        )
+        return
+
     # action == "confirm" — use shared logic
     receipt_data = pending["data"]
     image_bytes = pending["image_bytes"]
@@ -2261,6 +2282,94 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"✅ *Receipt Confirmed*\n\n{summary}\n\n"
         f"Submitted by {receipt_user}\n"
         f"Confirmed by {name}",
+        parse_mode="Markdown",
+    )
+
+
+async def cb_receipt_chgcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show item picker for category change."""
+    query = update.callback_query
+    await query.answer()
+    pending = ctx.chat_data.get("pending_receipt")
+    if not pending:
+        await query.edit_message_text("⚠️ No pending receipt.")
+        return
+    items = pending["data"].get("items", [])
+    if not items:
+        await query.edit_message_text("⚠️ No items in receipt.")
+        return
+    from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
+    buttons = []
+    for i, item in enumerate(items):
+        cat = item.get("category", DEFAULT_CATEGORY)
+        cat_label = ITEM_CATEGORIES.get(cat, ITEM_CATEGORIES.get(DEFAULT_CATEGORY, ""))
+        buttons.append([InlineKeyboardButton(
+            f"{i+1}. {item.get('name', '?')} [{cat_label}]",
+            callback_data=f"catitem:{i}",
+        )])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="receipt:back")])
+    await query.edit_message_text(
+        "🏷️ *Which item's category do you want to change?*",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+
+async def cb_catitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show category picker for a specific item."""
+    query = update.callback_query
+    await query.answer()
+    idx = int(query.data.split(":", 1)[1])
+    pending = ctx.chat_data.get("pending_receipt")
+    if not pending:
+        await query.edit_message_text("⚠️ No pending receipt.")
+        return
+    items = pending["data"].get("items", [])
+    if idx >= len(items):
+        await query.edit_message_text("⚠️ Item not found.")
+        return
+    item_name = items[idx].get("name", "?")
+    from config import ITEM_CATEGORIES
+    buttons = []
+    row = []
+    for key, label in ITEM_CATEGORIES.items():
+        row.append(InlineKeyboardButton(label, callback_data=f"setcat:{idx}:{key}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="receipt:chgcat")])
+    await query.edit_message_text(
+        f"🏷️ Pick category for *{item_name}*:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+
+async def cb_setcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Apply selected category to an item and re-show confirmation."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":", 2)  # setcat:idx:category
+    idx = int(parts[1])
+    new_cat = parts[2]
+    pending = ctx.chat_data.get("pending_receipt")
+    if not pending:
+        await query.edit_message_text("⚠️ No pending receipt.")
+        return
+    items = pending["data"].get("items", [])
+    if idx >= len(items):
+        await query.edit_message_text("⚠️ Item not found.")
+        return
+    from config import ITEM_CATEGORIES
+    items[idx]["category"] = new_cat
+    cat_label = ITEM_CATEGORIES.get(new_cat, new_cat)
+    item_name = items[idx].get("name", "?")
+    confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"])
+    await query.edit_message_text(
+        f"✅ {item_name} → {cat_label}\n\n{confirm_msg}",
+        reply_markup=_receipt_confirm_buttons(),
         parse_mode="Markdown",
     )
 
@@ -3097,6 +3206,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     old_name = items[idx].get("name", "?")
                                     items[idx]["name"] = str(item_change["name"])
                                     change_descriptions.append(f"{old_name} → {item_change['name']}")
+                                if "category" in item_change:
+                                    from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
+                                    new_cat = str(item_change["category"]).lower().strip()
+                                    if new_cat == "useables":
+                                        new_cat = "consumables"
+                                    if new_cat in ITEM_CATEGORIES:
+                                        items[idx]["category"] = new_cat
+                                        cat_label = ITEM_CATEGORIES[new_cat]
+                                        change_descriptions.append(
+                                            f"{items[idx].get('name', '?')} category → {cat_label}")
                         # Recalculate total from items after item-level changes
                         _fix_receipt_total_from_items(rd)
 
@@ -4341,6 +4460,9 @@ def main():
 
     # Receipt confirm/change callback (allowed everywhere — staff can submit receipts)
     app.add_handler(CallbackQueryHandler(g(cb_receipt), pattern=r"^receipt:"))
+    app.add_handler(CallbackQueryHandler(g(cb_receipt_chgcat), pattern=r"^receipt:chgcat$"))
+    app.add_handler(CallbackQueryHandler(g(cb_catitem), pattern=r"^catitem:\d+$"))
+    app.add_handler(CallbackQueryHandler(g(cb_setcat), pattern=r"^setcat:\d+:"))
 
     # Sales report confirm/change callback (allowed everywhere — staff can submit POS)
     app.add_handler(CallbackQueryHandler(g(cb_sales), pattern=r"^sales:"))

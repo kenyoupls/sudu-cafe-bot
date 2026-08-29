@@ -202,9 +202,12 @@ def log_expense_detail(
         return False
 
     # Normalise category
-    cat = category.lower().strip() if category else "ingredients"
-    if cat not in ("ingredients", "useables", "one-off"):
-        cat = "ingredients"
+    from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
+    cat = category.lower().strip() if category else DEFAULT_CATEGORY
+    if cat == "useables":          # backward compat rename
+        cat = "consumables"
+    if cat not in ITEM_CATEGORIES:
+        cat = DEFAULT_CATEGORY
 
     # Use the pre-calculated amount (discount-adjusted) if provided
     total = amount if amount is not None else qty * unit_price

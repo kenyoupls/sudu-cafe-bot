@@ -1328,13 +1328,18 @@ async def classify_receipt_reply(user_reply: str, receipt_summary: str) -> dict:
         '  "remove the second item" → remove\n'
         '    → {"action": "change", "changes": {"items": [{"index": 1, "action": "remove"}]}}\n'
         '  "add 2 cups of syrup at rm5 each" → add\n'
-        '    → {"action": "change", "changes": {"items": [{"action": "add", "name": "Syrup", "qty": 2, "price": 5.00}]}}\n\n'
+        '    → {"action": "change", "changes": {"items": [{"action": "add", "name": "Syrup", "qty": 2, "price": 5.00}]}}\n'
+        '  "change first item to consumables" → category change\n'
+        '    → {"action": "change", "changes": {"items": [{"index": 0, "category": "consumables"}]}}\n'
+        '  "pistachio is equipment" → category change by item name\n'
+        '    → {"action": "change", "changes": {"items": [{"index": 0, "category": "equipment"}]}}\n\n'
 
         "KEY RULES:\n"
         "- Extract numbers from natural text: '12 bottles of 1L' → qty=12, '1 bag' → qty=1\n"
         "- 'the item is X' always means rename, even if X contains a number like '1 bag of ice'\n"
         "- If they mention both a new name AND a quantity, include BOTH in the change\n"
         "- qty must be an integer, price must be a number\n"
+        "- Valid categories: ingredients, consumables, one-off, equipment, marketing\n"
         "- You can combine item changes with receipt-level changes in one response\n"
         "- When unsure between confirm and change, lean toward understanding it as a change\n\n"
 
@@ -2410,10 +2415,13 @@ async def process_receipt(
         f'  - Otherwise set paid_by to "{user_name}"\n'
         '  - NEVER use generic words like "Staff member", "staff", "customer", or "unknown"\n\n'
 
+        # NOTE: these category keys must match config.ITEM_CATEGORIES
         "CATEGORIES for each item:\n"
-        '  - "ingredients" = food/drink ingredients for recipes (milk, sugar, flour, syrup, chicken, ice, etc.)\n'
-        '  - "useables" = consumables used regularly (tissues, cups, straws, soap, garbage bags, etc.)\n'
-        '  - "one-off" = bought once/rarely (decorations, equipment, furniture, tools)\n\n'
+        '  - "ingredients" = food/drink ingredients for recipes (milk, sugar, flour, syrup, chicken, ice)\n'
+        '  - "consumables" = items used up regularly (tissues, cups, straws, soap, garbage bags, cleaning supplies)\n'
+        '  - "one-off" = bought once/rarely (decorations, one-time purchases)\n'
+        '  - "equipment" = machines, tools, furniture, appliances\n'
+        '  - "marketing" = signage, ads, merch, flyers, promo materials\n\n'
 
         "ITEM NAMES — Be specific: 'Low Fat Milk 1L' not just 'Milk'. Include brand/size if visible.\n\n"
 
