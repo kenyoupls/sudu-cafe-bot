@@ -54,6 +54,28 @@ def normalize_item_name(name: str) -> str:
     s = _re.sub(r'\s+', ' ', s).strip()      # Collapse whitespace
     return s.lower()
 
+
+def _words_prefix_match(words_a: list, words_b: list) -> bool:
+    """Check if two word lists match with allowance for truncated words.
+    E.g. ['pistachio', 'cru', 'pandan'] matches ['pistachio', 'crunch', 'pandan']
+    because 'cru' is a prefix of 'crunch'. At least 70% of words must match."""
+    shorter, longer = (words_a, words_b) if len(words_a) <= len(words_b) else (words_b, words_a)
+    if not shorter:
+        return False
+    matches = 0
+    used = set()
+    for sw in shorter:
+        for i, lw in enumerate(longer):
+            if i in used:
+                continue
+            if sw == lw or (len(sw) >= 3 and (lw.startswith(sw) or sw.startswith(lw))):
+                matches += 1
+                used.add(i)
+                break
+    ratio = matches / max(len(shorter), len(longer))
+    return ratio >= 0.7
+
+
 # ─── Try Google Sheets ─────────────────────────────────────
 try:
     import gspread
@@ -889,6 +911,14 @@ class LocalJsonStore:
             # Found an alias — check if canonical exists in stock
             for existing in self.data.get("stock", {}):
                 if normalize_item_name(existing) == normalize_item_name(canonical):
+                    return existing
+        # Fuzzy fallback: word-level prefix match (handles AI truncation like "CRU" → "CRUNCH")
+        new_words = new_norm.split()
+        if len(new_words) >= 2:
+            for existing in self.data.get("stock", {}):
+                existing_norm = normalize_item_name(existing)
+                existing_words = existing_norm.split()
+                if len(existing_words) >= 2 and _words_prefix_match(new_words, existing_words):
                     return existing
         return new_name
 

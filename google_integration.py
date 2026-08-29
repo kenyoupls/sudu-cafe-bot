@@ -214,7 +214,7 @@ def log_expense_detail(
 
     try:
         ws = ss.worksheet("Expenses Detail")
-        ws.append_row([
+        row_data = [
             expense_date,
             item_name,
             qty,
@@ -227,7 +227,11 @@ def log_expense_detail(
             recorded_by,
             notes,
             _fmt_ts(),
-        ])
+        ]
+        # Find actual last row with data in column A (avoids API table-detection bugs)
+        col_a = ws.col_values(1)
+        next_row = len(col_a) + 1
+        ws.update(f"A{next_row}", [row_data], value_input_option="USER_ENTERED")
         return True
 
     except Exception as e:
@@ -277,7 +281,9 @@ def update_monthly_expenses(month: str = None) -> bool:
                 continue  # skip bad dates
             row_month = date_str[:7]  # "2026-08"
 
-            item = row.get("Item", "Unknown")
+            item = row.get("Item", "")
+            if not item or not str(item).strip():
+                continue  # skip empty/malformed rows
             norm = _normalize_item_name(item)
             try:
                 qty = int(row.get("Qty", 0) or 0)

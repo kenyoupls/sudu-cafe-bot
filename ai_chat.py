@@ -2423,7 +2423,8 @@ async def process_receipt(
         '  - "equipment" = machines, tools, furniture, appliances\n'
         '  - "marketing" = signage, ads, merch, flyers, promo materials\n\n'
 
-        "ITEM NAMES — Be specific: 'Low Fat Milk 1L' not just 'Milk'. Include brand/size if visible.\n\n"
+        "ITEM NAMES — Be specific: 'Low Fat Milk 1L' not just 'Milk'. Include brand/size if visible.\n"
+        "  NEVER truncate or abbreviate item names with '...' or similar. Write the FULL name exactly as it appears on the receipt.\n\n"
 
         "PRICE — VERY IMPORTANT:\n"
         '  - "price" = the UNIT PRICE for ONE single item, NOT the line total\n'
@@ -2500,6 +2501,15 @@ async def process_receipt(
         # divide it back to get the real unit price
         _fix_item_prices(data)
 
+        # Strip any ellipsis/truncation artifacts from item names
+        import re as _re
+        for item in data.get("items", []):
+            _name = item.get("name", "")
+            _name = _name.replace("...", "").replace("…", "")  # strip ellipsis
+            _name = _re.sub(r'\s+', ' ', _name).strip()
+            if _name:
+                item["name"] = _name
+
         return data
 
     except (json.JSONDecodeError, Exception) as e:
@@ -2532,6 +2542,16 @@ async def process_receipt(
                     except (ValueError, TypeError):
                         item["qty"] = 1
             _fix_item_prices(data)
+
+            # Strip any ellipsis/truncation artifacts from item names
+            import re as _re
+            for item in data.get("items", []):
+                _name = item.get("name", "")
+                _name = _name.replace("...", "").replace("…", "")  # strip ellipsis
+                _name = _re.sub(r'\s+', ' ', _name).strip()
+                if _name:
+                    item["name"] = _name
+
             return data
         except Exception as e2:
             logger.error(f"Groq receipt OCR fallback also failed: {e2}")
