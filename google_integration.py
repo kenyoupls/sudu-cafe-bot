@@ -228,10 +228,7 @@ def log_expense_detail(
             notes,
             _fmt_ts(),
         ]
-        # Find actual last row with data in column A (avoids API table-detection bugs)
-        col_a = ws.col_values(1)
-        next_row = len(col_a) + 1
-        ws.update(f"A{next_row}", [row_data], value_input_option="USER_ENTERED")
+        ws.append_row(row_data, value_input_option="USER_ENTERED", table_range="A1")
         return True
 
     except Exception as e:

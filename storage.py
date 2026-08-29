@@ -1027,12 +1027,12 @@ class LocalJsonStore:
         self._save_local_only()
 
     def _receipt_hash_key(self, supplier: str, receipt_date: str, total: float, items: list) -> str:
-        """Generate a hash key for duplicate detection."""
+        """Generate a hash key for duplicate detection.
+        Uses only supplier + date + total (not item names — OCR is too noisy)."""
         import hashlib
         norm_supplier = normalize_item_name(supplier)
         rounded_total = f"{float(total):.2f}"
-        norm_items = sorted(normalize_item_name(i.get("name", "")) for i in items if i.get("name"))
-        raw = f"{norm_supplier}|{receipt_date}|{rounded_total}|{'|'.join(norm_items)}"
+        raw = f"{norm_supplier}|{receipt_date}|{rounded_total}"
         return hashlib.md5(raw.encode()).hexdigest()[:16]
 
     def record_oneoff_item(self, item: str):
