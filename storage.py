@@ -25,10 +25,25 @@ def _now():
 logger = logging.getLogger(__name__)
 
 
+_BRAND_PREFIXES = [
+    "sm", "s&p", "cap", "nestle", "dutch lady", "f&n",
+]
+_BRAND_PREFIX_RE = _re.compile(
+    r'^(?:' + '|'.join(_re.escape(p) for p in _BRAND_PREFIXES) + r')\b\s*',
+    _re.IGNORECASE,
+)
+_SIZE_SUFFIX_RE = _re.compile(
+    r'\b\d+(\.\d+)?\s*(kg|g|ml|l|pcs|pack|box|bag|btl|carton)\b',
+    _re.IGNORECASE,
+)
+
+
 def normalize_item_name(name: str) -> str:
     """Normalize item name so slight variations match.
     'Coconut (Toasted, 100g)' and 'Coconut - Toasted, 100g' → same key."""
     s = name.strip()
+    s = _BRAND_PREFIX_RE.sub('', s)          # Strip known brand prefixes
+    s = _SIZE_SUFFIX_RE.sub(' ', s)          # Strip size/weight suffixes
     s = _re.sub(r'[(){}[\]]', ' ', s)       # Remove brackets/parens
     s = _re.sub(r'[-/\\.,;:]+', ' ', s)      # Dashes, slashes, dots → space
     s = _re.sub(r'\s+', ' ', s).strip()      # Collapse whitespace
@@ -139,9 +154,10 @@ class SheetsSync:
                     return None
         return self._worksheets.get(name)
 
-    def sync_stock(self, stock_data: dict, stock_history: dict = None):
+    def sync_stock(self, stock_data: dict, stock_history: dict = None, stock_current: dict = None):
         """Sync stock data to Sheets — history format: items as rows, dates as columns (newest first).
-        Uses stock_history {date: {item: qty}} as primary source."""
+        Uses stock_history {date: {item: qty}} as primary source.
+        Column A = Item, Column B = Current Stock, columns C+ = date columns."""
         ws = self._get_ws("Stock")
         if not ws:
             return
@@ -193,7 +209,9 @@ class SheetsSync:
                     return datetime.min
             sorted_dates = sorted(dates, key=parse_date, reverse=True)
 
-            if not sorted_dates:
+            stock_current = stock_current or {}
+
+            if not sorted_dates and not stock_current:
                 return
 
             # Deduplicate items by normalized name
@@ -206,11 +224,25 @@ class SheetsSync:
                     # Keep the latest value for each date
                     merged[norm]["dates"][d] = v
 
-            # Build final rows
-            header = ["Item"] + sorted_dates
+            # Also include items that only appear in stock_current
+            for item in stock_current:
+                norm = normalize_item_name(item)
+                if norm not in merged:
+                    merged[norm] = {"display_name": item, "dates": {}}
+
+            # Build final rows: Item | Current Stock | date1 | date2 ...
+            header = ["Item", "Current Stock"] + sorted_dates
             rows = [header]
             for norm_key, info in sorted(merged.items(), key=lambda x: x[1]["display_name"].lower()):
-                row = [info["display_name"]]
+                display_name = info["display_name"]
+                current_val = stock_current.get(display_name)
+                if current_val is None:
+                    # Try matching by normalized name in case display name differs
+                    for ck, cv in stock_current.items():
+                        if normalize_item_name(ck) == norm_key:
+                            current_val = cv
+                            break
+                row = [display_name, current_val if current_val is not None else ""]
                 for d in sorted_dates:
                     row.append(info["dates"].get(d, ""))
                 rows.append(row)
@@ -292,18 +324,25 @@ class SheetsSync:
     # ─── Read from Sheet (reverse-sync: Sheet → JSON) ────────
 
     def read_stock_from_sheet(self) -> tuple:
-        """Read Stock sheet → return (stock_dict, stock_history_dict).
-        Sheet is source of truth — this overwrites local JSON data."""
+        """Read Stock sheet → return (stock_dict, stock_history_dict, stock_current_dict).
+        Sheet is source of truth — this overwrites local JSON data.
+        Handles the "Item | Current Stock | date1 | date2 ..." layout — the
+        Current Stock column (B) is read separately and skipped when scanning
+        for date columns."""
         ws = self._get_ws("Stock")
         if not ws:
-            return None, None
+            return None, None, None
         try:
             from datetime import datetime as _dt
             existing = ws.get_all_values()
             if not existing or not existing[0]:
-                return {}, {}
+                return {}, {}, {}
 
             header = existing[0]
+
+            # "Current Stock" occupies column B (index 1) when present
+            has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
+            date_start = 2 if has_current_col else 1
 
             def is_date_col(s):
                 try:
@@ -312,7 +351,7 @@ class SheetsSync:
                 except (ValueError, TypeError):
                     return False
 
-            date_cols = [(i, h) for i, h in enumerate(header[1:], 1) if is_date_col(h)]
+            date_cols = [(i, h) for i, h in enumerate(header[date_start:], date_start) if is_date_col(h)]
 
             # Parse dates for sorting (find latest per item)
             def parse_d(d):
@@ -323,6 +362,7 @@ class SheetsSync:
 
             stock = {}
             history = {}
+            stock_current = {}
 
             for row in existing[1:]:
                 if not row or not row[0]:
@@ -330,6 +370,14 @@ class SheetsSync:
                 item = row[0].strip()
                 if not item:
                     continue
+
+                if has_current_col:
+                    cur_val = (row[1] if len(row) > 1 else "").strip()
+                    if cur_val:
+                        try:
+                            stock_current[item] = int(float(cur_val))
+                        except (ValueError, TypeError):
+                            pass
 
                 latest_qty = ""
                 latest_date_parsed = _dt.min
@@ -355,11 +403,11 @@ class SheetsSync:
                     }
 
             logger.info(f"Read {len(stock)} stock items from Sheet")
-            return stock, history
+            return stock, history, stock_current
 
         except Exception as e:
             logger.error(f"Error reading stock from Sheet: {e}")
-            return None, None
+            return None, None, None
 
     def read_shopping_from_sheet(self) -> list:
         """Read Shopping List sheet → return shopping_list array."""
@@ -449,23 +497,36 @@ class SheetsSync:
 
             if not existing or not existing[0]:
                 # Sheet is empty — create header + first row
-                ws.update("A1", [["Item", date_str], [item, qty]])
-                ws.format("A1:B1", {"textFormat": {"bold": True}})
+                # Layout: Item | Current Stock | date_str
+                ws.update("A1", [["Item", "Current Stock", date_str], [item, "", qty]])
+                ws.format("A1:C1", {"textFormat": {"bold": True}})
                 return
 
             header = existing[0]
 
-            # Find or create date column
-            if date_str in header:
-                col_idx = header.index(date_str)
-            else:
-                # Insert as column B (newest date first, after "Item")
-                col_idx = 1
-                # Shift existing date columns right by inserting new col
-                new_header = [header[0], date_str] + header[1:]
+            # Ensure "Current Stock" occupies column B — insert if missing
+            has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
+            if not has_current_col:
+                new_header = [header[0], "Current Stock"] + header[1:]
                 new_rows = [new_header]
                 for row in existing[1:]:
-                    new_rows.append([row[0] if row else "", ""] + row[1:])
+                    new_rows.append([row[0] if row else "", ""] + (row[1:] if row else []))
+                ws.clear()
+                ws.update("A1", new_rows)
+                existing = new_rows
+                header = new_header
+
+            # Find or create date column (date columns start at column C / index 2)
+            if date_str in header[2:]:
+                col_idx = header.index(date_str, 2)
+            else:
+                # Insert as column C (newest date first, after "Item" and "Current Stock")
+                col_idx = 2
+                # Shift existing date columns right by inserting new col
+                new_header = header[:2] + [date_str] + header[2:]
+                new_rows = [new_header]
+                for row in existing[1:]:
+                    new_rows.append((row[:2] if row else ["", ""]) + [""] + (row[2:] if row else []))
                 ws.clear()
                 ws.update("A1", new_rows)
                 existing = new_rows
@@ -567,7 +628,7 @@ class SheetsSync:
         if not self.spreadsheet:
             return
         syncs = [
-            ("Stock", lambda: self.sync_stock(data.get("stock", {}), data.get("stock_history", {}))),
+            ("Stock", lambda: self.sync_stock(data.get("stock", {}), data.get("stock_history", {}), data.get("stock_current", {}))),
             ("Shopping", lambda: self.sync_shopping(data.get("shopping_list", []))),
             ("Events", lambda: self.sync_events(data.get("events", []))),
         ]
@@ -619,11 +680,15 @@ class LocalJsonStore:
             return
         try:
             # Stock
-            stock, history = self._sheets.read_stock_from_sheet()
+            stock, history, stock_current = self._sheets.read_stock_from_sheet()
             if stock is not None:
                 self.data["stock"] = stock
             if history is not None:
                 self.data["stock_history"] = history
+            if stock_current is not None and stock_current:
+                if "stock_current" not in self.data:
+                    self.data["stock_current"] = {}
+                self.data["stock_current"].update(stock_current)
 
             _time.sleep(2)  # Rate limit gap
 
@@ -742,7 +807,7 @@ class LocalJsonStore:
             return
 
         sync_map = {
-            "stock": lambda: self._sheets.sync_stock(self.data.get("stock", {}), self.data.get("stock_history", {})),
+            "stock": lambda: self._sheets.sync_stock(self.data.get("stock", {}), self.data.get("stock_history", {}), self.data.get("stock_current", {})),
             "shopping": lambda: self._sheets.sync_shopping(self.data.get("shopping_list", [])),
             "events": lambda: self._sheets.sync_events(self.data.get("events", [])),
         }
@@ -779,6 +844,9 @@ class LocalJsonStore:
             "action_items": [],
             "custom_instructions": [],
             "stock_history": {},  # {date_str: {item: qty, ...}}
+            "stock_current": {},        # {item_name: int} — running current stock count
+            "last_full_count": {},      # {item_name: {"qty": int, "date": "YYYY-MM-DD"}}
+            "oneoff_items": {},         # For Phase 7 later
         }
 
     # ─── Stock ──────────────────────────────────────────────
@@ -786,12 +854,21 @@ class LocalJsonStore:
         return self.data.get("stock", {})
 
     def _find_existing_stock_name(self, new_name: str) -> str:
-        """Find an existing stock item that matches by normalized name.
+        """Find an existing stock item that matches by normalized name or alias.
         Returns the existing key if found, otherwise the new_name."""
         new_norm = normalize_item_name(new_name)
+        # Check direct normalized match first
         for existing in self.data.get("stock", {}):
             if normalize_item_name(existing) == new_norm:
                 return existing
+        # Check alias store
+        alias_store = get_alias_store()
+        canonical = alias_store.resolve(new_name)
+        if canonical != new_name:
+            # Found an alias — check if canonical exists in stock
+            for existing in self.data.get("stock", {}):
+                if normalize_item_name(existing) == normalize_item_name(canonical):
+                    return existing
         return new_name
 
     def update_stock(self, item: str, qty: str, updated_by: str):
@@ -820,6 +897,15 @@ class LocalJsonStore:
         if today not in self.data["stock_history"]:
             self.data["stock_history"][today] = {}
         self.data["stock_history"][today][item] = qty
+
+        # Keep stock_current in sync
+        if "stock_current" not in self.data:
+            self.data["stock_current"] = {}
+        try:
+            self.data["stock_current"][item] = int(qty)
+        except (ValueError, TypeError):
+            pass
+
         self._save_local_only()
 
     def remove_stock(self, item: str) -> bool:
@@ -855,6 +941,52 @@ class LocalJsonStore:
             logger.info(f"Removed stock item: {item}")
         return removed
 
+    def record_oneoff_item(self, item: str):
+        """Record an item as one-off purchase (not tracked in regular stock)."""
+        if "oneoff_items" not in self.data:
+            self.data["oneoff_items"] = {}
+        norm = normalize_item_name(item)
+        now_str = _now().isoformat()
+        if norm in self.data["oneoff_items"]:
+            self.data["oneoff_items"][norm]["count"] = self.data["oneoff_items"][norm].get("count", 0) + 1
+            self.data["oneoff_items"][norm]["last_purchased"] = now_str
+            self.data["oneoff_items"][norm]["display_name"] = item
+        else:
+            self.data["oneoff_items"][norm] = {
+                "display_name": item,
+                "count": 1,
+                "first_purchased": now_str,
+                "last_purchased": now_str,
+            }
+        self._save_local_only()
+
+    def is_known_oneoff(self, item: str) -> bool:
+        """Check if item was previously marked as one-off."""
+        norm = normalize_item_name(item)
+        return norm in self.data.get("oneoff_items", {})
+
+    def get_frequent_oneoffs(self, threshold: int = 3) -> list:
+        """Get one-off items bought >= threshold times — candidates for promotion to regular."""
+        result = []
+        for norm, info in self.data.get("oneoff_items", {}).items():
+            if info.get("count", 0) >= threshold:
+                result.append({
+                    "item": info.get("display_name", norm),
+                    "count": info["count"],
+                    "first": info.get("first_purchased", ""),
+                    "last": info.get("last_purchased", ""),
+                })
+        return result
+
+    def promote_oneoff_to_regular(self, item: str) -> bool:
+        """Remove item from oneoff_items (it stays in stock as regular)."""
+        norm = normalize_item_name(item)
+        if norm in self.data.get("oneoff_items", {}):
+            del self.data["oneoff_items"][norm]
+            self._save_local_only()
+            return True
+        return False
+
     def update_stock_bulk(self, items: list, stock_date: str = None):
         """Update multiple stock items under a specific date.
         stock_date should be dd/mm/yy format. Defaults to today."""
@@ -885,7 +1017,238 @@ class LocalJsonStore:
                 }
                 self.data["stock_history"][stock_date][item_name] = qty
 
+                # Keep stock_current in sync
+                if "stock_current" not in self.data:
+                    self.data["stock_current"] = {}
+                try:
+                    self.data["stock_current"][item_name] = int(qty)
+                except (ValueError, TypeError):
+                    pass
+
         self._save_local_only()
+
+    def add_receipt_to_stock(self, item: str, qty: int):
+        """Add received quantity to running current stock (from a receipt).
+        Does NOT create a new date column — receipts only affect Current Stock."""
+        item = self._find_existing_stock_name(item)
+
+        if "stock_current" not in self.data:
+            self.data["stock_current"] = {}
+        try:
+            qty = int(qty)
+        except (ValueError, TypeError):
+            qty = 0
+
+        current = self.data["stock_current"].get(item, 0)
+        try:
+            current = int(current)
+        except (ValueError, TypeError):
+            current = 0
+        new_total = current + qty
+        self.data["stock_current"][item] = new_total
+
+        # Backward compat: update the stock dict with current qty
+        self.data["stock"][item] = {
+            "qty": str(new_total),
+            "updated_by": self.data.get("stock", {}).get(item, {}).get("updated_by", "Receipt"),
+            "updated_at": _now().isoformat(),
+        }
+
+        self._sync_current_stock_to_sheet(item)
+        self._save_local_only()
+
+    def full_stock_count(self, items: dict, counted_by: str):
+        """Record a full physical stock count.
+        items: {item_name: qty_int} from physical count.
+        Items not present carry forward their existing stock_current value."""
+        if "stock_current" not in self.data:
+            self.data["stock_current"] = {}
+        if "last_full_count" not in self.data:
+            self.data["last_full_count"] = {}
+        if "stock_history" not in self.data:
+            self.data["stock_history"] = {}
+
+        today_iso = _now().strftime("%Y-%m-%d")
+        today_sheet = _now().strftime("%d/%m/%y")
+
+        if today_sheet not in self.data["stock_history"]:
+            self.data["stock_history"][today_sheet] = {}
+
+        for item, qty in items.items():
+            item = self._find_existing_stock_name(item)
+            try:
+                qty = int(qty)
+            except (ValueError, TypeError):
+                continue
+
+            self.data["stock_current"][item] = qty
+            self.data["last_full_count"][item] = {"qty": qty, "date": today_iso}
+            self.data["stock_history"][today_sheet][item] = qty
+
+            # Backward compat
+            self.data["stock"][item] = {
+                "qty": str(qty),
+                "updated_by": counted_by,
+                "updated_at": _now().isoformat(),
+            }
+
+            # Write to Sheet
+            if self._sheets:
+                try:
+                    self._sheets.write_stock_item(item, str(qty), today_sheet)
+                except Exception as e:
+                    logger.error(f"Direct sheet write failed (full_stock_count): {e}")
+            self._sync_current_stock_to_sheet(item)
+
+        self._save_local_only()
+
+    def _sync_current_stock_to_sheet(self, item: str = None):
+        """Update the Current Stock (column B) values on the Stock sheet.
+        If item is given, only that item's row is updated; otherwise all items."""
+        if not self._sheets:
+            return
+        ws = self._sheets._get_ws("Stock")
+        if not ws:
+            return
+        try:
+            existing = ws.get_all_values()
+            if not existing or not existing[0]:
+                return
+
+            header = existing[0]
+
+            # Ensure "Current Stock" is column B; insert it if missing
+            if len(header) < 2 or header[1] != "Current Stock":
+                new_header = [header[0], "Current Stock"] + header[1:]
+                new_rows = [new_header]
+                for row in existing[1:]:
+                    new_rows.append([row[0] if row else "", ""] + (row[1:] if row else []))
+                ws.clear()
+                ws.update("A1", new_rows)
+                existing = new_rows
+                header = new_header
+
+            stock_current = self.data.get("stock_current", {})
+
+            if item is not None:
+                items_to_sync = {item: stock_current.get(item, 0)}
+            else:
+                items_to_sync = stock_current
+
+            for it, qty in items_to_sync.items():
+                norm = normalize_item_name(it)
+                row_idx = None
+                for i, row in enumerate(existing[1:], 1):
+                    if row and normalize_item_name(row[0]) == norm:
+                        row_idx = i
+                        break
+
+                if row_idx is not None:
+                    cell = gspread.utils.rowcol_to_a1(row_idx + 1, 2)
+                    ws.update_acell(cell, qty)
+                else:
+                    new_row = [""] * len(header)
+                    new_row[0] = it
+                    new_row[1] = qty
+                    ws.append_row(new_row)
+                    existing.append(new_row)
+
+            ws.format("A1:Z1", {"textFormat": {"bold": True}})
+
+        except Exception as e:
+            logger.error(f"Sheet sync error (current stock): {e}")
+
+    def correct_stock_entry(self, item: str, new_qty: int, corrected_by: str):
+        """Overwrite an item's current stock and today's history entry."""
+        item = self._find_existing_stock_name(item)
+        try:
+            new_qty = int(new_qty)
+        except (ValueError, TypeError):
+            new_qty = 0
+
+        today_sheet = _now().strftime("%d/%m/%y")
+
+        if "stock_current" not in self.data:
+            self.data["stock_current"] = {}
+        self.data["stock_current"][item] = new_qty
+
+        if "stock_history" not in self.data:
+            self.data["stock_history"] = {}
+        if today_sheet not in self.data["stock_history"]:
+            self.data["stock_history"][today_sheet] = {}
+        self.data["stock_history"][today_sheet][item] = new_qty
+
+        self.data["stock"][item] = {
+            "qty": str(new_qty),
+            "updated_by": corrected_by,
+            "updated_at": _now().isoformat(),
+        }
+
+        if self._sheets:
+            try:
+                self._sheets.write_stock_item(item, str(new_qty), today_sheet)
+            except Exception as e:
+                logger.error(f"Direct sheet write failed (correct_stock_entry): {e}")
+        self._sync_current_stock_to_sheet(item)
+
+        self._save_local_only()
+
+    def undo_last_stock_update(self, item: str) -> bool:
+        """Undo the most recent stock_history entry for an item.
+        Restores stock_current to the previous date's value (or removes if none).
+        Returns True if an undo was performed, False if there was nothing to undo."""
+        item = self._find_existing_stock_name(item)
+        history = self.data.get("stock_history", {})
+
+        # Collect all (date, qty) entries for this item, sorted by date desc
+        norm = normalize_item_name(item)
+
+        def parse_d(d):
+            try:
+                return datetime.strptime(d, "%d/%m/%y")
+            except (ValueError, TypeError):
+                return datetime.min
+
+        entries = []
+        for date_str, items_on_date in history.items():
+            for k, v in items_on_date.items():
+                if normalize_item_name(k) == norm:
+                    entries.append((date_str, k, v))
+
+        if not entries:
+            return False
+
+        entries.sort(key=lambda e: parse_d(e[0]), reverse=True)
+        latest_date, latest_key, _latest_qty = entries[0]
+
+        # Remove the latest entry
+        del history[latest_date][latest_key]
+        if not history[latest_date]:
+            del history[latest_date]
+
+        # Find previous entry (next most recent) to restore stock_current
+        if len(entries) > 1:
+            _, _, prev_qty = entries[1]
+            try:
+                prev_qty_val = int(prev_qty)
+            except (ValueError, TypeError):
+                prev_qty_val = prev_qty
+            if "stock_current" not in self.data:
+                self.data["stock_current"] = {}
+            self.data["stock_current"][item] = prev_qty_val
+            self.data["stock"][item] = {
+                "qty": str(prev_qty_val),
+                "updated_by": self.data.get("stock", {}).get(item, {}).get("updated_by", ""),
+                "updated_at": _now().isoformat(),
+            }
+        else:
+            # No previous entry — remove current stock tracking for this item
+            self.data.get("stock_current", {}).pop(item, None)
+            self.data.get("stock", {}).pop(item, None)
+
+        self._sync_current_stock_to_sheet(item)
+        self._save_local_only()
+        return True
 
     def check_low_stock(self, items_updated: list = None) -> list:
         """Check stock against SOP minimums. Returns list of {item, qty, min} for low items.
@@ -1354,6 +1717,54 @@ class LocalJsonStore:
     def set_setting(self, key: str, value):
         self.data["settings"][key] = value
         self._save()
+
+
+class AliasStore:
+    """Persistent alias mappings for stock item names.
+    Maps alternative names → canonical stock names."""
+
+    _instance = None
+    FILE = DATA_DIR / "aliases.json"
+
+    def __init__(self):
+        self._data = {}  # {alias_normalized: canonical_name}
+        self._load()
+
+    def _load(self):
+        if self.FILE.exists():
+            try:
+                with open(self.FILE) as f:
+                    self._data = json.load(f)
+            except Exception:
+                self._data = {}
+
+    def _save(self):
+        with open(self.FILE, "w") as f:
+            json.dump(self._data, f, indent=2)
+
+    def add_alias(self, canonical: str, alias: str):
+        """Map alias → canonical name."""
+        norm = normalize_item_name(alias)
+        self._data[norm] = canonical
+        self._save()
+
+    def resolve(self, name: str) -> str:
+        """Return canonical name if alias exists, else the input name."""
+        norm = normalize_item_name(name)
+        return self._data.get(norm, name)
+
+    def find_match(self, name: str) -> str:
+        """Try alias store first, then return input."""
+        return self.resolve(name)
+
+    def get_all(self) -> dict:
+        return dict(self._data)
+
+
+def get_alias_store() -> AliasStore:
+    if AliasStore._instance is None:
+        AliasStore._instance = AliasStore()
+    return AliasStore._instance
 
 
 # ─── Factory (singleton) ─────────────────────────────────────

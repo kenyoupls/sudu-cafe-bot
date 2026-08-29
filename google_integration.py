@@ -46,6 +46,7 @@ def _get_credentials():
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/calendar.readonly",
         ]
         return Credentials.from_service_account_file(creds_file, scopes=scopes)
     except Exception as e:
@@ -322,6 +323,69 @@ def update_monthly_expenses(month: str = None) -> bool:
     except Exception as e:
         logger.error(f"Failed to update monthly expenses: {e}")
         return False
+
+
+def delete_expense_rows(supplier: str, expense_date: str) -> int:
+    """Find and delete matching rows from Expenses Detail sheet.
+    Returns count of deleted rows. Re-aggregates monthly after deletion."""
+    ss = _get_spreadsheet()
+    if ss is None:
+        return 0
+
+    try:
+        ws = ss.worksheet("Expenses Detail")
+
+        all_rows = ws.get_all_values()
+        if not all_rows or len(all_rows) < 2:
+            return 0
+
+        header = all_rows[0]
+        # Find supplier and date column indices
+        supplier_col = None
+        date_col = None
+        for i, h in enumerate(header):
+            h_lower = h.lower().strip()
+            if 'supplier' in h_lower:
+                supplier_col = i
+            if 'date' in h_lower:
+                date_col = i
+
+        if supplier_col is None or date_col is None:
+            logger.error("Could not find supplier/date columns in Expenses Detail")
+            return 0
+
+        # Find rows to delete (from bottom up to preserve indices)
+        rows_to_delete = []
+        supplier_norm = supplier.lower().strip()
+        for row_idx, row in enumerate(all_rows[1:], 2):  # row 2 = first data row
+            if len(row) <= max(supplier_col, date_col):
+                continue
+            row_supplier = row[supplier_col].lower().strip()
+            row_date = row[date_col].strip()
+            if supplier_norm in row_supplier or row_supplier in supplier_norm:
+                if row_date == expense_date:
+                    rows_to_delete.append(row_idx)
+
+        # Delete from bottom up
+        deleted = 0
+        for row_idx in sorted(rows_to_delete, reverse=True):
+            try:
+                ws.delete_rows(row_idx)
+                deleted += 1
+            except Exception as e:
+                logger.error(f"Error deleting row {row_idx}: {e}")
+
+        # Re-aggregate monthly expenses
+        if deleted > 0:
+            try:
+                update_monthly_expenses()
+            except Exception as e:
+                logger.error(f"Error re-aggregating after deletion: {e}")
+
+        return deleted
+    except Exception as e:
+        logger.error(f"delete_expense_rows error: {e}")
+        return 0
 
 
 def get_expenses_detail(month: str = None) -> list:
@@ -994,3 +1058,213 @@ def upload_file_to_drive(
     except Exception as e:
         logger.error(f"Drive file upload error: {e}")
         return None
+
+
+# ═══════════════════════════════════════════════════════════
+#  🎉 HOLIDAY SYSTEM
+# ═══════════════════════════════════════════════════════════
+
+def fetch_google_calendar_holidays(year: int) -> list:
+    """Fetch public holidays from Google Calendar API for MY + SG.
+    Uses the existing service account credentials.
+    Returns list of {"date": "YYYY-MM-DD", "name": str, "country": str}."""
+    holidays = []
+    try:
+        creds = _get_credentials()
+        if not creds:
+            return holidays
+
+        from googleapiclient.discovery import build
+        service = build('calendar', 'v3', credentials=creds)
+
+        time_min = f"{year}-01-01T00:00:00Z"
+        time_max = f"{year}-12-31T23:59:59Z"
+
+        for country, cal_id in config.HOLIDAY_CALENDAR_IDS.items():
+            try:
+                events = service.events().list(
+                    calendarId=cal_id,
+                    timeMin=time_min,
+                    timeMax=time_max,
+                    singleEvents=True,
+                    orderBy='startTime',
+                ).execute()
+
+                for event in events.get('items', []):
+                    start = event.get('start', {})
+                    date_str = start.get('date', start.get('dateTime', '')[:10])
+                    if date_str:
+                        holidays.append({
+                            "date": date_str,
+                            "name": event.get('summary', 'Public Holiday'),
+                            "country": country,
+                            "source": "google_calendar",
+                        })
+            except Exception as e:
+                logger.error(f"Google Calendar error for {country}: {e}")
+    except Exception as e:
+        logger.error(f"fetch_google_calendar_holidays error: {e}")
+
+    return holidays
+
+
+def fetch_calendarific_holidays(year: int) -> list:
+    """Fetch state-level holidays from Calendarific API (free tier).
+    Returns list of {"date": "YYYY-MM-DD", "name": str, "state": str}."""
+    holidays = []
+    api_key = config.CALENDARIFIC_API_KEY
+    if not api_key:
+        logger.info("No CALENDARIFIC_API_KEY — skipping state holidays")
+        return holidays
+
+    import urllib.request
+    import json as _json
+
+    for loc in config.CALENDARIFIC_LOCATIONS:
+        try:
+            country = loc["country"]
+            state = loc.get("state", "")
+            url = (
+                f"https://calendarific.com/api/v2/holidays"
+                f"?api_key={api_key}&country={country}&year={year}"
+            )
+            if state:
+                url += f"&location={state}"
+
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode())
+
+            for h in data.get("response", {}).get("holidays", []):
+                date_info = h.get("date", {})
+                iso_date = date_info.get("iso", "")[:10]
+                if iso_date:
+                    holidays.append({
+                        "date": iso_date,
+                        "name": h.get("name", "Holiday"),
+                        "state": state or country,
+                        "source": "calendarific",
+                    })
+        except Exception as e:
+            logger.error(f"Calendarific error for {loc}: {e}")
+
+    return holidays
+
+
+def refresh_holiday_cache() -> dict:
+    """Combine all holiday sources, deduplicate, save to data/holidays.json."""
+    import json as _json
+    from pathlib import Path
+
+    cache_file = Path("data/holidays.json")
+    current_year = _now().year
+    next_year = current_year + 1
+
+    all_holidays = []
+
+    # Google Calendar holidays
+    for year in (current_year, next_year):
+        try:
+            all_holidays.extend(fetch_google_calendar_holidays(year))
+        except Exception as e:
+            logger.error(f"Google Calendar fetch failed for {year}: {e}")
+
+    # Calendarific state holidays
+    for year in (current_year, next_year):
+        try:
+            all_holidays.extend(fetch_calendarific_holidays(year))
+        except Exception as e:
+            logger.error(f"Calendarific fetch failed for {year}: {e}")
+
+    # School holidays
+    school_lists = {
+        current_year: getattr(config, f"SCHOOL_HOLIDAYS_{current_year}", []),
+        next_year: getattr(config, f"SCHOOL_HOLIDAYS_{next_year}", []),
+    }
+    for year, school_list in school_lists.items():
+        for start, end, label in school_list:
+            all_holidays.append({
+                "date": start,
+                "end_date": end,
+                "name": label,
+                "source": "school_holidays",
+            })
+
+    # Deduplicate by (date, name)
+    seen = set()
+    unique = []
+    for h in all_holidays:
+        key = (h["date"], h["name"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(h)
+
+    # Sort by date
+    unique.sort(key=lambda x: x["date"])
+
+    cache_data = {
+        "last_updated": _now().isoformat(),
+        "holidays": unique,
+    }
+
+    cache_file.parent.mkdir(exist_ok=True)
+    with open(cache_file, "w") as f:
+        _json.dump(cache_data, f, indent=2)
+
+    logger.info(f"Holiday cache refreshed: {len(unique)} holidays")
+    return cache_data
+
+
+def get_upcoming_holidays(days_ahead: int = 14) -> list:
+    """Read holiday cache + school holidays. Return holidays in the next N days."""
+    import json as _json
+    from pathlib import Path
+    from datetime import timedelta
+
+    cache_file = Path("data/holidays.json")
+    today = _now().date()
+    cutoff = today + timedelta(days=days_ahead)
+
+    upcoming = []
+
+    # Read cache
+    if cache_file.exists():
+        try:
+            with open(cache_file) as f:
+                cache = _json.load(f)
+            for h in cache.get("holidays", []):
+                try:
+                    h_date = datetime.strptime(h["date"], "%Y-%m-%d").date()
+                    h_end = None
+                    if h.get("end_date"):
+                        h_end = datetime.strptime(h["end_date"], "%Y-%m-%d").date()
+
+                    # Include if: single-day holiday in range, OR multi-day holiday overlaps range
+                    if h_end:
+                        if h_date <= cutoff and h_end >= today:
+                            upcoming.append(h)
+                    else:
+                        if today <= h_date <= cutoff:
+                            upcoming.append(h)
+                except (ValueError, KeyError):
+                    continue
+        except Exception as e:
+            logger.error(f"Error reading holiday cache: {e}")
+
+    # Also check current year's school holidays directly (in case cache is stale)
+    current_year = today.year
+    school_list = getattr(config, f"SCHOOL_HOLIDAYS_{current_year}", [])
+    for start, end, label in school_list:
+        try:
+            s_date = datetime.strptime(start, "%Y-%m-%d").date()
+            e_date = datetime.strptime(end, "%Y-%m-%d").date()
+            if s_date <= cutoff and e_date >= today:
+                entry = {"date": start, "end_date": end, "name": label, "source": "school_holidays"}
+                # Avoid duplicates
+                if not any(h["date"] == start and h["name"] == label for h in upcoming):
+                    upcoming.append(entry)
+        except ValueError:
+            continue
+
+    upcoming.sort(key=lambda x: x["date"])
+    return upcoming

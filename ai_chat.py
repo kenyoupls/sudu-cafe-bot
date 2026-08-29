@@ -247,77 +247,103 @@ async def _groq_vision(prompt: str, image_bytes: bytes, mime_type: str = "image/
 #
 # Cleanup: messages older than MEMORY_RETENTION_DAYS auto-deleted.
 
-MEMORY_DIR = Path("data") / "memory"
+MEMORY_BASE_DIR = Path("data") / "memory"
+# Legacy non-group dir (backward compat — used when chat_id=0)
+MEMORY_DIR = MEMORY_BASE_DIR
 SUMMARIES_FILE = MEMORY_DIR / "summaries.json"
 
-# In-memory cache: {date_str: [messages]}
+# In-memory cache: {group_key: {date_str: [messages]}}
 _day_cache: dict = {}
+# In-memory cache: {group_key: {date_str: summary}}
 _summaries_cache: dict = {}
-_cache_loaded = False
+_cache_loaded: set = set()  # set of group_keys that have been loaded
 
 
-def _ensure_dir():
-    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+def _group_memory_dir(chat_id: int = 0) -> Path:
+    """Return group-specific memory directory."""
+    if not chat_id:
+        return MEMORY_BASE_DIR
+    return MEMORY_BASE_DIR / str(chat_id)
 
 
-def _day_file(day: str) -> Path:
-    """Return path like data/memory/2026-08-22.json"""
-    return MEMORY_DIR / f"{day}.json"
+def _group_summaries_file(chat_id: int = 0) -> Path:
+    return _group_memory_dir(chat_id) / "summaries.json"
 
 
-def _load_day(day: str) -> list:
-    """Load messages for a single day."""
-    if day in _day_cache:
-        return _day_cache[day]
-    path = _day_file(day)
+def _ensure_dir(chat_id: int = 0):
+    _group_memory_dir(chat_id).mkdir(parents=True, exist_ok=True)
+
+
+def _group_key(chat_id: int = 0) -> str:
+    return str(chat_id) if chat_id else "_default"
+
+
+def _day_file(day: str, chat_id: int = 0) -> Path:
+    """Return path like data/memory/{chat_id}/2026-08-22.json"""
+    return _group_memory_dir(chat_id) / f"{day}.json"
+
+
+def _load_day(day: str, chat_id: int = 0) -> list:
+    """Load messages for a single day in a specific group."""
+    gk = _group_key(chat_id)
+    if gk not in _day_cache:
+        _day_cache[gk] = {}
+    if day in _day_cache[gk]:
+        return _day_cache[gk][day]
+    path = _day_file(day, chat_id)
     msgs = []
     if path.exists():
         try:
             with open(path, "r") as f:
                 msgs = json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load memory for {day}: {e}")
-    _day_cache[day] = msgs
+            logger.error(f"Failed to load memory for {day} (group {chat_id}): {e}")
+    _day_cache[gk][day] = msgs
     return msgs
 
 
-def _save_day(day: str):
+def _save_day(day: str, chat_id: int = 0):
     """Persist messages for a single day."""
-    _ensure_dir()
+    gk = _group_key(chat_id)
+    _ensure_dir(chat_id)
     try:
-        with open(_day_file(day), "w") as f:
-            json.dump(_day_cache.get(day, []), f, indent=1, default=str)
+        with open(_day_file(day, chat_id), "w") as f:
+            json.dump(_day_cache.get(gk, {}).get(day, []), f, indent=1, default=str)
     except Exception as e:
-        logger.error(f"Failed to save memory for {day}: {e}")
+        logger.error(f"Failed to save memory for {day} (group {chat_id}): {e}")
 
 
-def _load_summaries() -> dict:
-    """Load daily summaries from disk."""
-    global _summaries_cache
-    if _summaries_cache:
-        return _summaries_cache
-    if SUMMARIES_FILE.exists():
+def _load_summaries(chat_id: int = 0) -> dict:
+    """Load daily summaries from disk for a specific group."""
+    gk = _group_key(chat_id)
+    if gk not in _summaries_cache:
+        _summaries_cache[gk] = {}
+    if _summaries_cache[gk]:
+        return _summaries_cache[gk]
+    sf = _group_summaries_file(chat_id)
+    if sf.exists():
         try:
-            with open(SUMMARIES_FILE, "r") as f:
-                _summaries_cache = json.load(f)
+            with open(sf, "r") as f:
+                _summaries_cache[gk] = json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load summaries: {e}")
-            _summaries_cache = {}
-    return _summaries_cache
+            logger.error(f"Failed to load summaries (group {chat_id}): {e}")
+            _summaries_cache[gk] = {}
+    return _summaries_cache[gk]
 
 
-def _save_summaries():
+def _save_summaries(chat_id: int = 0):
     """Persist summaries to disk."""
-    _ensure_dir()
+    gk = _group_key(chat_id)
+    _ensure_dir(chat_id)
     try:
-        with open(SUMMARIES_FILE, "w") as f:
-            json.dump(_summaries_cache, f, indent=1, default=str)
+        with open(_group_summaries_file(chat_id), "w") as f:
+            json.dump(_summaries_cache.get(gk, {}), f, indent=1, default=str)
     except Exception as e:
-        logger.error(f"Failed to save summaries: {e}")
+        logger.error(f"Failed to save summaries (group {chat_id}): {e}")
 
 
 def _migrate_old_memory():
-    """One-time migration: move old chat_memory.json into daily files."""
+    """One-time migration: move old chat_memory.json into daily files (default group)."""
     old_file = Path("data") / "chat_memory.json"
     if not old_file.exists():
         return
@@ -327,42 +353,62 @@ def _migrate_old_memory():
         if not old_data:
             old_file.unlink(missing_ok=True)
             return
-        # Group by date
+        # Group by date — put into default (no group) memory
         by_day: dict = {}
         for msg in old_data:
-            day = msg.get("time", "")[:10]  # "2026-08-22 14:30" → "2026-08-22"
+            day = msg.get("time", "")[:10]
             if not day:
                 day = _today().isoformat()
             by_day.setdefault(day, []).append(msg)
-        _ensure_dir()
+        _ensure_dir(0)
+        gk = _group_key(0)
+        if gk not in _day_cache:
+            _day_cache[gk] = {}
         for day, msgs in by_day.items():
-            existing = _load_day(day)
+            existing = _load_day(day, 0)
             existing.extend(msgs)
-            _day_cache[day] = existing
-            _save_day(day)
+            _day_cache[gk][day] = existing
+            _save_day(day, 0)
         old_file.rename(old_file.with_suffix(".json.migrated"))
         logger.info(f"Migrated {len(old_data)} messages from old memory format")
     except Exception as e:
         logger.error(f"Migration error: {e}")
 
+    # Also migrate existing daily files from data/memory/*.json to default group
+    # (backward compat — old files without group subdir)
+    try:
+        for path in MEMORY_BASE_DIR.glob("20??-??-??.json"):
+            day_str = path.stem
+            existing = _load_day(day_str, 0)
+            # Already loaded from the same path, just ensure it's in cache
+            if gk not in _day_cache:
+                _day_cache[gk] = {}
+            _day_cache[gk][day_str] = existing
+    except Exception:
+        pass
 
-def _cleanup_old_days():
+
+def _cleanup_old_days(chat_id: int = 0):
     """Delete memory files older than MEMORY_RETENTION_DAYS. 0 = keep forever."""
     if config.MEMORY_RETENTION_DAYS <= 0:
-        return  # Keep forever
+        return
     cutoff = _today() - __import__("datetime").timedelta(days=config.MEMORY_RETENTION_DAYS)
+    gk = _group_key(chat_id)
+    mem_dir = _group_memory_dir(chat_id)
     try:
-        for path in MEMORY_DIR.glob("20??-??-??.json"):
+        for path in mem_dir.glob("20??-??-??.json"):
             day_str = path.stem
             try:
                 day_date = date.fromisoformat(day_str)
                 if day_date < cutoff:
                     path.unlink()
-                    _day_cache.pop(day_str, None)
-                    _summaries_cache.pop(day_str, None)
+                    if gk in _day_cache:
+                        _day_cache[gk].pop(day_str, None)
+                    if gk in _summaries_cache:
+                        _summaries_cache[gk].pop(day_str, None)
             except ValueError:
                 continue
-        _save_summaries()
+        _save_summaries(chat_id)
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
@@ -423,15 +469,15 @@ def _is_important(text: str) -> bool:
     return False
 
 
-def search_memory(query: str, max_results: int = 20) -> list:
+def search_memory(query: str, max_results: int = 20, chat_id: int = 0) -> list:
     """Search through ALL stored messages (not just recent ones)."""
-    _init_memory()
+    _init_memory(chat_id)
     query_lower = query.lower()
     results = []
-    all_days = _get_all_recent_days()
+    all_days = _get_all_recent_days(chat_id)
 
     for day_str in reversed(all_days):  # newest first
-        msgs = _load_day(day_str)
+        msgs = _load_day(day_str, chat_id)
         for msg in reversed(msgs):
             text = msg.get("text", "").lower()
             who = msg.get("who", "").lower()
@@ -442,28 +488,29 @@ def search_memory(query: str, max_results: int = 20) -> list:
     return results
 
 
-def _init_memory():
+def _init_memory(chat_id: int = 0):
     """First-use init: migrate, cleanup."""
-    global _cache_loaded
-    if _cache_loaded:
+    gk = _group_key(chat_id)
+    if gk in _cache_loaded:
         return
-    _cache_loaded = True
-    _migrate_old_memory()
-    _cleanup_old_days()
-    _load_summaries()
+    _cache_loaded.add(gk)
+    if chat_id == 0:
+        _migrate_old_memory()
+    _cleanup_old_days(chat_id)
+    _load_summaries(chat_id)
 
 
 def remember(user_name: str, message: str, msg_type: str = "text",
              chat_id: int = 0, message_id: int = 0):
     """Store a message in today's memory bucket. Marks importance for AI context.
 
-    For voice/photo messages, we store only the description text + Telegram
-    chat_id/message_id so staff can find the original in Telegram without
-    us keeping file bytes on disk.
+    chat_id: Telegram group ID for context isolation. Each group gets its own
+    memory directory so conversations stay separate.
     """
-    _init_memory()
+    _init_memory(chat_id)
+    gk = _group_key(chat_id)
     today = _today().isoformat()
-    msgs = _load_day(today)
+    msgs = _load_day(today, chat_id)
     important = _is_important(message) or msg_type in ("voice", "photo", "receipt", "document")
     entry = {
         "time": _now().strftime("%Y-%m-%d %H:%M"),
@@ -476,23 +523,28 @@ def remember(user_name: str, message: str, msg_type: str = "text",
     if chat_id and message_id and msg_type in ("voice", "photo", "receipt", "document"):
         entry["tg_ref"] = {"chat_id": chat_id, "message_id": message_id}
     msgs.append(entry)
-    _day_cache[today] = msgs
-    _save_day(today)
+    if gk not in _day_cache:
+        _day_cache[gk] = {}
+    _day_cache[gk][today] = msgs
+    _save_day(today, chat_id)
 
 
-def remember_bot_response(response: str):
+def remember_bot_response(response: str, chat_id: int = 0):
     """Store the bot's own response in today's memory bucket."""
-    _init_memory()
+    _init_memory(chat_id)
+    gk = _group_key(chat_id)
     today = _today().isoformat()
-    msgs = _load_day(today)
+    msgs = _load_day(today, chat_id)
     msgs.append({
         "time": _now().strftime("%Y-%m-%d %H:%M"),
         "who": "Bot",
         "type": "bot_response",
         "text": response[:300],
     })
-    _day_cache[today] = msgs
-    _save_day(today)
+    if gk not in _day_cache:
+        _day_cache[gk] = {}
+    _day_cache[gk][today] = msgs
+    _save_day(today, chat_id)
 
 
 def _auto_summarise_day(day_str: str, messages: list) -> str:
@@ -532,27 +584,28 @@ def _auto_summarise_day(day_str: str, messages: list) -> str:
     return " | ".join(parts)
 
 
-def _get_all_recent_days() -> list:
+def _get_all_recent_days(chat_id: int = 0) -> list:
     """Return sorted list of day strings we have on disk (newest last)."""
-    _ensure_dir()
+    _ensure_dir(chat_id)
+    mem_dir = _group_memory_dir(chat_id)
     days = []
-    for path in MEMORY_DIR.glob("20??-??-??.json"):
+    for path in mem_dir.glob("20??-??-??.json"):
         days.append(path.stem)
     days.sort()
     return days
 
 
-def get_memory_context() -> str:
+def get_memory_context(chat_id: int = 0) -> str:
     """
     Build memory context for Gemini:
     - Days older than SUMMARY_DAYS_START → one-line summaries
     - Last RECENT_MESSAGES_FULL messages → verbatim
     """
-    _init_memory()
+    _init_memory(chat_id)
     today = _today()
     summary_cutoff = today - __import__("datetime").timedelta(days=config.SUMMARY_DAYS_START)
 
-    all_days = _get_all_recent_days()
+    all_days = _get_all_recent_days(chat_id)
     if not all_days:
         return ""
 
@@ -565,16 +618,16 @@ def get_memory_context() -> str:
             day_date = date.fromisoformat(day_str)
         except ValueError:
             continue
-        msgs = _load_day(day_str)
+        msgs = _load_day(day_str, chat_id)
         if not msgs:
             continue
 
         if day_date < summary_cutoff:
             # Use cached summary or generate one
-            summaries = _load_summaries()
+            summaries = _load_summaries(chat_id)
             if day_str not in summaries:
                 summaries[day_str] = _auto_summarise_day(day_str, msgs)
-                _save_summaries()
+                _save_summaries(chat_id)
             lines.append(summaries[day_str])
         else:
             # Only include important messages in verbatim context
@@ -685,6 +738,8 @@ Available actions:
 - mark_bought: {"action": "mark_bought", "item": "Oat milk"}
 - save_instruction: {"action": "save_instruction", "instruction": "always reply in Malay when staff writes in Malay"}
   Use when an admin says things like "from now on...", "remember that...", "always do...", "never do...", "our rule is...". Save the instruction so you follow it permanently.
+- learn_alias: {"action": "learn_alias", "canonical": "Nata de Coco", "alias": "ndc"}
+  Use when staff refers to an item by a nickname, abbreviation, or alternate name. This teaches the bot to map the alias to the correct stock item going forward.
 - add_event: {"action": "add_event", "title": "Live Music", "date": "2026-09-15", "details": "Jazz band 7-10pm"}
 - stock_count: {"action": "stock_count", "item": "Coffee Beans", "count": "3 bags", "note": "counted by Ahmad"}
   Use this when someone reports a single stock count.
@@ -696,6 +751,10 @@ Available actions:
   Mark a planned content piece as completed.
 - suggest_content: {"action": "suggest_content"}
   When someone asks for content ideas. The bot will generate AI suggestions based on today's context.
+- correct_stock: {"action": "correct_stock", "item": "Nata de Coco", "qty": 6, "note": "wrong count earlier"}
+  Use when staff says a previous stock entry was WRONG and needs to be corrected/overwritten. Keywords: "that's wrong", "salah tu", "bukan", "change to", "actually it's", "correction", "betulkan". This OVERWRITES the current stock, not adds to it.
+- undo_receipt: {"action": "undo_receipt", "supplier": "Giant", "date": "2026-08-22", "items": [{"name": "Nata de Coco", "qty": 12}]}
+  Use when staff says a receipt was wrong, cancel it, undo it. This reverses the stock additions AND deletes the expense rows. Keywords: "cancel receipt", "undo receipt", "wrong receipt", "batalkan resit", "salah resit".
 
 --- REPORTS (use these when someone asks to SEE data — no slash commands needed) ---
 - show_today: {"action": "show_today"}
@@ -798,6 +857,14 @@ IMPORTANT:
 - If no actions needed, just reply normally with NO actions block
 - You know WHO sent each message — reference them by name naturally
 
+CORRECTION DETECTION:
+When staff says something is wrong about a previous entry, detect the intent:
+- "That's wrong, it should be 6" → correct_stock
+- "Salah tu, bukan 12, 6 je" → correct_stock
+- "Cancel that receipt" → undo_receipt
+- "The nata de coco was 6 lychee and 6 mango, not 12 nata" → correct_stock for each item
+- "Eh I entered wrong just now" → ask what needs correcting
+
 MANAGER MINDSET RULES:
 - You have memory of recent conversations — up to a month. USE IT ACTIVELY. Connect what someone said today to what happened yesterday. "You mentioned the grinder was making noise on Monday — did it get fixed?"
 - Never make up specific data about this café (sales numbers, exact stock counts). If you have the data in context, use it to make decisions.
@@ -815,13 +882,28 @@ You will be given: current café data (including older chat summaries and recent
 
 SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace("CAFE_NAME_HERE", config.CAFE_NAME) + "\n\n" + build_sop_prompt()
 
+# Staff group gets an extra instruction block that blocks financial queries
+_STAFF_RESTRICTION = """
+
+IMPORTANT — STAFF GROUP RESTRICTIONS:
+You are currently in the STAFF group chat. You MUST follow these rules:
+- NEVER share any financial data: expenses, sales numbers, revenue, P&L, profit, loss, cost breakdowns, who paid what, repayment info, or monthly summaries.
+- If someone asks about finances, expenses, sales, profit, revenue, costs, P&L, who paid, or any money-related data, politely refuse: "Financial info is only available in the owner group. Check with the boss."
+- Do NOT trigger any of these actions: show_expenses, show_whopaid, show_sales, show_pnl, show_staff, monthly_summary.
+- You CAN still help with: stock, cleaning, shopping list, events, tasks, content, checklists, schedules, and general café operations.
+- Receipts can be submitted here (for logging purchases), but you must NOT reveal expense totals or summaries.
+"""
+
+STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
+
 
 # ═══════════════════════════════════════════════════════════
 #  CONTEXT BUILDER
 # ═══════════════════════════════════════════════════════════
 
-def _build_context() -> str:
-    """Pull current café state to feed as context."""
+def _build_context(is_staff_group: bool = False) -> str:
+    """Pull current café state to feed as context.
+    If is_staff_group=True, financial data (expenses, sales, P&L, staff list) is excluded."""
     store = get_store()
     parts = []
 
@@ -842,6 +924,20 @@ def _build_context() -> str:
     low = store.get_low_stock()
     if low:
         parts.append("LOW/OUT ITEMS: " + ", ".join(i for i, _ in low))
+
+    # Proactive: items that have been low for multiple days
+    if stock:
+        persistent_low = []
+        stock_current = store.data.get("stock_current", {})
+        last_count = store.data.get("last_full_count", {})
+        for item_name, info in stock.items():
+            qty_str = str(info.get("qty", "")).strip().upper()
+            if qty_str in ("LOW", "OUT", "0"):
+                lc = last_count.get(item_name, {})
+                if lc:
+                    persistent_low.append(f"{item_name} (since {lc.get('date', '?')})")
+        if persistent_low:
+            parts.append("⚠️ PERSISTENT LOW STOCK (still not restocked):\n  " + "\n  ".join(persistent_low[:10]))
 
     # Today's cleaning
     cleaning = store.get_cleaning_today()
@@ -946,16 +1042,33 @@ def _build_context() -> str:
     except Exception:
         pass
 
+    # Upcoming holidays
+    try:
+        from google_integration import get_upcoming_holidays
+        upcoming_holidays = get_upcoming_holidays(14)
+        if upcoming_holidays:
+            h_lines = []
+            for h in upcoming_holidays:
+                end = f" to {h['end_date']}" if h.get('end_date') else ""
+                source = f" ({h.get('source', '')})" if h.get('source') else ""
+                h_lines.append(f"  {h['date']}{end}: {h['name']}{source}")
+            parts.append("UPCOMING HOLIDAYS (next 14 days):\n" + "\n".join(h_lines))
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
     if not parts:
         return "No café data available yet. Staff should use /stockcheck, /addshift, etc. to set up."
 
     return "--- CURRENT CAFÉ DATA ---\n" + "\n\n".join(parts) + "\n--- END DATA ---"
 
 
-def _full_context(user_name: str, user_message: str, reply_context: str = None) -> str:
+def _full_context(user_name: str, user_message: str, reply_context: str = None,
+                   chat_id: int = 0, is_staff_group: bool = False) -> str:
     """Combine café data + memory + new message into one context block."""
-    cafe_data = _build_context()
-    memory = get_memory_context()
+    cafe_data = _build_context(is_staff_group=is_staff_group)
+    memory = get_memory_context(chat_id=chat_id)
     now = _now().strftime("%A, %d %B %Y, %I:%M %p")
 
     parts = [
@@ -1022,7 +1135,8 @@ def _parse_actions(raw_text: str) -> tuple:
     return chat_reply, actions
 
 
-async def process_message(user_message: str, user_name: str, reply_context: str = None) -> tuple:
+async def process_message(user_message: str, user_name: str, reply_context: str = None,
+                          chat_id: int = 0, is_staff_group: bool = False) -> tuple:
     """
     Process a chat message through Gemini.
     Returns (chat_reply: str, actions: list[dict]).
@@ -1032,14 +1146,18 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     if client is None:
         return None, []
 
+    # Use staff-restricted prompt when in staff group
+    sys_prompt = STAFF_SYSTEM_PROMPT if is_staff_group else SYSTEM_PROMPT
+
     try:
-        prompt = _full_context(user_name, user_message, reply_context)
+        prompt = _full_context(user_name, user_message, reply_context,
+                               chat_id=chat_id, is_staff_group=is_staff_group)
 
         response = client.models.generate_content(
             model="gemini-3.5-flash-lite",
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=sys_prompt,
                 temperature=0.7,
             ),
         )
@@ -1052,7 +1170,7 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
 
         # Store bot response in memory (without the actions block)
         if chat_reply:
-            remember_bot_response(chat_reply)
+            remember_bot_response(chat_reply, chat_id=chat_id)
 
         return chat_reply, actions
 
@@ -1060,23 +1178,26 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
         logger.error(f"Gemini API error: {e} — trying Groq fallback")
         # ── Groq fallback for text chat ──
         try:
-            prompt = _full_context(user_name, user_message, reply_context)
-            raw = await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.7, max_tokens=500)
+            prompt = _full_context(user_name, user_message, reply_context,
+                                   chat_id=chat_id, is_staff_group=is_staff_group)
+            raw = await _groq_text(prompt, system=sys_prompt, temperature=0.7, max_tokens=500)
             if not raw:
                 return None, []
             chat_reply, actions = _parse_actions(raw)
             if chat_reply:
-                remember_bot_response(chat_reply)
+                remember_bot_response(chat_reply, chat_id=chat_id)
             return chat_reply, actions
         except Exception as e2:
             logger.error(f"Groq fallback also failed: {e2}")
             return None, []
 
 
-async def ask_ai(user_message: str, user_name: str, reply_context: str = None) -> Optional[str]:
+async def ask_ai(user_message: str, user_name: str, reply_context: str = None,
+                  chat_id: int = 0, is_staff_group: bool = False) -> Optional[str]:
     """Send a text message to Gemini with full context + memory.
     Simple version — returns text only. Use process_message() for actions."""
-    reply, _ = await process_message(user_message, user_name, reply_context)
+    reply, _ = await process_message(user_message, user_name, reply_context,
+                                     chat_id=chat_id, is_staff_group=is_staff_group)
     return reply
 
 
@@ -1326,7 +1447,7 @@ async def handle_video(
 
     try:
         cafe_data = _build_context()
-        memory = get_memory_context()
+        memory = get_memory_context(chat_id)
         now = _now().strftime("%A, %d %B %Y, %I:%M %p")
 
         caption_context = f"They included this caption: '{caption}'" if caption else "No caption was included."
@@ -1633,7 +1754,7 @@ async def handle_voice(audio_bytes: bytes, user_name: str, mime_type: str = "aud
 
     try:
         cafe_data = _build_context()
-        memory = get_memory_context()
+        memory = get_memory_context(chat_id)
         now = _now().strftime("%A, %d %B %Y, %I:%M %p")
 
         text_context = (
@@ -1674,7 +1795,7 @@ async def handle_voice(audio_bytes: bytes, user_name: str, mime_type: str = "aud
             voice_match = re.search(r'\[Voice:(.+?)\]', result)
             voice_text = voice_match.group(1).strip() if voice_match else result[:100]
             remember(user_name, voice_text, "voice", chat_id, message_id)
-            remember_bot_response(result)
+            remember_bot_response(result, chat_id)
 
         return result
 
@@ -1707,7 +1828,7 @@ async def handle_photo(
 
     try:
         cafe_data = _build_context()
-        memory = get_memory_context()
+        memory = get_memory_context(chat_id)
         now = _now().strftime("%A, %d %B %Y, %I:%M %p")
 
         caption_context = f"They included this caption: '{caption}'" if caption else "No caption was included."
@@ -1748,7 +1869,7 @@ async def handle_photo(
         if result:
             photo_desc = caption if caption else result[:80]
             remember(user_name, f"[Photo: {photo_desc}]", "photo", chat_id, message_id)
-            remember_bot_response(result)
+            remember_bot_response(result, chat_id)
 
         return result
 
@@ -1770,7 +1891,7 @@ async def handle_photo(
             if result:
                 photo_desc = caption if caption else result[:80]
                 remember(user_name, f"[Photo: {photo_desc}]", "photo", chat_id, message_id)
-                remember_bot_response(result)
+                remember_bot_response(result, chat_id)
             return result
         except Exception as e2:
             logger.error(f"Groq photo fallback also failed: {e2}")
@@ -2409,7 +2530,7 @@ async def process_receipt(
             return None
 
 
-async def ask_about_data(question: str, user_name: str) -> Optional[str]:
+async def ask_about_data(question: str, user_name: str, chat_id: int = 0) -> Optional[str]:
     """Let the AI answer questions about Sheets data (P&L, stock usage, etc.)."""
     client = get_client()
     if client is None:
@@ -2450,7 +2571,7 @@ async def ask_about_data(question: str, user_name: str) -> Optional[str]:
 
         result = response.text.strip() if response.text else None
         if result:
-            remember_bot_response(result)
+            remember_bot_response(result, chat_id)
         return result
 
     except ImportError:
@@ -2476,7 +2597,7 @@ async def ask_about_data(question: str, user_name: str) -> Optional[str]:
             )
             result = await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.3, max_tokens=500)
             if result:
-                remember_bot_response(result)
+                remember_bot_response(result, chat_id)
             return result
         except Exception as e2:
             logger.error(f"Groq data query fallback also failed: {e2}")

@@ -27,8 +27,10 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler,
 )
 
+import functools
+
 import config
-from storage import get_store
+from storage import get_store, normalize_item_name
 from ai_chat import (
     ask_ai, get_content_idea, analyze_stock_and_suggest, suggest_for_event,
     handle_voice, handle_photo, handle_video, remember, process_message,
@@ -86,6 +88,26 @@ def _is_group_chat(update: Update) -> bool:
     return update.effective_chat.type in ("group", "supergroup")
 
 
+def _is_allowed_group(update: Update) -> bool:
+    """Check if chat is one of the allowed groups. Rejects DMs and unknown groups."""
+    if not config.ALLOWED_GROUP_IDS:
+        return True  # No groups configured = allow everything (backward compat)
+    chat_id = update.effective_chat.id
+    return chat_id in config.ALLOWED_GROUP_IDS
+
+
+def _is_staff_group(update: Update) -> bool:
+    """Check if message is from the staff group (restricted permissions)."""
+    if not config.STAFF_GROUP_ID:
+        return False
+    return update.effective_chat.id == config.STAFF_GROUP_ID
+
+
+def _get_chat_id(update: Update) -> int:
+    """Get the chat ID for context isolation."""
+    return update.effective_chat.id
+
+
 def _bot_is_tagged(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if bot was @tagged or if the message is a reply to the bot."""
     msg = update.message
@@ -115,6 +137,57 @@ def _bot_is_tagged(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
                 return True
 
     return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  GROUP RESTRICTION + PERMISSION CHECKS
+# ═══════════════════════════════════════════════════════════
+
+async def _group_gate(update: Update) -> bool:
+    """Returns True if message should be BLOCKED (wrong group / DM).
+    Silent reject — bot just ignores the message."""
+    if not config.ALLOWED_GROUP_IDS:
+        return False  # No groups configured = allow all
+    if not _is_group_chat(update):
+        return True  # Block DMs
+    if not _is_allowed_group(update):
+        return True  # Block unknown groups
+    return False
+
+
+async def _staff_cmd_gate(update: Update, cmd_name: str) -> bool:
+    """Returns True if command should be BLOCKED in staff group.
+    Sends a polite rejection message."""
+    if _is_staff_group(update) and cmd_name in config.STAFF_BLOCKED_COMMANDS:
+        await update.message.reply_text(
+            "🔒 This command is only available in the owner group."
+        )
+        return True
+    return False
+
+
+def group_only(func):
+    """Decorator: silently ignore messages from DMs / unknown groups."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if await _group_gate(update):
+            return
+        return await func(update, ctx, *args, **kwargs)
+    return wrapper
+
+
+def owner_only(cmd_name: str):
+    """Decorator: block command in staff group (financial / admin commands)."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            if await _group_gate(update):
+                return
+            if await _staff_cmd_gate(update, cmd_name):
+                return
+            return await func(update, ctx, *args, **kwargs)
+        return wrapper
+    return decorator
 
 
 # ═══════════════════════════════════════════════════════════
@@ -311,76 +384,141 @@ async def cmd_removestock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Item *{item_name}* not found in stock.", parse_mode="Markdown")
 
 
+def _stockcheck_buttons() -> InlineKeyboardMarkup:
+    """Common-quantity buttons for the full stock count flow."""
+    qty_row1 = [InlineKeyboardButton(str(n), callback_data=f"sck:{n}") for n in (0, 1, 2, 3)]
+    qty_row2 = [InlineKeyboardButton(str(n), callback_data=f"sck:{n}") for n in (5, 10)]
+    skip_row = [InlineKeyboardButton("⏭ Skip (keep current)", callback_data="sck:skip")]
+    return InlineKeyboardMarkup([qty_row1, qty_row2, skip_row])
+
+
+def _stockcheck_prompt_text(idx: int, total: int, item: str, current_qty) -> str:
+    return (
+        f"📦 *Stock Check* ({idx + 1}/{total})\n\n"
+        f"*{item}*\n"
+        f"Current recorded stock: {current_qty}\n\n"
+        f"Tap the actual count, or type a number and send it as a reply."
+    )
+
+
 async def cmd_stockcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Start interactive stock check — one category at a time."""
+    """Start an interactive full physical stock count — one item at a time."""
+    stock = store.get_stock()
+    items = sorted(stock.keys(), key=lambda k: k.lower())
+
+    if not items:
+        await update.message.reply_text(
+            "📦 No stock items tracked yet. Add items via receipts or /addstock first."
+        )
+        return
+
+    ctx.user_data["stock_check_items"] = items
     ctx.user_data["stock_check_index"] = 0
     ctx.user_data["stock_check_results"] = {}
-    cat = config.STOCK_CATEGORIES[0]
+    ctx.user_data["stock_check_active"] = True
 
-    buttons = [
-        [
-            InlineKeyboardButton("✅ OK", callback_data=f"sck:OK"),
-            InlineKeyboardButton("⚠️ LOW", callback_data=f"sck:LOW"),
-            InlineKeyboardButton("🔴 OUT", callback_data=f"sck:OUT"),
-        ]
-    ]
+    item = items[0]
+    current_qty = stock.get(item, {}).get("qty", "—")
+
     await update.message.reply_text(
-        f"📦 *Stock Check*\n\n{cat}\nWhat's the level?",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        _stockcheck_prompt_text(0, len(items), item, current_qty),
+        reply_markup=_stockcheck_buttons(),
         parse_mode="Markdown",
     )
+
+
+async def _stockcheck_advance(update_or_query, ctx: ContextTypes.DEFAULT_TYPE, name: str, edit: bool):
+    """Move to the next item in the stock check, or finish it."""
+    items = ctx.user_data.get("stock_check_items", [])
+    idx = ctx.user_data.get("stock_check_index", 0)
+
+    if idx >= len(items):
+        # All done — submit full count
+        results = ctx.user_data.get("stock_check_results", {})
+        store.full_stock_count(results, name)
+
+        stock = store.get_stock()
+        lines = [f"📦 *Stock Check Complete* — by {name}\n"]
+        for item in items:
+            if item in results:
+                lines.append(f"  🟢 {item}: {results[item]}")
+            else:
+                current_qty = stock.get(item, {}).get("qty", "—")
+                lines.append(f"  ⏭ {item}: {current_qty} (unchanged)")
+
+        text = "\n".join(lines)
+        ctx.user_data["stock_check_active"] = False
+        ctx.user_data.pop("stock_check_items", None)
+        ctx.user_data.pop("stock_check_results", None)
+        ctx.user_data.pop("stock_check_index", None)
+
+        if edit:
+            await update_or_query.edit_message_text(text, parse_mode="Markdown")
+        else:
+            await update_or_query.message.reply_text(text, parse_mode="Markdown")
+        return
+
+    item = items[idx]
+    stock = store.get_stock()
+    current_qty = stock.get(item, {}).get("qty", "—")
+    prompt = _stockcheck_prompt_text(idx, len(items), item, current_qty)
+    markup = _stockcheck_buttons()
+
+    if edit:
+        await update_or_query.edit_message_text(prompt, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update_or_query.message.reply_text(prompt, reply_markup=markup, parse_mode="Markdown")
 
 
 async def cb_stockcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    level = query.data.split(":", 1)[1]
+    value = query.data.split(":", 1)[1]
     name = user_name(update)
 
+    items = ctx.user_data.get("stock_check_items", [])
     idx = ctx.user_data.get("stock_check_index", 0)
-    cat = config.STOCK_CATEGORIES[idx]
 
-    # Save this result
-    store.update_stock(cat, level, name)
-    ctx.user_data["stock_check_results"][cat] = level
-
-    # Move to next category
-    idx += 1
-    ctx.user_data["stock_check_index"] = idx
-
-    if idx >= len(config.STOCK_CATEGORIES):
-        # All done — show summary
-        results = ctx.user_data["stock_check_results"]
-        lines = [f"📦 *Stock Check Complete* — by {name}\n"]
-        for item, lvl in results.items():
-            emoji = "🔴" if lvl in ("LOW", "OUT") else "🟢"
-            lines.append(f"  {emoji} {item}: {lvl}")
-
-        low_items = [i for i, l in results.items() if l in ("LOW", "OUT")]
-        if low_items:
-            lines.append("\n🚨 *Action needed — add to shopping list:*")
-            for item in low_items:
-                lines.append(f"  ➕ {item}")
-                store.add_shopping_item(item, "Auto (stock check)", "urgent")
-
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+    if not items or idx >= len(items):
+        await query.edit_message_text("⚠️ No active stock check. Use /stockcheck to start.")
         return
 
-    # Ask about next category
-    cat = config.STOCK_CATEGORIES[idx]
-    buttons = [
-        [
-            InlineKeyboardButton("✅ OK", callback_data=f"sck:OK"),
-            InlineKeyboardButton("⚠️ LOW", callback_data=f"sck:LOW"),
-            InlineKeyboardButton("🔴 OUT", callback_data=f"sck:OUT"),
-        ]
-    ]
-    await query.edit_message_text(
-        f"📦 *Stock Check* ({idx + 1}/{len(config.STOCK_CATEGORIES)})\n\n"
-        f"{cat}\nWhat's the level?",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
-    )
+    item = items[idx]
+
+    if value != "skip":
+        try:
+            qty_int = int(value)
+        except ValueError:
+            qty_int = 0
+        ctx.user_data["stock_check_results"][item] = qty_int
+
+    ctx.user_data["stock_check_index"] = idx + 1
+    await _stockcheck_advance(query, ctx, name, edit=True)
+
+
+async def stockcheck_text_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle a typed numeric reply during an active stock check.
+    Returns True if the message was consumed as a stock-check answer."""
+    if not ctx.user_data.get("stock_check_active"):
+        return False
+
+    import re as _re
+    text = (update.message.text or "").strip()
+    if not _re.fullmatch(r"\d+", text):
+        return False
+
+    items = ctx.user_data.get("stock_check_items", [])
+    idx = ctx.user_data.get("stock_check_index", 0)
+    if not items or idx >= len(items):
+        return False
+
+    item = items[idx]
+    ctx.user_data["stock_check_results"][item] = int(text)
+    ctx.user_data["stock_check_index"] = idx + 1
+
+    name = user_name(update)
+    await _stockcheck_advance(update, ctx, name, edit=False)
+    return True
 
 
 async def cmd_lowstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1005,7 +1143,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "⚙️ *Bot Settings*\n",
         f"  ☕ Café: {config.CAFE_NAME}",
         f"  🌏 Timezone: {config.TIMEZONE}",
-        f"  💬 Group Chat ID: {config.GROUP_CHAT_ID}",
+        f"  💬 Group Chat ID: {config.OWNER_GROUP_ID}",
         f"  👑 Admins: {len(config.ADMIN_USER_IDS)} configured",
         f"\n*Scheduled Reminders:*",
         f"  🌅 Opening checklist: {config.OPENING_CHECKLIST_TIME}",
@@ -1029,7 +1167,7 @@ async def handle_voice_note(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # In groups: only process if tagged or replied-to
     if _is_group_chat(update) and not _bot_is_tagged(update, ctx):
         name = user_name(update)
-        remember(name, "[Sent a voice note]", "voice")
+        remember(name, "[Sent a voice note]", "voice", update.effective_chat.id)
         return
 
     voice = update.message.voice
@@ -1125,7 +1263,7 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # In groups: if not tagged and it's just a regular photo, stay quiet
         if in_group and not tagged and classification == "photo":
-            remember(name, f"[Sent a photo: {caption}]" if caption else "[Sent a photo]", "photo")
+            remember(name, f"[Sent a photo: {caption}]" if caption else "[Sent a photo]", "photo", chat_id)
             return
 
         # ─── RECEIPT ───────────────────────────────────────
@@ -1315,7 +1453,7 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # In groups: only process if tagged
     if _is_group_chat(update) and not _bot_is_tagged(update, ctx):
-        remember(name, f"[Sent a video: {caption}]" if caption else "[Sent a video]", "video")
+        remember(name, f"[Sent a video: {caption}]" if caption else "[Sent a video]", "video", chat_id)
         return
 
     # Check file size — Gemini free tier has limits
@@ -1596,6 +1734,112 @@ def _receipt_confirm_buttons():
     ]])
 
 
+async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """After a receipt is confirmed, ask about items that look genuinely new
+    (never seen before this receipt) so the user can mark them Regular vs One-off."""
+    try:
+        from storage import get_alias_store
+        alias_store = get_alias_store()
+        today_str = now_sg().strftime("%d/%m/%y")
+        new_items = []
+        for receipt_item in items:
+            r_name = receipt_item.get("name", "")
+            if not r_name:
+                continue
+            norm = normalize_item_name(r_name)
+
+            # Check if it was in stock BEFORE this receipt (any date other than today)
+            was_known = False
+            for date_str, date_items in store.data.get("stock_history", {}).items():
+                if date_str == today_str:
+                    continue  # skip today (just added by this receipt)
+                for hist_item in date_items:
+                    if normalize_item_name(hist_item) == norm:
+                        was_known = True
+                        break
+                if was_known:
+                    break
+
+            # Also check aliases and one-off purchase history
+            if not was_known:
+                was_known = alias_store.resolve(r_name) != r_name  # known alias
+
+            if not was_known and store.is_known_oneoff(r_name):
+                # It's a known one-off — record another purchase but don't ask again
+                was_known = True
+                store.record_oneoff_item(r_name)
+                store.remove_stock(r_name)  # one-off — don't keep tracking it in stock
+
+            if not was_known:
+                new_items.append(r_name)
+
+        if new_items:
+            ctx.chat_data["new_receipt_items"] = new_items
+            ctx.chat_data["new_receipt_items_idx"] = 0
+            item = new_items[0]
+            buttons = [
+                [
+                    InlineKeyboardButton("🔄 Regular (track stock)", callback_data="newitem:regular"),
+                    InlineKeyboardButton("🧪 One-off (don't track)", callback_data="newitem:oneoff"),
+                ]
+            ]
+            await update.effective_message.reply_text(
+                f"🆕 *New item detected:* {item}\n\n"
+                f"Is this a regular stock item or a one-off purchase?",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"New item detection error: {e}")
+
+
+async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle Regular/One-off selection for new receipt items."""
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.split(":", 1)[1]  # "regular" or "oneoff"
+    items = ctx.chat_data.get("new_receipt_items", [])
+    idx = ctx.chat_data.get("new_receipt_items_idx", 0)
+
+    if idx >= len(items):
+        return
+
+    item = items[idx]
+
+    if choice == "oneoff":
+        store.record_oneoff_item(item)
+        store.remove_stock(item)
+        await query.edit_message_text(
+            f"🧪 Got it — *{item}* marked as one-off (won't track in stock).",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.edit_message_text(
+            f"🔄 Got it — *{item}* will be tracked as regular stock.",
+            parse_mode="Markdown",
+        )
+
+    # Move to next new item
+    idx += 1
+    ctx.chat_data["new_receipt_items_idx"] = idx
+
+    if idx < len(items):
+        next_item = items[idx]
+        buttons = [
+            [
+                InlineKeyboardButton("🔄 Regular (track stock)", callback_data="newitem:regular"),
+                InlineKeyboardButton("🧪 One-off (don't track)", callback_data="newitem:oneoff"),
+            ]
+        ]
+        await query.message.reply_text(
+            f"🆕 *New item detected:* {next_item}\n\n"
+            f"Is this a regular stock item or a one-off purchase?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+
+
 async def _confirm_receipt(pending: dict, confirmed_by: str,
                            update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Shared receipt confirmation logic — used by both button and reply."""
@@ -1676,10 +1920,34 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                 except Exception as e:
                     logger.error(f"Expense detail error for {item_name}: {e}")
 
-                store.update_stock(item_name, str(qty_int), f"Receipt ({receipt_user})")
+                store.add_receipt_to_stock(item_name, qty_int)
 
         if items:
             results.append(f"📦 {len(items)} items updated in stock")
+
+        # Auto-clear matching shopping list items
+        try:
+            shopping = store.get_shopping_list()
+            cleared_items = []
+            for receipt_item in items:
+                r_name = receipt_item.get("name", "").lower()
+                if not r_name:
+                    continue
+                r_norm = normalize_item_name(r_name)
+                for idx, shop_item in enumerate(shopping):
+                    if shop_item.get("bought"):
+                        continue
+                    s_norm = normalize_item_name(shop_item.get("item", ""))
+                    # Match if either contains the other, or normalized names match
+                    if (r_norm in s_norm or s_norm in r_norm or r_norm == s_norm):
+                        store.mark_bought(idx)
+                        cleared_items.append(shop_item["item"])
+                        break
+            if cleared_items:
+                results.append(f"🛒 Auto-cleared from shopping: {', '.join(cleared_items)}")
+        except Exception as e:
+            logger.error(f"Auto-clear shopping error: {e}")
+
         if detail_count:
             results.append(f"📋 {detail_count} items logged to Expenses (paid by {paid_by})")
 
@@ -1694,6 +1962,8 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
     except Exception as e:
         logger.error(f"Receipt save error: {e}")
         results.append(f"⚠️ Partial save: {e}")
+
+    await _detect_new_items(items, update, ctx)
 
     _clear_receipt_tracking(ctx)
 
@@ -1811,10 +2081,34 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Expense detail error for {item_name}: {e}")
 
-                store.update_stock(item_name, str(qty_int), f"Receipt ({receipt_user})")
+                store.add_receipt_to_stock(item_name, qty_int)
 
         if items:
             results.append(f"📦 {len(items)} items updated in stock")
+
+        # Auto-clear matching shopping list items
+        try:
+            shopping = store.get_shopping_list()
+            cleared_items = []
+            for receipt_item in items:
+                r_name = receipt_item.get("name", "").lower()
+                if not r_name:
+                    continue
+                r_norm = normalize_item_name(r_name)
+                for idx, shop_item in enumerate(shopping):
+                    if shop_item.get("bought"):
+                        continue
+                    s_norm = normalize_item_name(shop_item.get("item", ""))
+                    # Match if either contains the other, or normalized names match
+                    if (r_norm in s_norm or s_norm in r_norm or r_norm == s_norm):
+                        store.mark_bought(idx)
+                        cleared_items.append(shop_item["item"])
+                        break
+            if cleared_items:
+                results.append(f"🛒 Auto-cleared from shopping: {', '.join(cleared_items)}")
+        except Exception as e:
+            logger.error(f"Auto-clear shopping error: {e}")
+
         if detail_count:
             results.append(f"📋 {detail_count} items logged to Expenses (paid by {paid_by})")
 
@@ -1829,6 +2123,8 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Receipt save error: {e}")
         results.append(f"⚠️ Partial save: {e}")
+
+    await _detect_new_items(items, update, ctx)
 
     _clear_receipt_tracking(ctx)
 
@@ -1995,6 +2291,54 @@ async def cb_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  💬 NATURAL LANGUAGE / AI CHAT
 # ═══════════════════════════════════════════════════════════
 
+# Action type → keywords that map to task descriptions
+_ACTION_TASK_KEYWORDS = {
+    "update_stock": lambda a: ["stock", a.get("item", "").lower()],
+    "log_cleaning": lambda a: ["clean", a.get("zone", "").lower()],
+    "add_shopping": lambda a: ["buy", "shopping", a.get("item", "").lower()],
+    "mark_bought": lambda a: ["buy", "bought", a.get("item", "").lower()],
+    "checklist_done": lambda a: ["checklist", a.get("checklist", "").lower()],
+    "bulk_stock": lambda a: ["stock", "count", "check"],
+    "correct_stock": lambda a: ["stock", a.get("item", "").lower()],
+}
+
+
+def _auto_clear_matching_tasks(actions: list):
+    """After actions execute, auto-clear pending tasks that match what was just done.
+    Uses fuzzy keyword overlap: if 2+ significant words from the action match a task
+    description, mark it done."""
+    pending = store.get_action_items(status="pending")
+    if not pending:
+        return
+
+    cleared = []
+    for act in actions:
+        if not isinstance(act, dict):
+            continue
+        action_type = act.get("action", "")
+        kw_func = _ACTION_TASK_KEYWORDS.get(action_type)
+        if not kw_func:
+            continue
+
+        keywords = [w for w in kw_func(act) if w and len(w) > 2]
+        if not keywords:
+            continue
+
+        for idx, task in enumerate(pending):
+            if task.get("status") != "pending":
+                continue
+            desc = task.get("task", "").lower()
+            # Count how many keywords appear in the task description
+            matches = sum(1 for kw in keywords if kw in desc)
+            if matches >= 2:
+                store.complete_action_item(idx, "Auto (bot did it)")
+                cleared.append(task.get("task", "?"))
+                break  # one action clears one task max
+
+    if cleared:
+        logger.info(f"Auto-cleared {len(cleared)} tasks: {cleared}")
+
+
 async def _execute_actions(actions: list, name: str, update: Update):
     """Execute structured actions returned by the AI."""
     feedback = []
@@ -2107,6 +2451,54 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     alert_lines.append("\nPlease restock these items!")
                     await update.message.reply_text("\n".join(alert_lines))
 
+            elif action_type == "correct_stock":
+                item = act.get("item", "")
+                new_qty = act.get("qty", 0)
+                note = act.get("note", "")
+                if item:
+                    try:
+                        new_qty = int(new_qty)
+                    except (ValueError, TypeError):
+                        new_qty = 0
+                    store.correct_stock_entry(item, new_qty, f"{name}: {note}" if note else name)
+                    feedback.append(f"✏️ Corrected: {item} → {new_qty}")
+
+            elif action_type == "undo_receipt":
+                supplier = act.get("supplier", "")
+                expense_date = act.get("date", "")
+                undo_items = act.get("items", [])
+                if supplier:
+                    # Reverse stock additions
+                    for ui in undo_items:
+                        item_name = ui.get("name", "")
+                        qty = ui.get("qty", 0)
+                        if item_name:
+                            try:
+                                qty = int(qty)
+                            except (ValueError, TypeError):
+                                qty = 0
+                            # Subtract the qty that was added
+                            stock_current = store.data.get("stock_current", {})
+                            current_val = stock_current.get(item_name, 0)
+                            try:
+                                current_val = int(current_val)
+                            except (ValueError, TypeError):
+                                current_val = 0
+                            new_val = max(0, current_val - qty)
+                            store.correct_stock_entry(item_name, new_val, f"Undo receipt ({name})")
+                    # Delete expense rows
+                    if expense_date:
+                        try:
+                            from google_integration import delete_expense_rows
+                            deleted = delete_expense_rows(supplier, expense_date)
+                            feedback.append(f"↩️ Undone: {supplier} receipt ({deleted} expense rows removed)")
+                        except ImportError:
+                            feedback.append(f"↩️ Stock reversed for {supplier} (no Sheets integration)")
+                        except Exception as e:
+                            feedback.append(f"↩️ Stock reversed for {supplier} (expense cleanup error: {e})")
+                    else:
+                        feedback.append(f"↩️ Stock reversed for {supplier}")
+
             elif action_type == "checklist_done":
                 checklist = act.get("checklist", "").lower()
                 items = act.get("items", ["all"])
@@ -2173,6 +2565,15 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 if instruction:
                     store.add_custom_instruction(instruction, name)
                     feedback.append(f"📝 Noted! I'll remember: {instruction}")
+
+            elif action_type == "learn_alias":
+                canonical = act.get("canonical", "")
+                alias = act.get("alias", "")
+                if canonical and alias:
+                    from storage import get_alias_store
+                    alias_store = get_alias_store()
+                    alias_store.add_alias(canonical, alias)
+                    feedback.append(f"🧠 Learned: '{alias}' = '{canonical}'")
 
             # ── REPORT ACTIONS (natural language → same output as slash commands) ──
 
@@ -2449,15 +2850,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    # Group restriction — ignore DMs and unknown groups
+    if await _group_gate(update):
+        return
+
     text = update.message.text.strip()
     name = user_name(update)
+    chat_id = _get_chat_id(update)
 
     # Skip commands
     if text.startswith("/"):
         return
 
     # Store in memory — ALWAYS, even if bot won't reply
-    remember(name, text, "text")
+    remember(name, text, "text", chat_id=chat_id)
+
+    # ─── Check for active stock check numeric reply ──
+    if ctx.user_data.get("stock_check_active"):
+        consumed = await stockcheck_text_reply(update, ctx)
+        if consumed:
+            return
 
     # ─── Check for receipt confirmation / amendment ──
     # Catches: (a) reply to ANY bot message in the receipt conversation,
@@ -2818,14 +3230,28 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_context = f"{replied_name}: {replied_text}"
 
     # ─── Send to AI — get reply + actions ──────────────────
-    chat_reply, actions = await process_message(text, name, reply_context)
+    is_staff = _is_staff_group(update)
+    chat_reply, actions = await process_message(
+        text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
+    )
 
     if chat_reply:
         await update.message.reply_text(chat_reply)
 
         # Execute any actions the AI triggered
         if actions:
+            # Filter out blocked actions in staff group
+            if is_staff:
+                actions = [
+                    a for a in actions
+                    if a.get("action", "") not in config.STAFF_BLOCKED_ACTIONS
+                ]
             feedback = await _execute_actions(actions, name, update)
+            # Auto-clear pending tasks that match executed actions
+            try:
+                _auto_clear_matching_tasks(actions)
+            except Exception as e:
+                logger.error(f"Auto-clear tasks error: {e}")
             if feedback:
                 await update.message.reply_text(
                     "\n".join(feedback),
@@ -3120,7 +3546,8 @@ async def cmd_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("📊 Pulling data and analyzing...")
     name = user_name(update)
-    response = await ask_about_data(question, name)
+    chat_id = update.effective_chat.id
+    response = await ask_about_data(question, name, chat_id)
 
     if response:
         await update.message.reply_text(f"📊 {response}")
@@ -3379,7 +3806,7 @@ async def cmd_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_cleaning_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Auto-sent cleaning reminder."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     buttons = []
     for zone in config.CLEANING_ZONES:
@@ -3387,7 +3814,7 @@ async def scheduled_cleaning_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     buttons.append([InlineKeyboardButton("✅ All Done", callback_data="clean:ALL_DONE")])
 
     await ctx.bot.send_message(
-        config.GROUP_CHAT_ID,
+        config.OWNER_GROUP_ID,
         "🧹 *Cleaning Reminder!*\nTime for a cleaning round. Tap when done:",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
@@ -3396,7 +3823,7 @@ async def scheduled_cleaning_reminder(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_opening_checklist(ctx: ContextTypes.DEFAULT_TYPE):
     """Auto-sent opening checklist."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     existing = store.get_checklist_today("opening")
     if existing:
@@ -3408,7 +3835,7 @@ async def scheduled_opening_checklist(ctx: ContextTypes.DEFAULT_TYPE):
     buttons.append([InlineKeyboardButton("✅ All Done!", callback_data="chk:opening:DONE")])
 
     await ctx.bot.send_message(
-        config.GROUP_CHAT_ID,
+        config.OWNER_GROUP_ID,
         "🌅 *Good Morning! Opening Checklist*\nTap each item when done:",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
@@ -3417,7 +3844,7 @@ async def scheduled_opening_checklist(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_closing_checklist(ctx: ContextTypes.DEFAULT_TYPE):
     """Auto-sent closing checklist."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     buttons = []
     for i, item in enumerate(config.CLOSING_CHECKLIST):
@@ -3425,7 +3852,7 @@ async def scheduled_closing_checklist(ctx: ContextTypes.DEFAULT_TYPE):
     buttons.append([InlineKeyboardButton("✅ All Done!", callback_data="chk:closing:DONE")])
 
     await ctx.bot.send_message(
-        config.GROUP_CHAT_ID,
+        config.OWNER_GROUP_ID,
         "🌙 *Closing Time! Checklist*\nTap each item when done:",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
@@ -3434,19 +3861,19 @@ async def scheduled_closing_checklist(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_stock_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Morning stock check reminder."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     low = store.get_low_stock()
     msg = "📦 *Morning Stock Check*\nTime to check inventory! Use /stockcheck\n"
     if low:
         items = "\n".join(f"  🔴 {i}" for i, _ in low)
         msg += f"\n⚠️ *Items already flagged low:*\n{items}"
-    await ctx.bot.send_message(config.GROUP_CHAT_ID, msg, parse_mode="Markdown")
+    await ctx.bot.send_message(config.OWNER_GROUP_ID, msg, parse_mode="Markdown")
 
 
 async def scheduled_content_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Daily content reminder — ask staff what they're filming, suggest if no plan."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
 
     today_content = store.get_content_today()
@@ -3470,10 +3897,10 @@ async def scheduled_content_reminder(ctx: ContextTypes.DEFAULT_TYPE):
                 f"Need any help with angles or ideas? 🎬"
             )
             await ctx.bot.send_message(
-                config.GROUP_CHAT_ID, msg, parse_mode="Markdown",
+                config.OWNER_GROUP_ID, msg, parse_mode="Markdown",
             )
             # Store this as a bot message in memory so the AI remembers it asked
-            remember("Bot", f"Asked {assigned} about today's {content_type}: {title}", "text")
+            remember("Bot", f"Asked {assigned} about today's {content_type}: {title}", "text", config.OWNER_GROUP_ID)
     else:
         # No content planned — ask who's on shift what they want to film
         # and offer an AI suggestion
@@ -3506,14 +3933,14 @@ async def scheduled_content_reminder(ctx: ContextTypes.DEFAULT_TYPE):
             )
 
         await ctx.bot.send_message(
-            config.GROUP_CHAT_ID, msg, parse_mode="Markdown",
+            config.OWNER_GROUP_ID, msg, parse_mode="Markdown",
         )
-        remember("Bot", "Asked team about content for today — no content planned", "text")
+        remember("Bot", "Asked team about content for today — no content planned", "text", config.OWNER_GROUP_ID)
 
 
 async def scheduled_shift_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Check if anyone's shift is starting soon."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     day = today_day()
     shifts = store.get_shifts(day)
@@ -3534,7 +3961,7 @@ async def scheduled_shift_reminder(ctx: ContextTypes.DEFAULT_TYPE):
                 diff = (shift_dt - now).total_seconds() / 60
                 if 25 <= diff <= 35:  # ~30 min before
                     await ctx.bot.send_message(
-                        config.GROUP_CHAT_ID,
+                        config.OWNER_GROUP_ID,
                         f"⏰ Shift reminder: *{staff}* starts at {shift_start} (~30 min)",
                         parse_mode="Markdown",
                     )
@@ -3544,7 +3971,7 @@ async def scheduled_shift_reminder(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
     """Chase up on pending action items that are stale."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     pending = store.get_action_items("pending")
     if not pending:
@@ -3574,7 +4001,7 @@ async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
     message = await generate_chaseup_message(items_only)
     if message:
         await ctx.bot.send_message(
-            config.GROUP_CHAT_ID,
+            config.OWNER_GROUP_ID,
             message,
             parse_mode="Markdown",
         )
@@ -3585,7 +4012,7 @@ async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scheduled_event_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Remind about events happening today or tomorrow."""
-    if not config.GROUP_CHAT_ID:
+    if not config.OWNER_GROUP_ID:
         return
     events = store.get_events(upcoming_only=True)
     today_str = now_sg().date().isoformat()
@@ -3594,16 +4021,76 @@ async def scheduled_event_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     for evt in events:
         if evt["date"] == today_str:
             await ctx.bot.send_message(
-                config.GROUP_CHAT_ID,
+                config.OWNER_GROUP_ID,
                 f"📅 *TODAY's Event:* {evt['title']}\n📝 {evt['details']}",
                 parse_mode="Markdown",
             )
         elif evt["date"] == tomorrow_str:
             await ctx.bot.send_message(
-                config.GROUP_CHAT_ID,
+                config.OWNER_GROUP_ID,
                 f"📅 *TOMORROW:* {evt['title']}\n📝 {evt['details']}\nMake sure we're prepared!",
                 parse_mode="Markdown",
             )
+
+
+async def scheduled_oneoff_check(ctx: ContextTypes.DEFAULT_TYPE):
+    """Daily: check if any one-off items should be promoted to regular stock."""
+    if not config.OWNER_GROUP_ID:
+        return
+    frequent = store.get_frequent_oneoffs(threshold=3)
+    if not frequent:
+        return
+
+    lines = ["🔄 *One-off items bought frequently:*\n"]
+    for f in frequent:
+        lines.append(f"  • {f['item']} — bought {f['count']} times")
+    lines.append("\nConsider making these regular stock items!")
+
+    await ctx.bot.send_message(
+        config.OWNER_GROUP_ID, "\n".join(lines), parse_mode="Markdown",
+    )
+
+
+async def scheduled_holiday_refresh(ctx: ContextTypes.DEFAULT_TYPE):
+    """Weekly: refresh holiday cache from Google Calendar + Calendarific."""
+    try:
+        from google_integration import refresh_holiday_cache
+        cache = refresh_holiday_cache()
+        count = len(cache.get("holidays", []))
+        logger.info(f"Holiday cache refreshed: {count} holidays")
+    except Exception as e:
+        logger.error(f"Holiday refresh error: {e}")
+
+
+async def scheduled_school_holiday_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    """October: remind about upcoming school year-end holidays."""
+    if not config.OWNER_GROUP_ID:
+        return
+
+    now = now_sg()
+    if now.month != config.SCHOOL_HOLIDAY_REMINDER_MONTH:
+        return
+    if now.day != 1:  # Only on the 1st of October
+        return
+
+    try:
+        from google_integration import get_upcoming_holidays
+        upcoming = get_upcoming_holidays(days_ahead=90)  # Look 3 months ahead
+        school = [h for h in upcoming if h.get("source") == "school_holidays"]
+
+        if school:
+            lines = ["🏫 *School Holiday Reminder*\n"]
+            lines.append("Year-end school holidays are coming up! Plan for busier periods:\n")
+            for h in school:
+                end = f" to {h['end_date']}" if h.get('end_date') else ""
+                lines.append(f"  📅 {h['name']}: {h['date']}{end}")
+            lines.append("\n💡 Consider: extra stock, additional staff, holiday specials!")
+
+            await ctx.bot.send_message(
+                config.OWNER_GROUP_ID, "\n".join(lines), parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"School holiday reminder error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -3622,7 +4109,10 @@ def main():
             await update.message.reply_text("Usage: /ask <your question>\nExample: /ask how do I clean the grinder?")
             return
         await update.message.reply_text("🤔 Thinking...")
-        response = await ask_ai(question, user_name(update))
+        chat_id = _get_chat_id(update)
+        is_staff = _is_staff_group(update)
+        response = await ask_ai(question, user_name(update),
+                                chat_id=chat_id, is_staff_group=is_staff)
         if response:
             await update.message.reply_text(f"🤖 {response}")
         else:
@@ -3648,115 +4138,122 @@ def main():
             await update.message.reply_text("❌ AI is not available. Try /content for pre-built ideas.")
 
     # ─── Command handlers ───────────────────────────────────
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    # g = group_only (all groups), o = owner_only (blocked in staff group)
+    g = group_only
+    o = owner_only
 
-    # Cleaning
-    app.add_handler(CommandHandler("clean", cmd_clean))
-    app.add_handler(CommandHandler("cleanstatus", cmd_cleanstatus))
-    app.add_handler(CallbackQueryHandler(cb_clean, pattern=r"^clean:"))
+    app.add_handler(CommandHandler("start", g(cmd_start)))
+    app.add_handler(CommandHandler("help", g(cmd_help)))
 
-    # Stock
-    app.add_handler(CommandHandler("stock", cmd_stock))
-    app.add_handler(CommandHandler("stockcheck", cmd_stockcheck))
-    app.add_handler(CommandHandler("removestock", cmd_removestock))
-    app.add_handler(CommandHandler("lowstock", cmd_lowstock))
-    app.add_handler(CallbackQueryHandler(cb_stockcheck, pattern=r"^sck:"))
+    # Cleaning (allowed everywhere)
+    app.add_handler(CommandHandler("clean", g(cmd_clean)))
+    app.add_handler(CommandHandler("cleanstatus", g(cmd_cleanstatus)))
+    app.add_handler(CallbackQueryHandler(g(cb_clean), pattern=r"^clean:"))
 
-    # Checklists
-    app.add_handler(CommandHandler("open", cmd_open))
-    app.add_handler(CommandHandler("close", cmd_close))
-    app.add_handler(CallbackQueryHandler(cb_checklist, pattern=r"^chk:"))
+    # Stock (allowed everywhere)
+    app.add_handler(CommandHandler("stock", g(cmd_stock)))
+    app.add_handler(CommandHandler("stockcheck", g(cmd_stockcheck)))
+    app.add_handler(CommandHandler("removestock", g(cmd_removestock)))
+    app.add_handler(CommandHandler("lowstock", g(cmd_lowstock)))
+    app.add_handler(CallbackQueryHandler(g(cb_stockcheck), pattern=r"^sck:"))
 
-    # Shifts
-    app.add_handler(CommandHandler("shifts", cmd_shifts))
-    app.add_handler(CommandHandler("addshift", cmd_addshift))
-    app.add_handler(CommandHandler("removeshift", cmd_removeshift))
+    # Checklists (allowed everywhere)
+    app.add_handler(CommandHandler("open", g(cmd_open)))
+    app.add_handler(CommandHandler("close", g(cmd_close)))
+    app.add_handler(CallbackQueryHandler(g(cb_checklist), pattern=r"^chk:"))
 
-    # Hours
-    app.add_handler(CommandHandler("hours", cmd_hours))
-    app.add_handler(CommandHandler("sethours", cmd_sethours))
-    app.add_handler(CommandHandler("holiday", cmd_setholiday))
-    app.add_handler(CommandHandler("holidays", cmd_hours))
+    # Shifts (owner only)
+    app.add_handler(CommandHandler("shifts", o("shifts")(cmd_shifts)))
+    app.add_handler(CommandHandler("addshift", o("addshift")(cmd_addshift)))
+    app.add_handler(CommandHandler("removeshift", o("removeshift")(cmd_removeshift)))
 
-    # Events
-    app.add_handler(CommandHandler("events", cmd_events))
-    app.add_handler(CommandHandler("addevent", cmd_addevent))
+    # Hours (owner only)
+    app.add_handler(CommandHandler("hours", o("hours")(cmd_hours)))
+    app.add_handler(CommandHandler("sethours", o("sethours")(cmd_sethours)))
+    app.add_handler(CommandHandler("holiday", o("holiday")(cmd_setholiday)))
+    app.add_handler(CommandHandler("holidays", o("holidays")(cmd_hours)))
 
-    # Shopping
-    app.add_handler(CommandHandler("buy", cmd_buy))
-    app.add_handler(CommandHandler("addbuy", cmd_addbuy))
-    app.add_handler(CommandHandler("bought", cmd_bought))
+    # Events (allowed everywhere)
+    app.add_handler(CommandHandler("events", g(cmd_events)))
+    app.add_handler(CommandHandler("addevent", g(cmd_addevent)))
 
-    # Content
-    app.add_handler(CommandHandler("content", cmd_content))
-    app.add_handler(CommandHandler("contentlog", cmd_contentlog))
-    app.add_handler(CallbackQueryHandler(cb_content, pattern=r"^content:"))
+    # Shopping (allowed everywhere)
+    app.add_handler(CommandHandler("buy", g(cmd_buy)))
+    app.add_handler(CommandHandler("addbuy", g(cmd_addbuy)))
+    app.add_handler(CommandHandler("bought", g(cmd_bought)))
 
-    # Staff
-    app.add_handler(CommandHandler("staff", cmd_staff))
-    app.add_handler(CommandHandler("addstaff", cmd_addstaff))
-    app.add_handler(CommandHandler("removestaff", cmd_removestaff))
+    # Content (allowed everywhere)
+    app.add_handler(CommandHandler("content", g(cmd_content)))
+    app.add_handler(CommandHandler("contentlog", g(cmd_contentlog)))
+    app.add_handler(CallbackQueryHandler(g(cb_content), pattern=r"^content:"))
 
-    # Reports
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("week", cmd_week))
+    # Staff (owner only)
+    app.add_handler(CommandHandler("staff", o("staff")(cmd_staff)))
+    app.add_handler(CommandHandler("addstaff", o("addstaff")(cmd_addstaff)))
+    app.add_handler(CommandHandler("removestaff", o("removestaff")(cmd_removestaff)))
 
-    # Settings
-    app.add_handler(CommandHandler("setup", cmd_setup))
-    app.add_handler(CommandHandler("settings", cmd_settings))
+    # Reports (allowed everywhere)
+    app.add_handler(CommandHandler("today", g(cmd_today)))
+    app.add_handler(CommandHandler("week", g(cmd_week)))
+
+    # Settings (owner only)
+    app.add_handler(CommandHandler("setup", o("setup")(cmd_setup)))
+    app.add_handler(CommandHandler("settings", o("settings")(cmd_settings)))
 
     # AI-powered
-    app.add_handler(CommandHandler("ask", cmd_ask))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
-    app.add_handler(CommandHandler("aicontent", cmd_aicontent))
+    app.add_handler(CommandHandler("ask", g(cmd_ask)))
+    app.add_handler(CommandHandler("analyze", o("analyze")(cmd_analyze)))
+    app.add_handler(CommandHandler("aicontent", g(cmd_aicontent)))
 
-    # Action items / chase-up
-    app.add_handler(CommandHandler("tasks", cmd_tasks))
-    app.add_handler(CommandHandler("taskdone", cmd_taskdone))
-    app.add_handler(CommandHandler("taskdismiss", cmd_taskdismiss))
+    # Action items / chase-up (allowed everywhere)
+    app.add_handler(CommandHandler("tasks", g(cmd_tasks)))
+    app.add_handler(CommandHandler("taskdone", g(cmd_taskdone)))
+    app.add_handler(CommandHandler("taskdismiss", g(cmd_taskdismiss)))
 
-    # Search history
-    app.add_handler(CommandHandler("search", cmd_search))
+    # Search history (allowed everywhere)
+    app.add_handler(CommandHandler("search", g(cmd_search)))
 
-    # P&L, receipts, data commands
-    app.add_handler(CommandHandler("pl", cmd_pl))
-    app.add_handler(CommandHandler("receipts", cmd_receipts))
-    app.add_handler(CommandHandler("data", cmd_data))
-    app.add_handler(CommandHandler("stockusage", cmd_stockusage))
-    app.add_handler(CommandHandler("expenses", cmd_expenses))
-    app.add_handler(CommandHandler("pnl", cmd_pnl_report))
-    app.add_handler(CommandHandler("whopaid", cmd_whopaid))
-    app.add_handler(CommandHandler("sales", cmd_sales))
+    # P&L, receipts, data commands (owner only)
+    app.add_handler(CommandHandler("pl", o("pl")(cmd_pl)))
+    app.add_handler(CommandHandler("receipts", o("receipts")(cmd_receipts)))
+    app.add_handler(CommandHandler("data", o("data")(cmd_data)))
+    app.add_handler(CommandHandler("stockusage", g(cmd_stockusage)))
+    app.add_handler(CommandHandler("expenses", o("expenses")(cmd_expenses)))
+    app.add_handler(CommandHandler("pnl", o("pnl")(cmd_pnl_report)))
+    app.add_handler(CommandHandler("whopaid", o("whopaid")(cmd_whopaid)))
+    app.add_handler(CommandHandler("sales", o("sales")(cmd_sales)))
 
-    # Receipt confirm/change callback
-    app.add_handler(CallbackQueryHandler(cb_receipt, pattern=r"^receipt:"))
+    # Receipt confirm/change callback (allowed everywhere — staff can submit receipts)
+    app.add_handler(CallbackQueryHandler(g(cb_receipt), pattern=r"^receipt:"))
 
-    # Sales report confirm/change callback
-    app.add_handler(CallbackQueryHandler(cb_sales, pattern=r"^sales:"))
+    # Sales report confirm/change callback (allowed everywhere — staff can submit POS)
+    app.add_handler(CallbackQueryHandler(g(cb_sales), pattern=r"^sales:"))
+
+    # New receipt item — regular vs one-off callback
+    app.add_handler(CallbackQueryHandler(g(cb_newitem), pattern=r"^newitem:"))
 
     # Voice note handler
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice_note))
+    app.add_handler(MessageHandler(filters.VOICE, g(handle_voice_note)))
 
     # Photo handler (receipts + general photos)
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    app.add_handler(MessageHandler(filters.PHOTO, g(handle_photo_message)))
 
     # Video handler (equipment issues, sales reports, general)
     app.add_handler(MessageHandler(
-        filters.VIDEO | filters.VIDEO_NOTE, handle_video_message
+        filters.VIDEO | filters.VIDEO_NOTE, g(handle_video_message)
     ))
 
     # Document handler (POS reports, CSV, Excel, PDF)
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.Document.ALL, g(handle_document)))
 
-    # Natural language handler (must be last)
+    # Natural language handler (must be last — has its own group gate)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_message
     ))
 
     # ─── Scheduled jobs ─────────────────────────────────────
     jq = app.job_queue
-    if jq and config.GROUP_CHAT_ID:
+    if jq and config.OWNER_GROUP_ID:
         # ── Disabled for now ──────────────────────────────────
         # Opening checklist
         # jq.run_daily(scheduled_opening_checklist, time=config.OPENING_CHECKLIST_TIME,
@@ -3800,8 +4297,32 @@ def main():
                 name=f"chaseup_{i}",
             )
 
+        # One-off items bought frequently — suggest promoting to regular stock
+        jq.run_daily(
+            scheduled_oneoff_check,
+            time=dtime(3, 30, tzinfo=TZ),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="oneoff_check",
+        )
+
+        # Holiday refresh — every Sunday at 3:00 AM MYT
+        jq.run_daily(
+            scheduled_holiday_refresh,
+            time=dtime(3, 0, tzinfo=TZ),
+            days=(6,),
+            name="holiday_refresh",
+        )
+
+        # School holiday reminder — daily check (only fires on Oct 1)
+        jq.run_daily(
+            scheduled_school_holiday_reminder,
+            time=dtime(9, 0, tzinfo=TZ),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="school_holiday_reminder",
+        )
+
         logger.info("✅ Scheduled jobs registered")
-    elif not config.GROUP_CHAT_ID:
+    elif not config.OWNER_GROUP_ID:
         logger.warning("⚠️ GROUP_CHAT_ID not set — scheduled reminders disabled. Use /setup to get your chat ID.")
 
     # ─── Set bot commands menu ──────────────────────────────

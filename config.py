@@ -10,8 +10,31 @@ load_dotenv()  # Load .env file if present
 
 # ─── Telegram ───────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # Your Telegram group ID
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # Legacy — kept for backward compat
 ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x]
+
+# ─── Multi-Group Setup ────────────────────────────────────
+# Owner group: full access to everything (financials, settings, staff mgmt)
+# Staff group: daily operations only (receipts, stock, cleaning, tasks, AI chat)
+OWNER_GROUP_ID = int(os.getenv("OWNER_GROUP_ID", "0")) or GROUP_CHAT_ID
+STAFF_GROUP_ID = int(os.getenv("STAFF_GROUP_ID", "0"))
+ALLOWED_GROUP_IDS = [gid for gid in [OWNER_GROUP_ID, STAFF_GROUP_ID] if gid]
+
+# Commands blocked in staff group — anything financial, admin, or settings
+STAFF_BLOCKED_COMMANDS = {
+    "staff", "addstaff", "removestaff",
+    "shifts", "addshift", "removeshift",
+    "hours", "sethours", "holiday", "holidays",
+    "analyze", "pl", "pnl", "data",
+    "setup", "settings",
+    "receipts", "expenses", "whopaid", "sales",
+}
+
+# AI actions blocked in staff group — financial reports
+STAFF_BLOCKED_ACTIONS = {
+    "show_expenses", "show_whopaid", "show_sales", "show_pnl",
+    "show_staff", "monthly_summary",
+}
 
 # ─── Google Sheets (free database) ──────────────────────────
 GOOGLE_SHEETS_CREDS_FILE = os.getenv("GOOGLE_SHEETS_CREDS_FILE", "credentials.json")
@@ -125,6 +148,48 @@ CLOSING_CHECKLIST = [
     "Lock all doors",
     "Send closing report to group",
 ]
+
+# ─── Holiday System ───────────────────────────────────────
+CALENDARIFIC_API_KEY = os.getenv("CALENDARIFIC_API_KEY", "")
+
+# Google Calendar public holiday calendar IDs
+HOLIDAY_CALENDAR_IDS = {
+    "MY": "en.malaysia#holiday@group.v.calendar.google.com",
+    "SG": "en.singapore#holiday@group.v.calendar.google.com",
+}
+
+# Calendarific country/state codes for state-level holidays
+CALENDARIFIC_LOCATIONS = [
+    {"country": "MY", "state": "MY-01"},  # Johor
+    {"country": "MY", "state": "MY-10"},  # Selangor (Klang Valley)
+    {"country": "MY", "state": "MY-04"},  # Melaka
+]
+
+# School holidays — hardcoded from MOE (Malaysia + Singapore)
+# Format: list of (start_date, end_date, label) tuples
+SCHOOL_HOLIDAYS_2026 = [
+    ("2026-03-14", "2026-03-22", "MY Term 1 Break"),
+    ("2026-05-23", "2026-06-07", "MY Mid-Year Break"),
+    ("2026-08-15", "2026-08-23", "MY Term 3 Break"),
+    ("2026-11-21", "2026-12-31", "MY Year-End Break"),
+    ("2026-03-14", "2026-03-22", "SG March School Holiday"),
+    ("2026-05-30", "2026-06-28", "SG June School Holiday"),
+    ("2026-09-05", "2026-09-13", "SG September School Holiday"),
+    ("2026-11-21", "2026-12-31", "SG Year-End Holiday"),
+]
+
+SCHOOL_HOLIDAYS_2027 = [
+    ("2027-03-13", "2027-03-21", "MY Term 1 Break"),
+    ("2027-05-22", "2027-06-06", "MY Mid-Year Break"),
+    ("2027-08-14", "2027-08-22", "MY Term 3 Break"),
+    ("2027-11-20", "2027-12-31", "MY Year-End Break"),
+    ("2027-03-13", "2027-03-21", "SG March School Holiday"),
+    ("2027-05-29", "2027-06-27", "SG June School Holiday"),
+    ("2027-09-04", "2027-09-12", "SG September School Holiday"),
+    ("2027-11-20", "2027-12-31", "SG Year-End Holiday"),
+]
+
+SCHOOL_HOLIDAY_REMINDER_MONTH = 10  # October — remind about upcoming year-end holidays
 
 # ─── Content Ideas Pool ─────────────────────────────────────
 CONTENT_IDEAS = [
