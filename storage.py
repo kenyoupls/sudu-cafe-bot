@@ -22,6 +22,11 @@ def _now():
     """Current time in configured timezone (MYT)."""
     return datetime.now(_TZ)
 
+
+def _fmt_ts():
+    """Format current timestamp as '20260829-1425' style."""
+    return _now().strftime("%Y%m%d-%H%M")
+
 logger = logging.getLogger(__name__)
 
 
@@ -399,7 +404,7 @@ class SheetsSync:
                     stock[item] = {
                         "qty": latest_qty,
                         "updated_by": "sheet",
-                        "updated_at": _dt.now().isoformat(),
+                        "updated_at": _now().strftime("%Y%m%d-%H%M"),
                     }
 
             logger.info(f"Read {len(stock)} stock items from Sheet")
@@ -666,6 +671,8 @@ class LocalJsonStore:
                     logger.info("Google Sheets sync enabled")
                     # Read from Sheet (Sheet is source of truth)
                     self._refresh_from_sheet()
+                    # Backfill current stock to sheet for items missing it
+                    self._backfill_current_stock_to_sheet()
                     # Start periodic refresh (every 10 min)
                     self._start_periodic_refresh()
                 else:
@@ -689,6 +696,19 @@ class LocalJsonStore:
                 if "stock_current" not in self.data:
                     self.data["stock_current"] = {}
                 self.data["stock_current"].update(stock_current)
+
+            # Backfill stock_current from latest historical qty for items missing it
+            for item_name, info in self.data.get("stock", {}).items():
+                if item_name not in self.data.get("stock_current", {}):
+                    # Try to parse a number from the latest qty
+                    qty_str = str(info.get("qty", "")).strip()
+                    try:
+                        import re as _re_local
+                        nums = _re_local.findall(r'[\d.]+', qty_str)
+                        if nums:
+                            self.data["stock_current"][item_name] = int(float(nums[0]))
+                    except (ValueError, TypeError):
+                        pass
 
             _time.sleep(2)  # Rate limit gap
 
@@ -847,6 +867,7 @@ class LocalJsonStore:
             "stock_current": {},        # {item_name: int} — running current stock count
             "last_full_count": {},      # {item_name: {"qty": int, "date": "YYYY-MM-DD"}}
             "oneoff_items": {},         # For Phase 7 later
+            "receipt_hashes": {},       # {hash_key: {supplier, date, total, item_count, recorded_by, recorded_at}}
         }
 
     # ─── Stock ──────────────────────────────────────────────
@@ -890,7 +911,7 @@ class LocalJsonStore:
         self.data["stock"][item] = {
             "qty": qty,
             "updated_by": updated_by,
-            "updated_at": _now().isoformat(),
+            "updated_at": _fmt_ts(),
         }
         if "stock_history" not in self.data:
             self.data["stock_history"] = {}
@@ -936,17 +957,60 @@ class LocalJsonStore:
             if not items_on_date:
                 del self.data["stock_history"][date_str]
 
+        # Also clear from stock_current and last_full_count
+        to_del_current = [k for k in self.data.get("stock_current", {})
+                          if normalize_item_name(k) == norm]
+        for k in to_del_current:
+            del self.data["stock_current"][k]
+            removed = True
+
+        to_del_lfc = [k for k in self.data.get("last_full_count", {})
+                      if normalize_item_name(k) == norm]
+        for k in to_del_lfc:
+            del self.data["last_full_count"][k]
+
         if removed:
             self._save_local_only()
             logger.info(f"Removed stock item: {item}")
         return removed
+
+    def check_duplicate_receipt(self, supplier: str, receipt_date: str, total: float, items: list) -> dict | None:
+        """Check if a receipt with same supplier+date+total+items was already logged.
+        Returns the existing receipt info dict if duplicate found, None otherwise."""
+        key = self._receipt_hash_key(supplier, receipt_date, total, items)
+        hashes = self.data.get("receipt_hashes", {})
+        return hashes.get(key)
+
+    def record_receipt_hash(self, supplier: str, receipt_date: str, total: float, items: list, recorded_by: str = ""):
+        """Record a receipt's hash after successful save."""
+        key = self._receipt_hash_key(supplier, receipt_date, total, items)
+        if "receipt_hashes" not in self.data:
+            self.data["receipt_hashes"] = {}
+        self.data["receipt_hashes"][key] = {
+            "supplier": supplier,
+            "date": receipt_date,
+            "total": total,
+            "item_count": len(items),
+            "recorded_by": recorded_by,
+            "recorded_at": _now().strftime("%Y%m%d-%H%M"),
+        }
+        self._save_local_only()
+
+    def _receipt_hash_key(self, supplier: str, receipt_date: str, total: float, items: list) -> str:
+        """Generate a hash key for duplicate detection."""
+        import hashlib
+        norm_supplier = normalize_item_name(supplier)
+        rounded_total = f"{float(total):.2f}"
+        norm_items = sorted(normalize_item_name(i.get("name", "")) for i in items if i.get("name"))
+        raw = f"{norm_supplier}|{receipt_date}|{rounded_total}|{'|'.join(norm_items)}"
+        return hashlib.md5(raw.encode()).hexdigest()[:16]
 
     def record_oneoff_item(self, item: str):
         """Record an item as one-off purchase (not tracked in regular stock)."""
         if "oneoff_items" not in self.data:
             self.data["oneoff_items"] = {}
         norm = normalize_item_name(item)
-        now_str = _now().isoformat()
+        now_str = _fmt_ts()
         if norm in self.data["oneoff_items"]:
             self.data["oneoff_items"][norm]["count"] = self.data["oneoff_items"][norm].get("count", 0) + 1
             self.data["oneoff_items"][norm]["last_purchased"] = now_str
@@ -1013,7 +1077,7 @@ class LocalJsonStore:
                 self.data["stock"][item_name] = {
                     "qty": qty,
                     "updated_by": entry.get("checked_by", ""),
-                    "updated_at": _now().isoformat(),
+                    "updated_at": _fmt_ts(),
                 }
                 self.data["stock_history"][stock_date][item_name] = qty
 
@@ -1051,7 +1115,7 @@ class LocalJsonStore:
         self.data["stock"][item] = {
             "qty": str(new_total),
             "updated_by": self.data.get("stock", {}).get(item, {}).get("updated_by", "Receipt"),
-            "updated_at": _now().isoformat(),
+            "updated_at": _fmt_ts(),
         }
 
         self._sync_current_stock_to_sheet(item)
@@ -1089,7 +1153,7 @@ class LocalJsonStore:
             self.data["stock"][item] = {
                 "qty": str(qty),
                 "updated_by": counted_by,
-                "updated_at": _now().isoformat(),
+                "updated_at": _fmt_ts(),
             }
 
             # Write to Sheet
@@ -1101,6 +1165,19 @@ class LocalJsonStore:
             self._sync_current_stock_to_sheet(item)
 
         self._save_local_only()
+
+    def _backfill_current_stock_to_sheet(self):
+        """On startup, ensure all stock items have a Current Stock value on the sheet."""
+        if not self._sheets:
+            return
+        try:
+            stock_current = self.data.get("stock_current", {})
+            if not stock_current:
+                return
+            self._sync_current_stock_to_sheet()
+            logger.info(f"Backfilled Current Stock for {len(stock_current)} items")
+        except Exception as e:
+            logger.error(f"Current stock backfill error: {e}")
 
     def _sync_current_stock_to_sheet(self, item: str = None):
         """Update the Current Stock (column B) values on the Stock sheet.
@@ -1181,7 +1258,7 @@ class LocalJsonStore:
         self.data["stock"][item] = {
             "qty": str(new_qty),
             "updated_by": corrected_by,
-            "updated_at": _now().isoformat(),
+            "updated_at": _fmt_ts(),
         }
 
         if self._sheets:
@@ -1239,7 +1316,7 @@ class LocalJsonStore:
             self.data["stock"][item] = {
                 "qty": str(prev_qty_val),
                 "updated_by": self.data.get("stock", {}).get(item, {}).get("updated_by", ""),
-                "updated_at": _now().isoformat(),
+                "updated_at": _fmt_ts(),
             }
         else:
             # No previous entry — remove current stock tracking for this item
@@ -1377,7 +1454,7 @@ class LocalJsonStore:
         self.data["cleaning_log"].append({
             "zone": zone,
             "done_by": done_by,
-            "done_at": _now().isoformat(),
+            "done_at": _fmt_ts(),
         })
         self._save("cleaning")
 
@@ -1394,7 +1471,7 @@ class LocalJsonStore:
             "type": checklist_type,
             "items_done": items_done,
             "done_by": done_by,
-            "done_at": _now().isoformat(),
+            "done_at": _fmt_ts(),
         })
         self._save()
 
@@ -1447,7 +1524,7 @@ class LocalJsonStore:
             "date": event_date,
             "details": details,
             "added_by": added_by,
-            "added_at": _now().isoformat(),
+            "added_at": _fmt_ts(),
             "status": "upcoming",
         }
         # 1. Write to Sheet FIRST
@@ -1485,7 +1562,7 @@ class LocalJsonStore:
             "item": item,
             "added_by": added_by,
             "urgency": urgency,
-            "added_at": _now().isoformat(),
+            "added_at": _fmt_ts(),
             "bought": False,
         }
         # 1. Write to Sheet FIRST
@@ -1513,7 +1590,7 @@ class LocalJsonStore:
                 if not item.get("bought"):
                     if count == index:
                         self.data["shopping_list"][idx]["bought"] = True
-                        self.data["shopping_list"][idx]["bought_at"] = _now().isoformat()
+                        self.data["shopping_list"][idx]["bought_at"] = _fmt_ts()
                         break
                     count += 1
             # Full re-sync shopping to Sheet (active/archive layout)
@@ -1541,7 +1618,7 @@ class LocalJsonStore:
         self.data["staff"][name] = {
             "telegram_id": telegram_id,
             "role": role,
-            "added_at": _now().isoformat(),
+            "added_at": _fmt_ts(),
         }
         self._save("staff")
 
@@ -1558,7 +1635,7 @@ class LocalJsonStore:
         self.data["content_log"].append({
             "idea": idea,
             "posted_by": posted_by,
-            "posted_at": _now().isoformat(),
+            "posted_at": _fmt_ts(),
         })
         self._save()
 
@@ -1578,7 +1655,7 @@ class LocalJsonStore:
             "added_by": added_by,
             "notes": notes,
             "status": "planned",
-            "created_at": _now().isoformat(),
+            "created_at": _fmt_ts(),
             "completed_at": None,
         })
         self._save()
@@ -1603,7 +1680,7 @@ class LocalJsonStore:
         if 0 <= index < len(cal):
             cal[index]["status"] = status
             if status == "done":
-                cal[index]["completed_at"] = _now().isoformat()
+                cal[index]["completed_at"] = _fmt_ts()
                 cal[index]["completed_by"] = completed_by
             self._save()
 
@@ -1613,7 +1690,7 @@ class LocalJsonStore:
             if (search in item.get("title", "").lower()
                     and item.get("status") in ("planned", "in_progress")):
                 item["status"] = "done"
-                item["completed_at"] = _now().isoformat()
+                item["completed_at"] = _fmt_ts()
                 item["completed_by"] = completed_by
                 self._save()
                 return True
@@ -1639,7 +1716,7 @@ class LocalJsonStore:
             "source_msg": source_msg[:200],
             "urgency": urgency,
             "status": "pending",
-            "created_at": _now().isoformat(),
+            "created_at": _fmt_ts(),
             "last_chased": None,
             "chase_count": 0,
         })
@@ -1659,7 +1736,7 @@ class LocalJsonStore:
                 if item.get("status") == "pending":
                     if count == index:
                         self.data["action_items"][idx]["status"] = "done"
-                        self.data["action_items"][idx]["completed_at"] = _now().isoformat()
+                        self.data["action_items"][idx]["completed_at"] = _fmt_ts()
                         self.data["action_items"][idx]["completed_by"] = completed_by
                         break
                     count += 1
@@ -1672,7 +1749,7 @@ class LocalJsonStore:
             for idx, item in enumerate(self.data["action_items"]):
                 if item.get("status") == "pending":
                     if count == index:
-                        self.data["action_items"][idx]["last_chased"] = _now().isoformat()
+                        self.data["action_items"][idx]["last_chased"] = _fmt_ts()
                         self.data["action_items"][idx]["chase_count"] = item.get("chase_count", 0) + 1
                         break
                     count += 1

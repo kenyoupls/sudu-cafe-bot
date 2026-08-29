@@ -27,6 +27,11 @@ def _now():
     """Current time in configured timezone (MYT)."""
     return datetime.now(_TZ)
 
+
+def _fmt_ts():
+    """Format current timestamp as '20260829-1425' style."""
+    return _now().strftime("%Y%m%d-%H%M")
+
 logger = logging.getLogger(__name__)
 
 # ─── Lazy imports (don't crash if not configured) ──────────
@@ -218,7 +223,7 @@ def log_expense_detail(
             receipt_link,
             recorded_by,
             notes,
-            _now().isoformat(),
+            _fmt_ts(),
         ])
         return True
 
@@ -288,15 +293,13 @@ def update_monthly_expenses(month: str = None) -> bool:
             agg[key]["total"] += total
 
         # Build rows sorted by month (newest first), then item name
-        now_str = _now().isoformat()
+        now_str = _fmt_ts()
         header = [
             "Month", "Item", "Total Qty", "Total Spent (RM)",
             "Category", "Updated At"
         ]
         data_rows = []
-        for (row_month, norm_key), data in sorted(
-            agg.items(), key=lambda x: (-x[0][0].__hash__, x[1]["display_name"])
-        ):
+        for (row_month, norm_key), data in agg.items():
             data_rows.append([
                 row_month,
                 data["display_name"],
@@ -307,10 +310,7 @@ def update_monthly_expenses(month: str = None) -> bool:
             ])
 
         # Sort: newest month first, then alphabetical within month
-        data_rows.sort(key=lambda r: (-r[0].replace("-", "").__hash__, r[1].lower()))
-        # Actually use a proper sort: reverse month string, then item name
-        data_rows.sort(key=lambda r: r[1].lower())          # secondary: item A-Z
-        data_rows.sort(key=lambda r: r[0], reverse=True)    # primary: month newest first
+        data_rows.sort(key=lambda r: (-int(r[0].replace("-", "")), r[1].lower()))
 
         ws_exp = ss.worksheet("Expenses")
         ws_exp.clear()
@@ -513,7 +513,7 @@ def log_daily_sales(
             cashier,
             recorded_by,
             notes,
-            _now().isoformat(),
+            _fmt_ts(),
         ])
         logger.info(f"Logged daily sales: {report_date} RM{total_sales:.2f}")
         return True
@@ -551,7 +551,7 @@ def log_pos_report(
             notes,
             analysis[:500],
             file_link,
-            _now().isoformat(),
+            _fmt_ts(),
         ])
         return True
 
@@ -716,7 +716,7 @@ def generate_monthly_summary(month: str = None) -> dict:
                 top_supplier,
                 top_payment,
                 notes,
-                _now().isoformat(),
+                _fmt_ts(),
             ]
 
             if row_idx:
@@ -1203,7 +1203,7 @@ def refresh_holiday_cache() -> dict:
     unique.sort(key=lambda x: x["date"])
 
     cache_data = {
-        "last_updated": _now().isoformat(),
+        "last_updated": _fmt_ts(),
         "holidays": unique,
     }
 
@@ -1251,20 +1251,27 @@ def get_upcoming_holidays(days_ahead: int = 14) -> list:
         except Exception as e:
             logger.error(f"Error reading holiday cache: {e}")
 
-    # Also check current year's school holidays directly (in case cache is stale)
+    # Always check school holidays from config as a fallback, regardless of
+    # whether the cache file exists or is populated. Check both the current
+    # year and the next year so holidays near a year boundary aren't missed.
     current_year = today.year
-    school_list = getattr(config, f"SCHOOL_HOLIDAYS_{current_year}", [])
-    for start, end, label in school_list:
-        try:
-            s_date = datetime.strptime(start, "%Y-%m-%d").date()
-            e_date = datetime.strptime(end, "%Y-%m-%d").date()
-            if s_date <= cutoff and e_date >= today:
-                entry = {"date": start, "end_date": end, "name": label, "source": "school_holidays"}
-                # Avoid duplicates
-                if not any(h["date"] == start and h["name"] == label for h in upcoming):
-                    upcoming.append(entry)
-        except ValueError:
-            continue
+    next_year = current_year + 1
+    school_lists = {
+        current_year: getattr(config, f"SCHOOL_HOLIDAYS_{current_year}", []),
+        next_year: getattr(config, f"SCHOOL_HOLIDAYS_{next_year}", []),
+    }
+    for _year, school_list in school_lists.items():
+        for start, end, label in school_list:
+            try:
+                s_date = datetime.strptime(start, "%Y-%m-%d").date()
+                e_date = datetime.strptime(end, "%Y-%m-%d").date()
+                if s_date <= cutoff and e_date >= today:
+                    entry = {"date": start, "end_date": end, "name": label, "source": "school_holidays"}
+                    # Avoid duplicates
+                    if not any(h["date"] == start and h["name"] == label for h in upcoming):
+                        upcoming.append(entry)
+            except ValueError:
+                continue
 
     upcoming.sort(key=lambda x: x["date"])
     return upcoming

@@ -90,11 +90,11 @@ def generate_pnl_xlsx(month: str = None, output_path: str = None) -> Optional[st
     try:
         # Pull data from Google Sheets
         from google_integration import (
-            get_monthly_transactions,
+            get_expenses_detail,
             get_daily_sales_for_month,
         )
 
-        transactions = get_monthly_transactions(month)
+        transactions = get_expenses_detail(month)
         daily_sales = get_daily_sales_for_month(month)
 
         # ─── Aggregate data ─────────────────────────
@@ -119,17 +119,13 @@ def generate_pnl_xlsx(month: str = None, output_path: str = None) -> Optional[st
         staff_meal = 0
 
         for t in transactions:
-            t_type = t.get("Type", "").lower()
-            if t_type not in ("expense", "purchase", "invoice", "receipt"):
-                continue
-
             try:
                 amount = float(t.get("Total (RM)", 0) or 0)
             except (ValueError, TypeError):
                 amount = 0
 
             supplier = t.get("Supplier", "")
-            items_str = t.get("Items", "")
+            items_str = t.get("Item", "")
             notes = t.get("Notes", "").lower()
 
             # Check for special categories

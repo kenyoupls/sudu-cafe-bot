@@ -77,6 +77,20 @@ def user_name(update: Update) -> str:
     u = update.effective_user
     return u.full_name or u.username or str(u.id)
 
+def _parse_ts(s: str) -> datetime:
+    """Parse timestamp in either old ISO or new '20260829-1425' format."""
+    if not s:
+        return datetime.min.replace(tzinfo=TZ)
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        dt = datetime.strptime(s, "%Y%m%d-%H%M")
+        return dt.replace(tzinfo=TZ)
+    except (ValueError, TypeError):
+        return datetime.min.replace(tzinfo=TZ)
+
 def is_admin(update: Update) -> bool:
     if not config.ADMIN_USER_IDS:
         return True  # No admins configured = everyone is admin
@@ -324,7 +338,7 @@ async def cmd_cleanstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = ["🧹 *Today's Cleaning Log*\n"]
     for entry in logs:
-        t = datetime.fromisoformat(entry["done_at"]).strftime("%I:%M %p")
+        t = _parse_ts(entry["done_at"]).strftime("%I:%M %p")
         lines.append(f"  ✅ {entry['zone']} — {entry['done_by']} at {t}")
 
     # Check what's NOT cleaned yet
@@ -361,7 +375,7 @@ async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         (info.get("updated_at", "") for info in stock.values()), default="Never"
     )
     if last_check != "Never":
-        last_check = datetime.fromisoformat(last_check).strftime("%d %b, %I:%M %p")
+        last_check = _parse_ts(last_check).strftime("%d %b, %I:%M %p")
     lines.append(f"\n🕐 Last updated: {last_check}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -973,7 +987,7 @@ async def cmd_contentlog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📱 *Recent Content*\n"]
     for entry in reversed(log[-10:]):
-        dt = datetime.fromisoformat(entry["posted_at"]).strftime("%d %b")
+        dt = _parse_ts(entry["posted_at"]).strftime("%d %b")
         lines.append(f"  • {dt}: {entry['idea'][:60]} ({entry['posted_by']})")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -1840,14 +1854,67 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cb_duplicate_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle duplicate receipt confirmation — user says Yes (save anyway) or No (skip)."""
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data.split(":", 1)[1]  # "save" or "skip"
+    pending = ctx.chat_data.get("pending_receipt")
+
+    if not pending:
+        await query.edit_message_text("⚠️ No pending receipt to process.")
+        return
+
+    if choice == "skip":
+        _clear_receipt_tracking(ctx)
+        await query.edit_message_text("🚫 Receipt skipped — duplicate not saved.")
+        return
+
+    # choice == "save" — proceed with normal confirmation
+    name = user_name(update)
+    # Route to the shared confirmation logic
+    await query.edit_message_text("⏳ Saving receipt (confirmed not a duplicate)...")
+    await _confirm_receipt(pending, name, update, ctx, skip_duplicate_check=True)
+
+
 async def _confirm_receipt(pending: dict, confirmed_by: str,
-                           update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+                           update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                           skip_duplicate_check: bool = False):
     """Shared receipt confirmation logic — used by both button and reply."""
     receipt_data = pending["data"]
     image_bytes = pending["image_bytes"]
     receipt_user = pending["user"]
 
-    status_msg = await update.message.reply_text("⏳ Saving receipt, updating stock & records...")
+    # Check for duplicate receipt
+    if not skip_duplicate_check:
+        supplier_check = receipt_data.get("supplier", "Unknown")
+        receipt_total_check = float(receipt_data.get("total") or 0)
+        receipt_date_check = receipt_data.get("date", now_sg().date().isoformat())
+        items_check = receipt_data.get("items", [])
+
+        existing = store.check_duplicate_receipt(
+            supplier_check, receipt_date_check, receipt_total_check, items_check
+        )
+        if existing:
+            buttons = [
+                [
+                    InlineKeyboardButton("✅ Yes, save it", callback_data="dupcheck:save"),
+                    InlineKeyboardButton("❌ No, skip", callback_data="dupcheck:skip"),
+                ]
+            ]
+            await update.effective_message.reply_text(
+                f"⚠️ *Possible duplicate receipt detected!*\n\n"
+                f"A receipt from *{existing.get('supplier', supplier_check)}* on {existing.get('date', receipt_date_check)} "
+                f"for RM{existing.get('total', receipt_total_check):.2f} ({existing.get('item_count', len(items_check))} items) "
+                f"was already saved by {existing.get('recorded_by', '?')}.\n\n"
+                f"Is this a *new* purchase or the same one?",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="Markdown",
+            )
+            return  # Wait for user to click button
+
+    status_msg = await update.effective_message.reply_text("⏳ Saving receipt, updating stock & records...")
 
     results = []
 
@@ -1951,11 +2018,16 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         if detail_count:
             results.append(f"📋 {detail_count} items logged to Expenses (paid by {paid_by})")
 
-        # Update monthly expense aggregation
+        # Update monthly expense aggregation + monthly summary
         try:
             update_monthly_expenses()
         except Exception as e:
             logger.error(f"Monthly expense aggregation error: {e}")
+        try:
+            from google_integration import generate_monthly_summary
+            generate_monthly_summary()
+        except Exception as e:
+            logger.error(f"Monthly summary update error: {e}")
 
     except ImportError:
         results.append("⚠️ Google integration not configured")
@@ -1966,6 +2038,18 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
     await _detect_new_items(items, update, ctx)
 
     _clear_receipt_tracking(ctx)
+
+    # Record receipt hash for duplicate detection
+    try:
+        store.record_receipt_hash(
+            supplier=receipt_data.get("supplier", "Unknown"),
+            receipt_date=receipt_data.get("date", now_sg().date().isoformat()),
+            total=float(receipt_data.get("total") or 0),
+            items=receipt_data.get("items", []),
+            recorded_by=confirmed_by,
+        )
+    except Exception as e:
+        logger.error(f"Receipt hash recording error: {e}")
 
     summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
     await status_msg.edit_text(
@@ -2010,6 +2094,33 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     receipt_data = pending["data"]
     image_bytes = pending["image_bytes"]
     receipt_user = pending["user"]
+
+    # Check for duplicate receipt
+    supplier_check = receipt_data.get("supplier", "Unknown")
+    receipt_total_check = float(receipt_data.get("total") or 0)
+    receipt_date_check = receipt_data.get("date", now_sg().date().isoformat())
+    items_check = receipt_data.get("items", [])
+
+    existing = store.check_duplicate_receipt(
+        supplier_check, receipt_date_check, receipt_total_check, items_check
+    )
+    if existing:
+        buttons = [
+            [
+                InlineKeyboardButton("✅ Yes, save it", callback_data="dupcheck:save"),
+                InlineKeyboardButton("❌ No, skip", callback_data="dupcheck:skip"),
+            ]
+        ]
+        await query.edit_message_text(
+            f"⚠️ *Possible duplicate receipt detected!*\n\n"
+            f"A receipt from *{existing.get('supplier', supplier_check)}* on {existing.get('date', receipt_date_check)} "
+            f"for RM{existing.get('total', receipt_total_check):.2f} ({existing.get('item_count', len(items_check))} items) "
+            f"was already saved by {existing.get('recorded_by', '?')}.\n\n"
+            f"Is this a *new* purchase or the same one?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+        return  # Wait for user to click button
 
     await query.edit_message_text("⏳ Saving receipt, updating stock & records...")
 
@@ -2112,11 +2223,16 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if detail_count:
             results.append(f"📋 {detail_count} items logged to Expenses (paid by {paid_by})")
 
-        # Update monthly expense aggregation
+        # Update monthly expense aggregation + monthly summary
         try:
             update_monthly_expenses()
         except Exception as e:
             logger.error(f"Monthly expense aggregation error: {e}")
+        try:
+            from google_integration import generate_monthly_summary
+            generate_monthly_summary()
+        except Exception as e:
+            logger.error(f"Monthly summary update error: {e}")
 
     except ImportError:
         results.append("⚠️ Google integration not configured")
@@ -2127,6 +2243,18 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _detect_new_items(items, update, ctx)
 
     _clear_receipt_tracking(ctx)
+
+    # Record receipt hash for duplicate detection
+    try:
+        store.record_receipt_hash(
+            supplier=receipt_data.get("supplier", "Unknown"),
+            receipt_date=receipt_data.get("date", now_sg().date().isoformat()),
+            total=float(receipt_data.get("total") or 0),
+            items=receipt_data.get("items", []),
+            recorded_by=name,
+        )
+    except Exception as e:
+        logger.error(f"Receipt hash recording error: {e}")
 
     summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
     await query.edit_message_text(
@@ -2615,12 +2743,8 @@ async def _execute_actions(actions: list, name: str, update: Update):
             elif action_type == "show_expenses":
                 month = act.get("month")
                 try:
-                    from google_integration import get_monthly_transactions
-                    transactions = get_monthly_transactions(month)
-                    expenses = [
-                        t for t in transactions
-                        if t.get("Type", "").lower() in ("expense", "purchase", "invoice", "receipt")
-                    ]
+                    from google_integration import get_expenses_detail
+                    expenses = get_expenses_detail(month)
                     if not expenses:
                         await update.message.reply_text(
                             "💸 No expenses recorded this month.\nSend a receipt photo to start tracking!"
@@ -3496,12 +3620,8 @@ async def cmd_receipts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     month = ctx.args[0] if ctx.args else None
 
     try:
-        from google_integration import get_monthly_transactions
-        transactions = get_monthly_transactions(month)
-        receipts = [
-            t for t in transactions
-            if t.get("Type", "").lower() in ("receipt", "invoice", "purchase")
-        ]
+        from google_integration import get_expenses_detail
+        receipts = get_expenses_detail(month)
 
         if not receipts:
             await update.message.reply_text(
@@ -3637,12 +3757,8 @@ async def cmd_expenses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     month = ctx.args[0] if ctx.args else None
 
     try:
-        from google_integration import get_monthly_transactions
-        transactions = get_monthly_transactions(month)
-        expenses = [
-            t for t in transactions
-            if t.get("Type", "").lower() in ("expense", "purchase", "invoice", "receipt")
-        ]
+        from google_integration import get_expenses_detail
+        expenses = get_expenses_detail(month)
 
         if not expenses:
             await update.message.reply_text(
@@ -3676,7 +3792,7 @@ async def cmd_expenses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"\n*Recent ({min(10, len(expenses))}):*")
         for t in expenses[-10:]:
             amount = float(t.get("Total (RM)", 0) or 0)
-            items_str = t.get("Items", "")[:40]
+            items_str = t.get("Item", "")[:40]
             lines.append(
                 f"  {t.get('Date', '?')} | {t.get('Supplier', '?')} | "
                 f"RM{amount:.2f}"
@@ -3986,7 +4102,7 @@ async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
         ref_time = last_chased or created
         if ref_time:
             try:
-                ref_dt = datetime.fromisoformat(ref_time)
+                ref_dt = _parse_ts(ref_time)
                 hours_old = (now - ref_dt).total_seconds() / 3600
                 if hours_old >= config.CHASEUP_STALE_HOURS:
                     stale.append((i, item))
@@ -4231,6 +4347,7 @@ def main():
 
     # New receipt item — regular vs one-off callback
     app.add_handler(CallbackQueryHandler(g(cb_newitem), pattern=r"^newitem:"))
+    app.add_handler(CallbackQueryHandler(g(cb_duplicate_check), pattern=r"^dupcheck:"))
 
     # Voice note handler
     app.add_handler(MessageHandler(filters.VOICE, g(handle_voice_note)))
@@ -4352,6 +4469,14 @@ def main():
         ])
 
     app.post_init = post_init
+
+    # Force refresh holiday cache on startup
+    try:
+        from google_integration import refresh_holiday_cache
+        refresh_holiday_cache()
+        logger.info("Holiday cache refreshed on startup")
+    except Exception as e:
+        logger.warning(f"Holiday cache refresh failed on startup (non-fatal): {e}")
 
     # ─── Start polling ──────────────────────────────────────
     logger.info(f"☕ {config.CAFE_NAME} Manager Bot starting...")
