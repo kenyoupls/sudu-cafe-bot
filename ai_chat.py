@@ -743,8 +743,18 @@ Available actions:
 - add_event: {"action": "add_event", "title": "Live Music", "date": "2026-09-15", "details": "Jazz band 7-10pm"}
 - stock_count: {"action": "stock_count", "item": "Coffee Beans", "count": "3 bags", "note": "counted by Ahmad"}
   Use this when someone reports a single stock count.
+  Prefer bulk_stock over stock_count — use stock_count only when staff explicitly reports just ONE item's count.
 - bulk_stock: {"action": "bulk_stock", "checked_by": "Edwin", "date": "20/08/26", "items": [{"item": "Full Cream Milk", "qty": "112"}, {"item": "Low Fat Milk", "qty": "73"}, {"item": "Matcha Powder", "qty": "2"}]}
   IMPORTANT: Use this when someone sends a full stock list or multiple items at once. Put EVERY item as a separate entry in the items array. Include ALL items from the message — do not skip any. If qty is empty or unclear, use dash. The "date" field is the date the stock was counted (format dd/mm/yy). Extract the date from the message if mentioned (e.g. "Updated by: 20.08.2026" → "20/08/26"). If no date is mentioned, omit the date field and it defaults to today. This saves each item individually to Google Sheets with history by date.
+  When staff sends a list of items with quantities, ALWAYS use bulk_stock — even for just 2-3 items.
+  This is a PHYSICAL COUNT: set each item's stock to the number given (overwrite, not add).
+  Examples that should trigger bulk_stock:
+    "milk 6, sugar 3, cups 200, ice 10 bags"
+    "susu 6, gula 3, cawan 200, ais 10 beg"
+    "milk - 6\nsugar - 3\ncups - 200"
+    "Whipping cream 1L: 5 boxes\nNata de coco: 12 packets"
+    "everything ok except milk is 2 and sugar is low"
+  → {"action": "bulk_stock", "checked_by": "<name>", "items": [{"item": "Milk", "qty": "6"}, ...]}
 - plan_content: {"action": "plan_content", "title": "Latte art video", "type": "reel", "date": "2026-08-25", "assigned_to": "Ahmad", "notes": "Show the rosetta pour"}
   type: photo, video, reel, story, post. Use when someone plans content for the café socials.
 - done_content: {"action": "done_content", "title": "Latte art video"}

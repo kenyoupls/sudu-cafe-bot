@@ -398,141 +398,18 @@ async def cmd_removestock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Item *{item_name}* not found in stock.", parse_mode="Markdown")
 
 
-def _stockcheck_buttons() -> InlineKeyboardMarkup:
-    """Common-quantity buttons for the full stock count flow."""
-    qty_row1 = [InlineKeyboardButton(str(n), callback_data=f"sck:{n}") for n in (0, 1, 2, 3)]
-    qty_row2 = [InlineKeyboardButton(str(n), callback_data=f"sck:{n}") for n in (5, 10)]
-    skip_row = [InlineKeyboardButton("⏭ Skip (keep current)", callback_data="sck:skip")]
-    return InlineKeyboardMarkup([qty_row1, qty_row2, skip_row])
-
-
-def _stockcheck_prompt_text(idx: int, total: int, item: str, current_qty) -> str:
-    return (
-        f"📦 *Stock Check* ({idx + 1}/{total})\n\n"
-        f"*{item}*\n"
-        f"Current recorded stock: {current_qty}\n\n"
-        f"Tap the actual count, or type a number and send it as a reply."
-    )
-
-
 async def cmd_stockcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Start an interactive full physical stock count — one item at a time."""
-    stock = store.get_stock()
-    items = sorted(stock.keys(), key=lambda k: k.lower())
-
-    if not items:
-        await update.message.reply_text(
-            "📦 No stock items tracked yet. Add items via receipts or /addstock first."
-        )
-        return
-
-    ctx.user_data["stock_check_items"] = items
-    ctx.user_data["stock_check_index"] = 0
-    ctx.user_data["stock_check_results"] = {}
-    ctx.user_data["stock_check_active"] = True
-
-    item = items[0]
-    current_qty = stock.get(item, {}).get("qty", "—")
-
+    """Show instructions for bulk stock check."""
     await update.message.reply_text(
-        _stockcheck_prompt_text(0, len(items), item, current_qty),
-        reply_markup=_stockcheck_buttons(),
+        "📋 *Stock Check*\n\n"
+        "Just send a list of items with their counts in the chat. For example:\n\n"
+        "_milk 6\n"
+        "sugar 3\n"
+        "cups 200\n"
+        "ice 10 bags_\n\n"
+        "I'll update everything and tell you what's missing!",
         parse_mode="Markdown",
     )
-
-
-async def _stockcheck_advance(update_or_query, ctx: ContextTypes.DEFAULT_TYPE, name: str, edit: bool):
-    """Move to the next item in the stock check, or finish it."""
-    items = ctx.user_data.get("stock_check_items", [])
-    idx = ctx.user_data.get("stock_check_index", 0)
-
-    if idx >= len(items):
-        # All done — submit full count
-        results = ctx.user_data.get("stock_check_results", {})
-        store.full_stock_count(results, name)
-
-        stock = store.get_stock()
-        lines = [f"📦 *Stock Check Complete* — by {name}\n"]
-        for item in items:
-            if item in results:
-                lines.append(f"  🟢 {item}: {results[item]}")
-            else:
-                current_qty = stock.get(item, {}).get("qty", "—")
-                lines.append(f"  ⏭ {item}: {current_qty} (unchanged)")
-
-        text = "\n".join(lines)
-        ctx.user_data["stock_check_active"] = False
-        ctx.user_data.pop("stock_check_items", None)
-        ctx.user_data.pop("stock_check_results", None)
-        ctx.user_data.pop("stock_check_index", None)
-
-        if edit:
-            await update_or_query.edit_message_text(text, parse_mode="Markdown")
-        else:
-            await update_or_query.message.reply_text(text, parse_mode="Markdown")
-        return
-
-    item = items[idx]
-    stock = store.get_stock()
-    current_qty = stock.get(item, {}).get("qty", "—")
-    prompt = _stockcheck_prompt_text(idx, len(items), item, current_qty)
-    markup = _stockcheck_buttons()
-
-    if edit:
-        await update_or_query.edit_message_text(prompt, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await update_or_query.message.reply_text(prompt, reply_markup=markup, parse_mode="Markdown")
-
-
-async def cb_stockcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    value = query.data.split(":", 1)[1]
-    name = user_name(update)
-
-    items = ctx.user_data.get("stock_check_items", [])
-    idx = ctx.user_data.get("stock_check_index", 0)
-
-    if not items or idx >= len(items):
-        await query.edit_message_text("⚠️ No active stock check. Use /stockcheck to start.")
-        return
-
-    item = items[idx]
-
-    if value != "skip":
-        try:
-            qty_int = int(value)
-        except ValueError:
-            qty_int = 0
-        ctx.user_data["stock_check_results"][item] = qty_int
-
-    ctx.user_data["stock_check_index"] = idx + 1
-    await _stockcheck_advance(query, ctx, name, edit=True)
-
-
-async def stockcheck_text_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Handle a typed numeric reply during an active stock check.
-    Returns True if the message was consumed as a stock-check answer."""
-    if not ctx.user_data.get("stock_check_active"):
-        return False
-
-    import re as _re
-    text = (update.message.text or "").strip()
-    if not _re.fullmatch(r"\d+", text):
-        return False
-
-    items = ctx.user_data.get("stock_check_items", [])
-    idx = ctx.user_data.get("stock_check_index", 0)
-    if not items or idx >= len(items):
-        return False
-
-    item = items[idx]
-    ctx.user_data["stock_check_results"][item] = int(text)
-    ctx.user_data["stock_check_index"] = idx + 1
-
-    name = user_name(update)
-    await _stockcheck_advance(update, ctx, name, edit=False)
-    return True
 
 
 async def cmd_lowstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2688,6 +2565,30 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     alert_lines.append("\nPlease restock these items!")
                     await update.message.reply_text("\n".join(alert_lines))
 
+                # Follow up: list items not mentioned in this stock count
+                try:
+                    all_stock = store.get_stock()
+                    updated_norms = set()
+                    for si in items:
+                        updated_norms.add(normalize_item_name(si.get("item", "")))
+
+                    missing = []
+                    for item_name in all_stock:
+                        if normalize_item_name(item_name) not in updated_norms:
+                            # Skip one-off items
+                            if not store.is_known_oneoff(item_name):
+                                missing.append(item_name)
+
+                    if missing:
+                        missing_list = "\n".join(f"  • {m}" for m in sorted(missing)[:30])
+                        await update.effective_message.reply_text(
+                            f"📋 *Items not counted yet:*\n\n{missing_list}\n\n"
+                            f"_Send their counts when ready, or say 'skip' to keep current values._",
+                            parse_mode="Markdown",
+                        )
+                except Exception as e:
+                    logger.error(f"Stock follow-up error: {e}")
+
             elif action_type == "correct_stock":
                 item = act.get("item", "")
                 new_qty = act.get("qty", 0)
@@ -3097,12 +2998,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Store in memory — ALWAYS, even if bot won't reply
     remember(name, text, "text", chat_id=chat_id)
-
-    # ─── Check for active stock check numeric reply ──
-    if ctx.user_data.get("stock_check_active"):
-        consumed = await stockcheck_text_reply(update, ctx)
-        if consumed:
-            return
 
     # ─── Check for receipt confirmation / amendment ──
     # Catches: (a) reply to ANY bot message in the receipt conversation,
@@ -4390,7 +4285,6 @@ def main():
     app.add_handler(CommandHandler("stockcheck", g(cmd_stockcheck)))
     app.add_handler(CommandHandler("removestock", g(cmd_removestock)))
     app.add_handler(CommandHandler("lowstock", g(cmd_lowstock)))
-    app.add_handler(CallbackQueryHandler(g(cb_stockcheck), pattern=r"^sck:"))
 
     # Checklists (allowed everywhere)
     app.add_handler(CommandHandler("open", g(cmd_open)))
