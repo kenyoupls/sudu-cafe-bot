@@ -122,6 +122,24 @@ def _get_chat_id(update: Update) -> int:
     return update.effective_chat.id
 
 
+async def _auto_add_low_to_shopping(low_items: list, store, bot, chat_id: int):
+    """Auto-add items below minimum stock to shopping list."""
+    from storage import normalize_item_name
+    shopping = store.get_shopping_list()
+    existing = {normalize_item_name(s["item"]) for s in shopping}
+    added = []
+    for li in low_items:
+        if normalize_item_name(li["item"]) not in existing:
+            store.add_shopping_item(li["item"], "Auto (low stock)", urgency="high")
+            added.append(li["item"])
+    if added:
+        msg = "🛒 *Auto-added to shopping list* (below minimum):\n• " + "\n• ".join(added)
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Shopping auto-add message error: {e}")
+
+
 def _bot_is_tagged(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     """Check if bot was @tagged or if the message is a reply to the bot."""
     msg = update.message
@@ -1877,6 +1895,14 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         if items:
             results.append(f"📦 {len(items)} items updated in stock")
 
+        # Auto-add low stock items to shopping list
+        try:
+            low_items = store.check_low_stock([item.get("name", "") for item in items if item.get("name")])
+            if low_items:
+                await _auto_add_low_to_shopping(low_items, store, ctx.bot, update.effective_chat.id)
+        except Exception as e:
+            logger.error(f"Low stock auto-add error: {e}")
+
         # Auto-clear matching shopping list items
         try:
             shopping = store.get_shopping_list()
@@ -2094,6 +2120,14 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if items:
             results.append(f"📦 {len(items)} items updated in stock")
+
+        # Auto-add low stock items to shopping list
+        try:
+            low_items = store.check_low_stock([item.get("name", "") for item in items if item.get("name")])
+            if low_items:
+                await _auto_add_low_to_shopping(low_items, store, ctx.bot, update.effective_chat.id)
+        except Exception as e:
+            logger.error(f"Low stock auto-add error: {e}")
 
         # Auto-clear matching shopping list items
         try:
@@ -2476,6 +2510,7 @@ async def _execute_actions(actions: list, name: str, update: Update):
                         li = low_items[0]
                         unit = f" {li['unit']}" if li.get('unit') else ""
                         feedback.append(f"⚠️ LOW STOCK: {li['item']} is at {li['qty']} (min: {li['min']}{unit})")
+                        await _auto_add_low_to_shopping(low_items, store, update.get_bot(), update.effective_chat.id)
 
             elif action_type == "log_cleaning":
                 zone = act.get("zone", "")
@@ -2564,6 +2599,7 @@ async def _execute_actions(actions: list, name: str, update: Update):
                         alert_lines.append(f"  • {li['item']}: {li['qty']} (min: {li['min']}{unit})")
                     alert_lines.append("\nPlease restock these items!")
                     await update.message.reply_text("\n".join(alert_lines))
+                    await _auto_add_low_to_shopping(low_items, store, update.get_bot(), update.effective_chat.id)
 
                 # Follow up: list items not mentioned in this stock count
                 try:
@@ -4192,6 +4228,37 @@ async def scheduled_holiday_refresh(ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Holiday refresh error: {e}")
 
 
+async def scheduled_holiday_alert(context: ContextTypes.DEFAULT_TYPE):
+    """Daily check for upcoming holidays — alert at 14, 7, and 1 day(s) before."""
+    try:
+        from google_integration import get_upcoming_holidays
+        today = now_sg().date()
+        upcoming = get_upcoming_holidays(days_ahead=15)
+        if not upcoming:
+            return
+
+        alerts = []
+        for h in upcoming:
+            try:
+                h_date = datetime.strptime(h["date"], "%Y-%m-%d").date()
+                days_until = (h_date - today).days
+                if days_until in (14, 7, 1):
+                    label = f"{days_until} day{'s' if days_until > 1 else ''}"
+                    alerts.append(f"📅 *{h.get('name', 'Holiday')}* — {h['date']} ({label} away)")
+            except (ValueError, KeyError):
+                continue
+
+        if alerts:
+            msg = "🗓️ *Upcoming Holiday Alert*\n\n" + "\n".join(alerts)
+            await context.bot.send_message(
+                chat_id=config.OWNER_GROUP_ID,
+                text=msg,
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.error(f"Holiday alert error: {e}")
+
+
 async def scheduled_school_holiday_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """October: remind about upcoming school year-end holidays."""
     if not config.OWNER_GROUP_ID:
@@ -4444,6 +4511,14 @@ def main():
             time=dtime(3, 0, tzinfo=TZ),
             days=(6,),
             name="holiday_refresh",
+        )
+
+        # Holiday alert — daily check, fires at 14/7/1 days before a holiday
+        jq.run_daily(
+            scheduled_holiday_alert,
+            time=dtime(9, 0, tzinfo=TZ),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="holiday_alert",
         )
 
         # School holiday reminder — daily check (only fires on Oct 1)

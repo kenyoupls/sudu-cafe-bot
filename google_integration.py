@@ -1162,7 +1162,8 @@ def refresh_holiday_cache() -> dict:
     import json as _json
     from pathlib import Path
 
-    cache_file = Path("data/holidays.json")
+    cache_file = Path(__file__).parent / "data" / "holidays.json"
+    cache_file.parent.mkdir(exist_ok=True)
     current_year = _now().year
     next_year = current_year + 1
 
@@ -1227,7 +1228,7 @@ def get_upcoming_holidays(days_ahead: int = 14) -> list:
     from pathlib import Path
     from datetime import timedelta
 
-    cache_file = Path("data/holidays.json")
+    cache_file = Path(__file__).parent / "data" / "holidays.json"
     today = _now().date()
     cutoff = today + timedelta(days=days_ahead)
 

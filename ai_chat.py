@@ -1065,8 +1065,8 @@ def _build_context(is_staff_group: bool = False) -> str:
             parts.append("UPCOMING HOLIDAYS (next 14 days):\n" + "\n".join(h_lines))
     except ImportError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Holiday context error: {e}")
 
     if not parts:
         return "No café data available yet. Staff should use /stockcheck, /addshift, etc. to set up."

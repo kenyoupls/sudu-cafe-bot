@@ -422,6 +422,13 @@ class SheetsSync:
                             latest_date_parsed = pd
                             latest_qty = val
 
+                # Backfill stock_current from most recent date column if column B was empty
+                if item not in stock_current and latest_qty:
+                    try:
+                        stock_current[item] = int(float(latest_qty))
+                    except (ValueError, TypeError):
+                        pass
+
                 if latest_qty:
                     stock[item] = {
                         "qty": latest_qty,
