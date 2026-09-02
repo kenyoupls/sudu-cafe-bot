@@ -156,6 +156,7 @@ _groq_client: Optional[Groq] = None
 
 GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
+GROQ_TEXT_MODEL_SMALL = "llama-3.1-8b-instant"
 
 
 def get_groq_client() -> Optional[Groq]:
@@ -185,21 +186,30 @@ async def _groq_text(prompt: str, system: str = "", temperature: float = 0.7,
     client = get_groq_client()
     if client is None:
         return None
-    try:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        resp = client.chat.completions.create(
-            model=GROQ_TEXT_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content.strip() if resp.choices else None
-    except Exception as e:
-        logger.error(f"Groq text error: {e}")
-        return None
+
+    for model in [GROQ_TEXT_MODEL, GROQ_TEXT_MODEL_SMALL]:
+        try:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content.strip() if resp.choices else None
+        except Exception as e:
+            err_str = str(e)
+            if "413" in err_str or "too large" in err_str.lower() or "rate_limit" in err_str.lower():
+                logger.warning(f"Groq {model} too large, trying smaller model")
+                continue
+            logger.error(f"Groq text error ({model}): {e}")
+            return None
+
+    logger.error("Groq text: all models failed")
+    return None
 
 
 async def _groq_vision(prompt: str, image_bytes: bytes, mime_type: str = "image/jpeg",
@@ -907,6 +917,57 @@ You are currently in the STAFF group chat. You MUST follow these rules:
 STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
 
 
+# ─── Condensed prompt for Groq (primary provider) ───────────
+# Trimmed to ~500 tokens: no SOP recipes, no verbose examples.
+# Groq is fast/cheap so we keep its system prompt small to save tokens
+# and reduce 413 "request too large" errors.
+_GROQ_SYSTEM_PROMPT = f"""You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
+
+PERSONALITY:
+- Direct, no-nonsense, warm — like a hands-on owner who works the floor
+- SHORT replies only: 2-3 sentences max. Telegram style, not email.
+- Be specific ("order 5 cartons of milk from Giant"), never generic
+- Say "we", not "you" — you're part of the team
+- If something's wrong, say so straight and give the fix
+- Never make up data you don't have
+
+MALAYSIA LANGUAGE:
+- Staff mix English, Bahasa Melayu, Mandarin, and Tamil in one message — totally normal
+- ALWAYS reply in ENGLISH unless the message is written ENTIRELY in one other language
+- Never correct their mixed language
+- Currency is RM (Ringgit Malaysia)
+
+WHAT YOU MANAGE: stock, cleaning, equipment, supplier orders, task assignments, follow-ups, expenses/sales/P&L awareness, content planning, promos/events, troubleshooting.
+
+ACTIONS YOU CAN TRIGGER:
+When a message implies something actionable, append a JSON array at the END of your reply, wrapped in ```actions``` fences. Only include actions when clearly actionable — never for questions, chit-chat, or greetings.
+
+Available actions (name — brief format):
+- update_stock — {{"action":"update_stock","item":"...","qty":"OK|LOW|OUT|<number>","note":"..."}}
+- log_cleaning — {{"action":"log_cleaning","zone":"..."}}
+- add_shopping — {{"action":"add_shopping","item":"...","urgency":"normal|urgent"}}
+- mark_bought — {{"action":"mark_bought","item":"..."}}
+- save_instruction — {{"action":"save_instruction","instruction":"..."}} (admin says "from now on...", "remember...", "always/never...")
+- learn_alias — {{"action":"learn_alias","canonical":"...","alias":"..."}}
+- add_event — {{"action":"add_event","title":"...","date":"YYYY-MM-DD","details":"..."}}
+- stock_count — {{"action":"stock_count","item":"...","count":"...","note":"..."}} (single item only)
+- bulk_stock — {{"action":"bulk_stock","checked_by":"...","date":"dd/mm/yy","items":[{{"item":"...","qty":"..."}}]}} (use for 2+ items, physical count overwrites)
+- plan_content — {{"action":"plan_content","title":"...","type":"photo|video|reel|story|post","date":"YYYY-MM-DD","assigned_to":"...","notes":"..."}}
+- done_content — {{"action":"done_content","title":"..."}}
+- suggest_content — {{"action":"suggest_content"}}
+- correct_stock — {{"action":"correct_stock","item":"...","qty":0,"note":"..."}} (overwrites a wrong past entry)
+- undo_receipt — {{"action":"undo_receipt","supplier":"...","date":"YYYY-MM-DD","items":[{{"name":"...","qty":0}}]}}
+- checklist_done — {{"action":"checklist_done","checklist":"opening|6pm|closing","items":["all"] or [...]}}
+- monthly_summary — {{"action":"monthly_summary","month":"YYYY-MM"}}
+- Reports (no data made up, just trigger): show_today, show_expenses, show_whopaid, show_sales, show_pnl, show_stock, show_lowstock, show_shopping, show_cleaning, show_shifts, show_week, show_tasks, show_staff — each {{"action":"show_x"}}, month optional where relevant.
+
+You can include multiple actions in one array. Always give your natural chat reply BEFORE the actions block. If no action is needed, reply with no actions block at all.
+
+You will be given current café data and the new message. Use it to make decisions — don't invent numbers."""
+
+_GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + "\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
+
+
 # ═══════════════════════════════════════════════════════════
 #  CONTEXT BUILDER
 # ═══════════════════════════════════════════════════════════
@@ -1096,6 +1157,59 @@ def _full_context(user_name: str, user_message: str, reply_context: str = None,
     return "\n\n".join(parts)
 
 
+def _groq_context(user_name: str, user_message: str, reply_context: str = None,
+                   chat_id: int = 0, is_staff_group: bool = False) -> str:
+    """Trimmed context for Groq — no memory/history, shorter café data."""
+    store = get_store()
+    parts = []
+
+    # Custom instructions (keep, these are short)
+    custom_instructions = store.get_custom_instructions()
+    if custom_instructions:
+        instr_lines = [ci['instruction'] for ci in custom_instructions[:5]]
+        parts.append("RULES: " + "; ".join(instr_lines))
+
+    # Stock summary (condensed — only low/out items)
+    low = store.get_low_stock()
+    if low:
+        parts.append("LOW/OUT STOCK: " + ", ".join(i for i, _ in low))
+
+    # Shopping list (brief)
+    shopping = store.get_shopping_list()
+    if shopping:
+        items = [s["item"] for s in shopping[:10]]
+        parts.append("SHOPPING LIST: " + ", ".join(items))
+
+    # Today's events
+    events = store.get_events()
+    if events:
+        today_events = [e for e in events if e.get("date", "") == _now().strftime("%Y-%m-%d")]
+        if today_events:
+            parts.append("TODAY'S EVENTS: " + ", ".join(e.get("title", "") for e in today_events))
+
+    # Upcoming holidays
+    try:
+        from google_integration import get_upcoming_holidays
+        holidays = get_upcoming_holidays(14)
+        if holidays:
+            h_list = [f"{h['date']}: {h['name']}" for h in holidays[:5]]
+            parts.append("UPCOMING HOLIDAYS: " + "; ".join(h_list))
+    except Exception:
+        pass
+
+    now = _now().strftime("%A, %d %B %Y, %I:%M %p")
+    parts.append(f"Time: {now}")
+    parts.append(f"Staff: {user_name}")
+
+    if reply_context:
+        # Trim reply context to 300 chars
+        parts.append(f"[Replying to: {reply_context[:300]}]")
+
+    parts.append(f"Message: {user_message}")
+
+    return "\n".join(parts)
+
+
 # ═══════════════════════════════════════════════════════════
 #  💬 TEXT CHAT (with memory)
 # ═══════════════════════════════════════════════════════════
@@ -1152,11 +1266,27 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     Returns (chat_reply: str, actions: list[dict]).
     Actions are structured commands the bot should execute (stock updates, etc).
     """
+    # Use staff-restricted prompt when in staff group
+    groq_sys = _GROQ_STAFF_SYSTEM_PROMPT if is_staff_group else _GROQ_SYSTEM_PROMPT
+
+    # ── Primary: Groq ──
+    try:
+        prompt = _groq_context(user_name, user_message, reply_context,
+                               chat_id=chat_id, is_staff_group=is_staff_group)
+        raw = await _groq_text(prompt, system=groq_sys, temperature=0.7, max_tokens=500)
+        if raw:
+            chat_reply, actions = _parse_actions(raw)
+            if chat_reply:
+                remember_bot_response(chat_reply, chat_id=chat_id)
+            return chat_reply, actions
+    except Exception as e:
+        logger.warning(f"Groq primary failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None, []
 
-    # Use staff-restricted prompt when in staff group
     sys_prompt = STAFF_SYSTEM_PROMPT if is_staff_group else SYSTEM_PROMPT
 
     try:
@@ -1184,22 +1314,9 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
 
         return chat_reply, actions
 
-    except Exception as e:
-        logger.error(f"Gemini API error: {e} — trying Groq fallback")
-        # ── Groq fallback for text chat ──
-        try:
-            prompt = _full_context(user_name, user_message, reply_context,
-                                   chat_id=chat_id, is_staff_group=is_staff_group)
-            raw = await _groq_text(prompt, system=sys_prompt, temperature=0.7, max_tokens=500)
-            if not raw:
-                return None, []
-            chat_reply, actions = _parse_actions(raw)
-            if chat_reply:
-                remember_bot_response(chat_reply, chat_id=chat_id)
-            return chat_reply, actions
-        except Exception as e2:
-            logger.error(f"Groq fallback also failed: {e2}")
-            return None, []
+    except Exception as e2:
+        logger.error(f"Gemini fallback also failed: {e2}")
+        return None, []
 
 
 async def ask_ai(user_message: str, user_name: str, reply_context: str = None,
@@ -1214,6 +1331,32 @@ async def ask_ai(user_message: str, user_name: str, reply_context: str = None,
 async def classify_photo(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
     """Ask Gemini to classify the photo type.
     Returns: 'receipt', 'sales_report', 'problem', or 'photo'."""
+    # ── Primary: Groq vision ──
+    try:
+        prompt = (
+            "Look at this image carefully. Classify it into EXACTLY one of these categories:\n\n"
+            "1. 'receipt' — a purchase receipt, invoice, bill, delivery order, "
+            "online shopping checkout/order (Shopee, Lazada, Grab, FoodPanda), "
+            "payment confirmation, bank transfer proof, or ANY proof of money spent\n"
+            "2. 'sales_report' — a POS daily sales report, sales summary, end-of-day report\n"
+            "3. 'problem' — broken/damaged item, equipment issue, maintenance problem\n"
+            "4. 'photo' — anything else\n\n"
+            "Reply with ONLY one word: receipt, sales_report, problem, or photo"
+        )
+        result = await _groq_vision(prompt, image_bytes, mime_type, temperature=0.1, max_tokens=20)
+        if result:
+            result = result.strip().lower()
+            if "sales_report" in result or "sales" in result:
+                return "sales_report"
+            if "receipt" in result:
+                return "receipt"
+            if "problem" in result:
+                return "problem"
+            return "photo"
+    except Exception as e:
+        logger.warning(f"Groq classify_photo failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return "photo"
@@ -1253,33 +1396,9 @@ async def classify_photo(image_bytes: bytes, mime_type: str = "image/jpeg") -> s
             return "problem"
         return "photo"
 
-    except Exception as e:
-        logger.error(f"Photo classification error: {e} — trying Groq fallback")
-        # ── Groq vision fallback for photo classification ──
-        try:
-            prompt = (
-                "Look at this image carefully. Classify it into EXACTLY one of these categories:\n\n"
-                "1. 'receipt' — a purchase receipt, invoice, bill, delivery order, "
-                "online shopping checkout/order (Shopee, Lazada, Grab, FoodPanda), "
-                "payment confirmation, bank transfer proof, or ANY proof of money spent\n"
-                "2. 'sales_report' — a POS daily sales report, sales summary, end-of-day report\n"
-                "3. 'problem' — broken/damaged item, equipment issue, maintenance problem\n"
-                "4. 'photo' — anything else\n\n"
-                "Reply with ONLY one word: receipt, sales_report, problem, or photo"
-            )
-            result = await _groq_vision(prompt, image_bytes, mime_type, temperature=0.1, max_tokens=20)
-            if result:
-                result = result.strip().lower()
-                if "sales_report" in result or "sales" in result:
-                    return "sales_report"
-                if "receipt" in result:
-                    return "receipt"
-                if "problem" in result:
-                    return "problem"
-            return "photo"
-        except Exception as e2:
-            logger.error(f"Groq classify_photo fallback also failed: {e2}")
-            return "photo"
+    except Exception as e2:
+        logger.error(f"Gemini classify fallback failed: {e2}")
+        return "photo"
 
 
 async def classify_receipt_reply(user_reply: str, receipt_summary: str) -> dict:
@@ -1535,6 +1654,45 @@ async def process_sales_report(
         "raw_text": "full text from report",
     }
     """
+    # ── Primary: Groq vision ──
+    try:
+        prompt = (
+            f"You are analyzing a POS daily sales / close-up report image from a café.\n"
+            f"Staff member: {user_name}\n"
+            f"{'Caption: ' + caption if caption else 'No caption.'}\n\n"
+            "Extract ALL information from this sales report. "
+            "It may be in any language.\n\n"
+            "Reply with ONLY a JSON object with these fields:\n"
+            '{\n'
+            '  "date": "YYYY-MM-DD",\n'
+            '  "payment_breakdown": [{"method": "Credit Card", "amount": 143.30}],\n'
+            '  "total_sales": 261.70,\n'
+            '  "bill_count": 6,\n'
+            '  "total_pax": 6,\n'
+            '  "total_discount": 0.00,\n'
+            '  "total_void": 0.00,\n'
+            '  "total_refund": 0.00,\n'
+            '  "other_charge": 0.00,\n'
+            '  "user": "cashier name",\n'
+            '  "notes": "extra info",\n'
+            '  "raw_text": "all readable text"\n'
+            '}\n'
+            "Amounts in RM. If you can't read a value, use null."
+        )
+        result = await _groq_vision(prompt, image_bytes, mime_type, temperature=0.1, max_tokens=800)
+        if result:
+            result = result.replace("```json", "").replace("```", "").strip()
+            data = json.loads(result)
+            if isinstance(data, dict):
+                if "payment_breakdown" not in data:
+                    data["payment_breakdown"] = []
+                if "total_sales" not in data:
+                    data["total_sales"] = 0
+                return data
+    except Exception as e:
+        logger.warning(f"Groq sales report processing failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -1593,48 +1751,9 @@ async def process_sales_report(
 
         return data
 
-    except Exception as e:
-        logger.error(f"Sales report processing error: {e} — trying Groq fallback")
-        # ── Groq vision fallback for sales report OCR ──
-        try:
-            prompt = (
-                f"You are analyzing a POS daily sales / close-up report image from a café.\n"
-                f"Staff member: {user_name}\n"
-                f"{'Caption: ' + caption if caption else 'No caption.'}\n\n"
-                "Extract ALL information from this sales report. "
-                "It may be in any language.\n\n"
-                "Reply with ONLY a JSON object with these fields:\n"
-                '{\n'
-                '  "date": "YYYY-MM-DD",\n'
-                '  "payment_breakdown": [{"method": "Credit Card", "amount": 143.30}],\n'
-                '  "total_sales": 261.70,\n'
-                '  "bill_count": 6,\n'
-                '  "total_pax": 6,\n'
-                '  "total_discount": 0.00,\n'
-                '  "total_void": 0.00,\n'
-                '  "total_refund": 0.00,\n'
-                '  "other_charge": 0.00,\n'
-                '  "user": "cashier name",\n'
-                '  "notes": "extra info",\n'
-                '  "raw_text": "all readable text"\n'
-                '}\n'
-                "Amounts in RM. If you can't read a value, use null."
-            )
-            result = await _groq_vision(prompt, image_bytes, mime_type, temperature=0.1, max_tokens=800)
-            if not result:
-                return None
-            result = result.replace("```json", "").replace("```", "").strip()
-            data = json.loads(result)
-            if not isinstance(data, dict):
-                return None
-            if "payment_breakdown" not in data:
-                data["payment_breakdown"] = []
-            if "total_sales" not in data:
-                data["total_sales"] = 0
-            return data
-        except Exception as e2:
-            logger.error(f"Groq sales report fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini sales report fallback also failed: {e2}")
+        return None
 
 
 def validate_stock_count(item: str, reported_count: str) -> Optional[str]:
@@ -1686,6 +1805,25 @@ async def generate_content_suggestions(user_name: str) -> Optional[str]:
     Generate photo/video content ideas based on current café context —
     what's happening today, upcoming events, stock, season, trending formats.
     """
+    # ── Primary: Groq ──
+    try:
+        cafe_data = _build_context()
+        now = _now()
+        prompt = (
+            f"You are the content strategist for a café in Melaka, Malaysia.\n\n"
+            f"{cafe_data}\n\n"
+            f"Today is {now.strftime('%A, %d %B %Y')}.\n\n"
+            f"Generate 3-4 SPECIFIC photo/video content ideas for Instagram/TikTok.\n"
+            f"For each: what to film, format (photo/reel/story), best time, caption, 3-5 hashtags.\n"
+            f"Keep it practical — things a barista with a phone can shoot today."
+        )
+        result = await _groq_text(prompt, temperature=0.9, max_tokens=600)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning(f"Groq content suggestion failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -1733,23 +1871,9 @@ Reply in the sender's language style (English with casual Malaysian flair is fin
 
         return response.text.strip() if response.text else None
 
-    except Exception as e:
-        logger.error(f"Content suggestion error: {e} — trying Groq fallback")
-        try:
-            cafe_data = _build_context()
-            now = _now()
-            prompt = (
-                f"You are the content strategist for a café in Melaka, Malaysia.\n\n"
-                f"{cafe_data}\n\n"
-                f"Today is {now.strftime('%A, %d %B %Y')}.\n\n"
-                f"Generate 3-4 SPECIFIC photo/video content ideas for Instagram/TikTok.\n"
-                f"For each: what to film, format (photo/reel/story), best time, caption, 3-5 hashtags.\n"
-                f"Keep it practical — things a barista with a phone can shoot today."
-            )
-            return await _groq_text(prompt, temperature=0.9, max_tokens=600)
-        except Exception as e2:
-            logger.error(f"Groq content suggestion fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini content suggestion fallback also failed: {e2}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1837,6 +1961,28 @@ async def handle_photo(
     - Analyze what's in it (equipment, food, cleanliness, receipt, etc.)
     - Respond with practical advice or acknowledgment
     """
+    # ── Primary: Groq vision ──
+    try:
+        caption_context = f"They included this caption: '{caption}'" if caption else "No caption was included."
+        prompt = (
+            f"Current time: {_now().strftime('%A, %d %B %Y, %I:%M %p')}\n"
+            f"Staff member: {user_name}\n"
+            f"They just sent a photo. {caption_context}\n\n"
+            f"Analyze the photo and respond helpfully (2-3 sentences max).\n"
+            f"If equipment issue: identify and suggest fix. If cleanliness: suggest action.\n"
+            f"If delivery/receipt: note what was received. If food/drink: comment on quality."
+        )
+        result = await _groq_vision(prompt, image_bytes, mime_type, system=_GROQ_SYSTEM_PROMPT,
+                                    temperature=0.5, max_tokens=300)
+        if result:
+            photo_desc = caption if caption else result[:80]
+            remember(user_name, f"[Photo: {photo_desc}]", "photo", chat_id, message_id)
+            remember_bot_response(result, chat_id)
+            return result
+    except Exception as e:
+        logger.warning(f"Groq photo analysis failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -1888,29 +2034,9 @@ async def handle_photo(
 
         return result
 
-    except Exception as e:
-        logger.error(f"Gemini photo error: {e} — trying Groq fallback")
-        # ── Groq vision fallback for photo analysis ──
-        try:
-            caption_context = f"They included this caption: '{caption}'" if caption else "No caption was included."
-            prompt = (
-                f"Current time: {_now().strftime('%A, %d %B %Y, %I:%M %p')}\n"
-                f"Staff member: {user_name}\n"
-                f"They just sent a photo. {caption_context}\n\n"
-                f"Analyze the photo and respond helpfully (2-3 sentences max).\n"
-                f"If equipment issue: identify and suggest fix. If cleanliness: suggest action.\n"
-                f"If delivery/receipt: note what was received. If food/drink: comment on quality."
-            )
-            result = await _groq_vision(prompt, image_bytes, mime_type, system=SYSTEM_PROMPT,
-                                        temperature=0.5, max_tokens=300)
-            if result:
-                photo_desc = caption if caption else result[:80]
-                remember(user_name, f"[Photo: {photo_desc}]", "photo", chat_id, message_id)
-                remember_bot_response(result, chat_id)
-            return result
-        except Exception as e2:
-            logger.error(f"Groq photo fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini photo fallback also failed: {e2}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1960,13 +2086,33 @@ def extract_action_items(text: str, user_name: str) -> list:
 
 async def extract_action_items_ai(text: str, user_name: str) -> list:
     """Use Gemini to intelligently extract action items from a message."""
-    client = get_client()
-    if client is None:
-        return extract_action_items(text, user_name)
-
     # Only call AI for messages that look like they have action items
     if not extract_action_items(text, user_name):
         return []
+
+    # ── Primary: Groq ──
+    try:
+        prompt = (
+            "Extract action items from this cafe group chat message. "
+            f"Sender: {user_name}\n"
+            f'Message: "{text}"\n\n'
+            "Reply with ONLY a JSON array:\n"
+            '[{"task": "what to do", "assigned_to": "who", "urgency": "normal"}]\n'
+            "If no action items, reply with []"
+        )
+        result = await _groq_text(prompt, temperature=0.1, max_tokens=200)
+        if result:
+            result = result.replace("```json", "").replace("```", "").strip()
+            items = json.loads(result)
+            if isinstance(items, list):
+                return items
+    except Exception as e:
+        logger.warning(f"Groq action extraction failed: {e}")
+
+    # ── Fallback: Gemini ──
+    client = get_client()
+    if client is None:
+        return extract_action_items(text, user_name)
 
     try:
         prompt = (
@@ -1998,27 +2144,9 @@ async def extract_action_items_ai(text: str, user_name: str) -> list:
             return items
         return []
 
-    except Exception as e:
-        logger.error(f"AI action extraction error: {e} — trying Groq fallback")
-        try:
-            prompt = (
-                "Extract action items from this cafe group chat message. "
-                f"Sender: {user_name}\n"
-                f'Message: "{text}"\n\n'
-                "Reply with ONLY a JSON array:\n"
-                '[{"task": "what to do", "assigned_to": "who", "urgency": "normal"}]\n'
-                "If no action items, reply with []"
-            )
-            result = await _groq_text(prompt, temperature=0.1, max_tokens=200)
-            if result:
-                result = result.replace("```json", "").replace("```", "").strip()
-                items = json.loads(result)
-                if isinstance(items, list):
-                    return items
-            return []
-        except Exception as e2:
-            logger.error(f"Groq action extraction fallback also failed: {e2}")
-            return extract_action_items(text, user_name)
+    except Exception as e2:
+        logger.error(f"Gemini action extraction fallback also failed: {e2}")
+        return extract_action_items(text, user_name)
 
 
 async def generate_chaseup_message(pending_items: list) -> str:
@@ -2026,12 +2154,28 @@ async def generate_chaseup_message(pending_items: list) -> str:
     if not pending_items:
         return ""
 
-    client = get_client()
     items_text = "\n".join(
         f"- {i.get('task', '?')} (assigned: {i.get('assigned_to', '?')}, "
         f"since: {i.get('created_at', '?')[:16]}, chased {i.get('chase_count', 0)}x)"
         for i in pending_items
     )
+
+    # ── Primary: Groq ──
+    try:
+        prompt = (
+            f"Generate a SHORT, friendly chase-up message for these pending café tasks:\n\n"
+            f"{items_text}\n\n"
+            f"Keep it casual, Malaysian style. Tag who's responsible. "
+            f"End with: reply /taskdone <number> when settled. Max 5 lines."
+        )
+        result = await _groq_text(prompt, system=_GROQ_SYSTEM_PROMPT, temperature=0.7, max_tokens=200)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning(f"Groq chaseup message failed: {e}")
+
+    # ── Fallback: Gemini ──
+    client = get_client()
 
     if client is None:
         # Fallback: simple template
@@ -2064,20 +2208,9 @@ async def generate_chaseup_message(pending_items: list) -> str:
         )
         return response.text.strip() if response.text else ""
 
-    except Exception as e:
-        logger.error(f"Chase-up message error: {e} — trying Groq fallback")
-        try:
-            prompt = (
-                f"Generate a SHORT, friendly chase-up message for these pending café tasks:\n\n"
-                f"{items_text}\n\n"
-                f"Keep it casual, Malaysian style. Tag who's responsible. "
-                f"End with: reply /taskdone <number> when settled. Max 5 lines."
-            )
-            result = await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.7, max_tokens=200)
-            return result or ""
-        except Exception as e2:
-            logger.error(f"Groq chaseup fallback also failed: {e2}")
-            return ""
+    except Exception as e2:
+        logger.error(f"Gemini chaseup fallback also failed: {e2}")
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2086,6 +2219,20 @@ async def generate_chaseup_message(pending_items: list) -> str:
 
 async def get_content_idea(topic: str = "") -> Optional[str]:
     """Ask AI for a specific content idea."""
+    # ── Primary: Groq ──
+    try:
+        prompt = (
+            f"Give me ONE specific social media content idea for {config.CAFE_NAME}. "
+            f"{'Topic: ' + topic + '. ' if topic else ''}"
+            f"Include: what to post, platform, caption, best time. Under 4 sentences."
+        )
+        result = await _groq_text(prompt, system=_GROQ_SYSTEM_PROMPT, temperature=0.9, max_tokens=200)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning(f"Groq content idea failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -2110,22 +2257,30 @@ async def get_content_idea(topic: str = "") -> Optional[str]:
 
         return response.text.strip() if response.text else None
 
-    except Exception as e:
-        logger.error(f"Gemini API error (content): {e} — trying Groq fallback")
-        try:
-            prompt = (
-                f"Give me ONE specific social media content idea for {config.CAFE_NAME}. "
-                f"{'Topic: ' + topic + '. ' if topic else ''}"
-                f"Include: what to post, platform, caption, best time. Under 4 sentences."
-            )
-            return await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.9, max_tokens=200)
-        except Exception as e2:
-            logger.error(f"Groq content idea fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini content idea fallback also failed: {e2}")
+        return None
 
 
 async def analyze_stock_and_suggest() -> Optional[str]:
     """AI analyzes stock levels and suggests actions."""
+    # ── Primary: Groq ──
+    try:
+        context = _build_context()
+        prompt = (
+            f"{context}\n\n"
+            f"Based on stock levels above, give:\n"
+            f"1. What needs buying URGENTLY (one line)\n"
+            f"2. Items to reorder soon (one line)\n"
+            f"3. One inventory management tip (one line)"
+        )
+        result = await _groq_text(prompt, system=_GROQ_SYSTEM_PROMPT, temperature=0.3, max_tokens=200)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning(f"Groq stock analysis failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -2153,25 +2308,28 @@ async def analyze_stock_and_suggest() -> Optional[str]:
 
         return response.text.strip() if response.text else None
 
-    except Exception as e:
-        logger.error(f"Gemini API error (stock analysis): {e} — trying Groq fallback")
-        try:
-            context = _build_context()
-            prompt = (
-                f"{context}\n\n"
-                f"Based on stock levels above, give:\n"
-                f"1. What needs buying URGENTLY (one line)\n"
-                f"2. Items to reorder soon (one line)\n"
-                f"3. One inventory management tip (one line)"
-            )
-            return await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.3, max_tokens=200)
-        except Exception as e2:
-            logger.error(f"Groq stock analysis fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini stock analysis fallback also failed: {e2}")
+        return None
 
 
 async def suggest_for_event(event_title: str, event_date: str) -> Optional[str]:
     """AI suggests preparation steps for an event."""
+    # ── Primary: Groq ──
+    try:
+        context = _build_context()
+        prompt = (
+            f"{context}\n\n"
+            f"We have event: '{event_title}' on {event_date}.\n"
+            f"Give a quick prep checklist (5 items max) for a café. One line each."
+        )
+        result = await _groq_text(prompt, system=_GROQ_SYSTEM_PROMPT, temperature=0.5, max_tokens=250)
+        if result:
+            return result
+    except Exception as e:
+        logger.warning(f"Groq event suggestion failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -2197,19 +2355,9 @@ async def suggest_for_event(event_title: str, event_date: str) -> Optional[str]:
 
         return response.text.strip() if response.text else None
 
-    except Exception as e:
-        logger.error(f"Gemini API error (event): {e} — trying Groq fallback")
-        try:
-            context = _build_context()
-            prompt = (
-                f"{context}\n\n"
-                f"We have event: '{event_title}' on {event_date}.\n"
-                f"Give a quick prep checklist (5 items max) for a café. One line each."
-            )
-            return await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.5, max_tokens=250)
-        except Exception as e2:
-            logger.error(f"Groq event suggestion fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini event suggestion fallback also failed: {e2}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2381,10 +2529,6 @@ async def process_receipt(
         "raw_text": "full text from receipt",
     }
     """
-    client = get_client()
-    if client is None:
-        return None
-
     today_str = _today().isoformat()
     current_year = _today().year
 
@@ -2462,6 +2606,51 @@ async def process_receipt(
         "qty must be an integer. Prices in RM. If you can't read a value, use null."
     )
 
+    # ── Primary: Groq vision ──
+    try:
+        result = await _groq_vision(receipt_prompt, image_bytes, mime_type, temperature=0.1, max_tokens=1000)
+        if result:
+            result = result.replace("```json", "").replace("```", "").strip()
+            data = json.loads(result)
+            if isinstance(data, dict):
+                if "items" not in data:
+                    data["items"] = []
+                if "total" not in data:
+                    data["total"] = 0
+                # Post-process qty
+                for item in data.get("items", []):
+                    raw_qty = item.get("qty")
+                    if raw_qty is None or raw_qty == "":
+                        item["qty"] = 1
+                    elif isinstance(raw_qty, str):
+                        import re as _re
+                        m = _re.match(r'(\d+)', str(raw_qty))
+                        item["qty"] = int(m.group(1)) if m else 1
+                    else:
+                        try:
+                            item["qty"] = int(raw_qty)
+                        except (ValueError, TypeError):
+                            item["qty"] = 1
+                _fix_item_prices(data)
+
+                # Strip any ellipsis/truncation artifacts from item names
+                import re as _re
+                for item in data.get("items", []):
+                    _name = item.get("name", "")
+                    _name = _name.replace("...", "").replace("…", "")  # strip ellipsis
+                    _name = _re.sub(r'\s+', ' ', _name).strip()
+                    if _name:
+                        item["name"] = _name
+
+                return data
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning(f"Groq receipt OCR failed: {e}")
+
+    # ── Fallback: Gemini ──
+    client = get_client()
+    if client is None:
+        return None
+
     try:
         image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
         text_part = types.Part.from_text(text=receipt_prompt)
@@ -2522,54 +2711,40 @@ async def process_receipt(
 
         return data
 
-    except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"Receipt OCR error: {e} — trying Groq fallback")
-        # ── Groq vision fallback for receipt OCR ──
-        try:
-            result = await _groq_vision(receipt_prompt, image_bytes, mime_type, temperature=0.1, max_tokens=1000)
-            if not result:
-                return None
-            result = result.replace("```json", "").replace("```", "").strip()
-            data = json.loads(result)
-            if not isinstance(data, dict):
-                return None
-            if "items" not in data:
-                data["items"] = []
-            if "total" not in data:
-                data["total"] = 0
-            # Post-process qty
-            for item in data.get("items", []):
-                raw_qty = item.get("qty")
-                if raw_qty is None or raw_qty == "":
-                    item["qty"] = 1
-                elif isinstance(raw_qty, str):
-                    import re as _re
-                    m = _re.match(r'(\d+)', str(raw_qty))
-                    item["qty"] = int(m.group(1)) if m else 1
-                else:
-                    try:
-                        item["qty"] = int(raw_qty)
-                    except (ValueError, TypeError):
-                        item["qty"] = 1
-            _fix_item_prices(data)
-
-            # Strip any ellipsis/truncation artifacts from item names
-            import re as _re
-            for item in data.get("items", []):
-                _name = item.get("name", "")
-                _name = _name.replace("...", "").replace("…", "")  # strip ellipsis
-                _name = _re.sub(r'\s+', ' ', _name).strip()
-                if _name:
-                    item["name"] = _name
-
-            return data
-        except Exception as e2:
-            logger.error(f"Groq receipt OCR fallback also failed: {e2}")
-            return None
+    except (json.JSONDecodeError, Exception) as e2:
+        logger.error(f"Gemini receipt OCR fallback also failed: {e2}")
+        return None
 
 
 async def ask_about_data(question: str, user_name: str, chat_id: int = 0) -> Optional[str]:
     """Let the AI answer questions about Sheets data (P&L, stock usage, etc.)."""
+    # ── Primary: Groq ──
+    try:
+        from google_integration import get_all_data_for_ai
+        current_month = _today().strftime("%Y-%m")
+        data = get_all_data_for_ai(current_month)
+        prev_month_date = _today().replace(day=1) - __import__("datetime").timedelta(days=1)
+        prev_month = prev_month_date.strftime("%Y-%m")
+        prev_data = get_all_data_for_ai(prev_month)
+
+        prompt = (
+            f"You are the café manager bot. A staff member is asking about business data.\n\n"
+            f"--- CURRENT MONTH ({current_month}) ---\n{data}\n\n"
+            f"--- PREVIOUS MONTH ({prev_month}) ---\n{prev_data}\n\n"
+            f"Staff member: {user_name}\n"
+            f"Question: {question}\n\n"
+            f"Answer using the data above. Be specific with numbers. All amounts in RM."
+        )
+        result = await _groq_text(prompt, system=_GROQ_SYSTEM_PROMPT, temperature=0.3, max_tokens=500)
+        if result:
+            remember_bot_response(result, chat_id)
+            return result
+    except ImportError:
+        return "Google Sheets integration not configured. Set up credentials.json first."
+    except Exception as e:
+        logger.warning(f"Groq data query failed: {e}")
+
+    # ── Fallback: Gemini ──
     client = get_client()
     if client is None:
         return None
@@ -2614,32 +2789,9 @@ async def ask_about_data(question: str, user_name: str, chat_id: int = 0) -> Opt
 
     except ImportError:
         return "Google Sheets integration not configured. Set up credentials.json first."
-    except Exception as e:
-        logger.error(f"Data query error: {e} — trying Groq fallback")
-        # ── Groq text fallback for data queries ──
-        try:
-            from google_integration import get_all_data_for_ai
-            current_month = _today().strftime("%Y-%m")
-            data = get_all_data_for_ai(current_month)
-            prev_month_date = _today().replace(day=1) - __import__("datetime").timedelta(days=1)
-            prev_month = prev_month_date.strftime("%Y-%m")
-            prev_data = get_all_data_for_ai(prev_month)
-
-            prompt = (
-                f"You are the café manager bot. A staff member is asking about business data.\n\n"
-                f"--- CURRENT MONTH ({current_month}) ---\n{data}\n\n"
-                f"--- PREVIOUS MONTH ({prev_month}) ---\n{prev_data}\n\n"
-                f"Staff member: {user_name}\n"
-                f"Question: {question}\n\n"
-                f"Answer using the data above. Be specific with numbers. All amounts in RM."
-            )
-            result = await _groq_text(prompt, system=SYSTEM_PROMPT, temperature=0.3, max_tokens=500)
-            if result:
-                remember_bot_response(result, chat_id)
-            return result
-        except Exception as e2:
-            logger.error(f"Groq data query fallback also failed: {e2}")
-            return None
+    except Exception as e2:
+        logger.error(f"Gemini data query fallback also failed: {e2}")
+        return None
 
 
 async def analyze_pos_file(file_bytes: bytes, filename: str, user_name: str) -> Optional[str]:
