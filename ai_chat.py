@@ -154,8 +154,8 @@ def get_client() -> Optional[genai.Client]:
 # ─── Groq Client (fallback) ─────────────────────────────────
 _groq_client: Optional[Groq] = None
 
-GROQ_TEXT_MODEL = "llama-3.3-70b-versatile"
-GROQ_VISION_MODEL = "llama-4-scout-17b-16e-instruct"
+GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
+GROQ_VISION_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
 
 def get_groq_client() -> Optional[Groq]:
