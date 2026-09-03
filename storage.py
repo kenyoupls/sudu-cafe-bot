@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 
 _BRAND_PREFIXES = [
     "sm", "s&p", "cap", "nestle", "dutch lady", "f&n",
+    "ayam brand", "nutrifres", "dasani", "clorox", "ajax",
+    "dettol", "mr muscle", "marigold", "yeo's", "yeos",
+    "gardenia", "massimo", "sunshine", "goodday", "milo",
+    "nescafe", "maggi", "kara", "aroy-d", "aroy d",
+    "value", "topvalu", "tesco", "giant", "lotus",
+    "spray n wipe", "mr. muscle", "cif", "colgate",
 ]
 _BRAND_PREFIX_RE = _re.compile(
     r'^(?:' + '|'.join(_re.escape(p) for p in _BRAND_PREFIXES) + r')\b\s*',

@@ -1784,6 +1784,32 @@ async def cb_duplicate_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _confirm_receipt(pending, name, update, ctx, skip_duplicate_check=True)
 
 
+def _merge_receipt_items(items: list) -> list:
+    """Merge duplicate items on same receipt into one entry with summed qty."""
+    merged = {}
+    for item in items:
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+        key = normalize_item_name(name)
+        if key in merged:
+            try:
+                merged[key]["qty"] = int(merged[key].get("qty", 1)) + int(item.get("qty", 1))
+            except (ValueError, TypeError):
+                merged[key]["qty"] = int(merged[key].get("qty", 1)) + 1
+            # Keep the higher unit price (they should be same)
+            try:
+                existing_price = float(merged[key].get("price", 0) or 0)
+                new_price = float(item.get("price", 0) or 0)
+                if new_price > existing_price:
+                    merged[key]["price"] = new_price
+            except (ValueError, TypeError):
+                pass
+        else:
+            merged[key] = dict(item)  # copy
+    return list(merged.values())
+
+
 async def _confirm_receipt(pending: dict, confirmed_by: str,
                            update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                            skip_duplicate_check: bool = False):
@@ -1845,10 +1871,18 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
 
         # 2. Update stock + log expense details from receipt items
         items = receipt_data.get("items", [])
+        items = _merge_receipt_items(items)
         # Always default paid_by to the person who sent the receipt
         paid_by = receipt_data.get("paid_by", "") or receipt_user
         receipt_data["paid_by"] = paid_by  # ensure it's saved in data too
         expense_date = receipt_data.get("date", now_sg().strftime("%d/%m/%y"))
+        # Convert ISO date to dd/mm/yy if needed
+        if expense_date and "-" in expense_date and len(expense_date) == 10:
+            try:
+                from datetime import datetime
+                expense_date = datetime.strptime(expense_date, "%Y-%m-%d").strftime("%d/%m/%y")
+            except ValueError:
+                pass
         detail_count = 0
 
         # Use receipt's final total — the amount actually paid
@@ -2080,9 +2114,17 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # Update stock + log expense details from receipt items
         items = receipt_data.get("items", [])
+        items = _merge_receipt_items(items)
         paid_by = receipt_data.get("paid_by", "") or receipt_user
         receipt_data["paid_by"] = paid_by
         expense_date = receipt_data.get("date", now_sg().strftime("%d/%m/%y"))
+        # Convert ISO date to dd/mm/yy if needed
+        if expense_date and "-" in expense_date and len(expense_date) == 10:
+            try:
+                from datetime import datetime
+                expense_date = datetime.strptime(expense_date, "%Y-%m-%d").strftime("%d/%m/%y")
+            except ValueError:
+                pass
         detail_count = 0
 
         # Use receipt's final total — the amount actually paid
