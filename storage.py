@@ -55,6 +55,85 @@ def normalize_item_name(name: str) -> str:
     return s.lower()
 
 
+_LEADING_CODE_RE = _re.compile(
+    r'''^\s*
+        (?:
+            [A-Za-z]+-\d+[A-Za-z]*          # E-878, SM-123
+            |
+            [A-Za-z]{2,}\s*\d+(?:\.\d+)?"   # MAV 14"
+            |
+            [A-Za-z]{1,4}\d{2,}[A-Za-z0-9]* # SM123, AB99X
+        )
+        \s+
+    ''',
+    _re.VERBOSE,
+)
+_HASHTAG_WORD_RE = _re.compile(r'#\S+')
+_SIZE_KEEP_RE = _re.compile(
+    r'^\d+(\.\d+)?\s*(kg|g|ml|l|pcs|pack|box|bag|btl|carton)$',
+    _re.IGNORECASE,
+)
+_SIZE_TOKEN_RE = _re.compile(
+    r'\b(\d+(?:\.\d+)?)\s*(kg|g|ml|l|pcs|pack|box|bag|btl|carton)\b',
+    _re.IGNORECASE,
+)
+
+
+def clean_item_name(raw: str) -> str:
+    """Clean up a raw/ugly receipt item name into a simple, readable name.
+
+    - Strips leading product/model codes (e.g. "E-878", "MAV 14\"", "SM-123")
+    - Removes hashtag words (e.g. "#SOBBAR")
+    - Title-cases an ALL CAPS name
+    - Strips known brand prefixes (see _BRAND_PREFIXES)
+    - Keeps size info like "1.5L", "500ml", "250g"
+    - Collapses whitespace and removes duplicate trailing size-only words
+    """
+    if not raw:
+        return raw
+
+    s = raw.strip()
+
+    # 1. Strip leading product/model code
+    s = _LEADING_CODE_RE.sub('', s, count=1)
+
+    # 2. Remove hashtag words
+    s = _HASHTAG_WORD_RE.sub('', s)
+
+    # Collapse whitespace before further processing
+    s = _re.sub(r'\s+', ' ', s).strip()
+
+    # 3. If entire name is ALL CAPS, convert to Title Case
+    letters = [c for c in s if c.isalpha()]
+    if letters and all(c.isupper() for c in letters):
+        # Preserve size tokens' original casing (e.g. "1.5L" stays "1.5L",
+        # "400ML" becomes "400ml") — title-casing would otherwise mangle them.
+        sizes = {}
+        def _stash(m):
+            key = f'\x00SIZE{len(sizes)}\x00'
+            unit = m.group(2)
+            sizes[key] = m.group(1) + (unit if unit == 'L' else unit.lower())
+            return key
+        s = _SIZE_TOKEN_RE.sub(_stash, s)
+        s = s.title()
+        for key, val in sizes.items():
+            s = s.replace(key.title(), val)
+
+    # 4. Strip known brand prefixes
+    s = _BRAND_PREFIX_RE.sub('', s)
+
+    # Collapse whitespace again
+    s = _re.sub(r'\s+', ' ', s).strip()
+
+    # 7. Remove duplicate trailing size/unit-only words (e.g. "... Spoon Spoon")
+    words = s.split(' ')
+    while len(words) >= 2 and words[-1].lower() == words[-2].lower():
+        words.pop()
+    s = ' '.join(words)
+
+    return s.strip()
+
+
 def _words_prefix_match(words_a: list, words_b: list) -> bool:
     """Check if two word lists match with allowance for truncated words.
     E.g. ['pistachio', 'cru', 'pandan'] matches ['pistachio', 'crunch', 'pandan']
@@ -108,7 +187,7 @@ class SheetsSync:
     # POS Reports) are managed by google_integration.py
     WORKSHEETS = {
         "Stock": ["Item"],  # Date columns added dynamically
-        "Shopping List": ["Item", "Added By", "Urgency", "Status", "Added At", "Bought At"],
+        "Shopping List": ["Item"],
         "Events": ["Title", "Date", "Details", "Added By", "Status"],
     }
 
@@ -208,6 +287,11 @@ class SheetsSync:
             # Also merge existing sheet data (preserve old entries not in history)
             def is_date_col(s):
                 try:
+                    datetime.strptime(s, "%Y%m%d")
+                    return True
+                except (ValueError, TypeError):
+                    pass
+                try:
                     datetime.strptime(s, "%d/%m/%y")
                     return True
                 except (ValueError, TypeError):
@@ -230,6 +314,10 @@ class SheetsSync:
 
             # Sort dates newest first
             def parse_date(d):
+                try:
+                    return datetime.strptime(d, "%Y%m%d")
+                except ValueError:
+                    pass
                 try:
                     return datetime.strptime(d, "%d/%m/%y")
                 except ValueError:
@@ -282,47 +370,19 @@ class SheetsSync:
             logger.error(f"Sheets sync error (Stock): {e}")
 
     def sync_shopping(self, shopping_data: list):
-        """Sync shopping list to Sheets — active items on top, archived (bought) at bottom."""
+        """Sync shopping list to Sheets — single 'Item' column, auto-generated from low stock."""
         ws = self._get_ws("Shopping List")
         if not ws:
             return
         try:
-            header = ["Item", "Added By", "Urgency", "Status", "Added At", "Bought At"]
-            active = [i for i in shopping_data if not i.get("bought")]
-            bought = [i for i in shopping_data if i.get("bought")]
-
-            rows = [header]
-
-            # Active items first
-            for item in active:
-                rows.append([
-                    item.get("item", ""),
-                    item.get("added_by", ""),
-                    item.get("urgency", "normal"),
-                    "🔴 Need to buy",
-                    item.get("added_at", ""),
-                    "",
-                ])
-
-            # Separator row
-            if bought:
-                rows.append(["── ARCHIVED (Bought) ──", "", "", "", "", ""])
-
-            # Bought items at the bottom
-            for item in bought:
-                rows.append([
-                    item.get("item", ""),
-                    item.get("added_by", ""),
-                    item.get("urgency", "normal"),
-                    "✅ Bought",
-                    item.get("added_at", ""),
-                    item.get("bought_at", ""),
-                ])
+            rows = [["Item"]]
+            for item in shopping_data:
+                rows.append([item.get("item", "")])
 
             ws.clear()
             if rows:
                 ws.update("A1", rows)
-                ws.format("A1:F1", {"textFormat": {"bold": True}})
+                ws.format("A1:A1", {"textFormat": {"bold": True}})
         except Exception as e:
             logger.error(f"Sheets sync error (Shopping): {e}")
 
@@ -373,6 +433,11 @@ class SheetsSync:
 
             def is_date_col(s):
                 try:
+                    _dt.strptime(s, "%Y%m%d")
+                    return True
+                except (ValueError, TypeError):
+                    pass
+                try:
                     _dt.strptime(s, "%d/%m/%y")
                     return True
                 except (ValueError, TypeError):
@@ -382,6 +447,10 @@ class SheetsSync:
 
             # Parse dates for sorting (find latest per item)
             def parse_d(d):
+                try:
+                    return _dt.strptime(d, "%Y%m%d")
+                except ValueError:
+                    pass
                 try:
                     return _dt.strptime(d, "%d/%m/%y")
                 except ValueError:
@@ -454,33 +523,13 @@ class SheetsSync:
                 return []
 
             shopping = []
-            in_archive = False
-
             for row in existing[1:]:  # Skip header
                 if not row or not row[0]:
                     continue
-                if "ARCHIVED" in row[0]:
-                    in_archive = True
-                    continue
-
                 item_name = row[0].strip()
                 if not item_name:
                     continue
-
-                entry = {
-                    "item": item_name,
-                    "added_by": row[1] if len(row) > 1 else "",
-                    "urgency": row[2] if len(row) > 2 else "normal",
-                    "added_at": row[4] if len(row) > 4 else "",
-                }
-
-                if in_archive or (len(row) > 3 and "Bought" in str(row[3])):
-                    entry["bought"] = True
-                    entry["bought_at"] = row[5] if len(row) > 5 else ""
-                else:
-                    entry["bought"] = False
-
-                shopping.append(entry)
+                shopping.append({"item": item_name})
 
             logger.info(f"Read {len(shopping)} shopping items from Sheet")
             return shopping
@@ -609,35 +658,26 @@ class SheetsSync:
             logger.error(f"Sheet remove error (stock): {e}")
 
     def write_shopping_item(self, item_data: dict):
-        """Append a shopping item to the Sheet."""
+        """Append a shopping item to the Sheet — single 'Item' column."""
         ws = self._get_ws("Shopping List")
         if not ws:
             return
         try:
-            # Find the archive separator — insert before it
-            existing = ws.get_all_values()
-            insert_row = None
-            for i, row in enumerate(existing):
-                if row and "ARCHIVED" in str(row[0]):
-                    insert_row = i + 1  # 1-indexed
-                    break
-
-            new_row = [
-                item_data.get("item", ""),
-                item_data.get("added_by", ""),
-                item_data.get("urgency", "normal"),
-                "🔴 Need to buy",
-                item_data.get("added_at", ""),
-                "",
-            ]
-
-            if insert_row:
-                ws.insert_row(new_row, insert_row)
-            else:
-                ws.append_row(new_row)
-
+            ws.append_row([item_data.get("item", "")])
         except Exception as e:
             logger.error(f"Sheet write error (shopping): {e}")
+
+    def clear_shopping_list(self):
+        """Clear all rows from the Shopping List sheet, keeping only the header."""
+        ws = self._get_ws("Shopping List")
+        if not ws:
+            return
+        try:
+            ws.clear()
+            ws.update("A1", [["Item"]])
+            ws.format("A1:A1", {"textFormat": {"bold": True}})
+        except Exception as e:
+            logger.error(f"Sheet clear error (shopping): {e}")
 
     def write_event(self, event_data: dict):
         """Append an event to the Sheet."""
@@ -935,7 +975,7 @@ class LocalJsonStore:
             qty = "1"
         # Deduplicate: use existing name if it matches
         item = self._find_existing_stock_name(item)
-        today = _now().strftime("%d/%m/%y")
+        today = _now().strftime("%Y%m%d")
 
         # 1. Write to Sheet FIRST (source of truth)
         if self._sheets:
@@ -965,6 +1005,7 @@ class LocalJsonStore:
             pass
 
         self._save_local_only()
+        self._rebuild_shopping_list()
 
     def remove_stock(self, item: str) -> bool:
         """Remove a stock item from Sheet + JSON cache. Returns True if found."""
@@ -1008,6 +1049,7 @@ class LocalJsonStore:
 
         if removed:
             self._save_local_only()
+            self._rebuild_shopping_list()
             logger.info(f"Removed stock item: {item}")
         return removed
 
@@ -1092,7 +1134,7 @@ class LocalJsonStore:
         """Update multiple stock items under a specific date.
         stock_date should be dd/mm/yy format. Defaults to today."""
         if not stock_date:
-            stock_date = _now().strftime("%d/%m/%y")
+            stock_date = _now().strftime("%Y%m%d")
 
         if "stock_history" not in self.data:
             self.data["stock_history"] = {}
@@ -1127,11 +1169,13 @@ class LocalJsonStore:
                     pass
 
         self._save_local_only()
+        self._rebuild_shopping_list()
 
-    def add_receipt_to_stock(self, item: str, qty: int):
-        """Add received quantity to running current stock (from a receipt).
-        Does NOT create a new date column — receipts only affect Current Stock."""
-        item = self._find_existing_stock_name(item)
+    def add_receipt_to_stock(self, item: str, qty: int, receipt_date: str = None):
+        """Add received quantity to running current stock (from a receipt),
+        and also record the new total in stock_history under a date column
+        on the Stock sheet."""
+        item = self._find_existing_stock_name(clean_item_name(item))
 
         if "stock_current" not in self.data:
             self.data["stock_current"] = {}
@@ -1155,8 +1199,24 @@ class LocalJsonStore:
             "updated_at": _fmt_ts(),
         }
 
+        # Also record in stock_history + sheet date column
+        date_col = receipt_date or _now().strftime("%Y%m%d")
+        if "stock_history" not in self.data:
+            self.data["stock_history"] = {}
+        if date_col not in self.data["stock_history"]:
+            self.data["stock_history"][date_col] = {}
+        self.data["stock_history"][date_col][item] = new_total
+
+        # Write to sheet date column
+        if self._sheets:
+            try:
+                self._sheets.write_stock_item(item, str(new_total), date_col)
+            except Exception as e:
+                logger.error(f"Direct sheet write failed (receipt_to_stock): {e}")
+
         self._sync_current_stock_to_sheet(item)
         self._save_local_only()
+        self._rebuild_shopping_list()
 
     def full_stock_count(self, items: dict, counted_by: str):
         """Record a full physical stock count.
@@ -1170,7 +1230,7 @@ class LocalJsonStore:
             self.data["stock_history"] = {}
 
         today_iso = _now().strftime("%Y-%m-%d")
-        today_sheet = _now().strftime("%d/%m/%y")
+        today_sheet = _now().strftime("%Y%m%d")
 
         if today_sheet not in self.data["stock_history"]:
             self.data["stock_history"][today_sheet] = {}
@@ -1202,6 +1262,7 @@ class LocalJsonStore:
             self._sync_current_stock_to_sheet(item)
 
         self._save_local_only()
+        self._rebuild_shopping_list()
 
     def _backfill_current_stock_to_sheet(self):
         """On startup, ensure all stock items have a Current Stock value on the sheet."""
@@ -1280,7 +1341,7 @@ class LocalJsonStore:
         except (ValueError, TypeError):
             new_qty = 0
 
-        today_sheet = _now().strftime("%d/%m/%y")
+        today_sheet = _now().strftime("%Y%m%d")
 
         if "stock_current" not in self.data:
             self.data["stock_current"] = {}
@@ -1306,6 +1367,7 @@ class LocalJsonStore:
         self._sync_current_stock_to_sheet(item)
 
         self._save_local_only()
+        self._rebuild_shopping_list()
 
     def undo_last_stock_update(self, item: str) -> bool:
         """Undo the most recent stock_history entry for an item.
@@ -1318,6 +1380,10 @@ class LocalJsonStore:
         norm = normalize_item_name(item)
 
         def parse_d(d):
+            try:
+                return datetime.strptime(d, "%Y%m%d")
+            except (ValueError, TypeError):
+                pass
             try:
                 return datetime.strptime(d, "%d/%m/%y")
             except (ValueError, TypeError):
@@ -1362,6 +1428,7 @@ class LocalJsonStore:
 
         self._sync_current_stock_to_sheet(item)
         self._save_local_only()
+        self._rebuild_shopping_list()
         return True
 
     def check_low_stock(self, items_updated: list = None) -> list:
@@ -1593,15 +1660,11 @@ class LocalJsonStore:
                     logger.error(f"Sheet sync failed (complete_event): {e}")
             self._save_local_only()
 
-    # ─── Shopping / To-Buy List ─────────────────────────────
-    def add_shopping_item(self, item: str, added_by: str, urgency: str = "normal"):
-        entry = {
-            "item": item,
-            "added_by": added_by,
-            "urgency": urgency,
-            "added_at": _fmt_ts(),
-            "bought": False,
-        }
+    # ─── Shopping / To-Buy List ──────────────────────────────
+    # Auto-generated from low stock — see _rebuild_shopping_list().
+    def add_shopping_item(self, item: str, added_by: str = "", urgency: str = "normal"):
+        item = clean_item_name(item)
+        entry = {"item": item}
         # 1. Write to Sheet FIRST
         if self._sheets:
             try:
@@ -1613,41 +1676,75 @@ class LocalJsonStore:
         self.data["shopping_list"].append(entry)
         self._save_local_only()
 
-    def get_shopping_list(self, include_bought: bool = False) -> list:
-        items = self.data.get("shopping_list", [])
-        if not include_bought:
-            items = [i for i in items if not i.get("bought")]
-        return items
+    def get_shopping_list(self) -> list:
+        return self.data.get("shopping_list", [])
 
     def mark_bought(self, index: int):
-        pending = [i for i in self.data["shopping_list"] if not i.get("bought")]
-        if 0 <= index < len(pending):
-            count = 0
-            for idx, item in enumerate(self.data["shopping_list"]):
-                if not item.get("bought"):
-                    if count == index:
-                        self.data["shopping_list"][idx]["bought"] = True
-                        self.data["shopping_list"][idx]["bought_at"] = _fmt_ts()
-                        break
-                    count += 1
-            # Full re-sync shopping to Sheet (active/archive layout)
-            if self._sheets:
-                try:
-                    self._sheets.sync_shopping(self.data.get("shopping_list", []))
-                except Exception as e:
-                    logger.error(f"Sheet sync failed (mark_bought): {e}")
+        """Backward compat: remove an item from the local list and rebuild
+        from current low-stock state (stock updates are the real source now)."""
+        items = self.data.get("shopping_list", [])
+        if 0 <= index < len(items):
+            del items[index]
             self._save_local_only()
+        self._rebuild_shopping_list()
 
     def clear_bought(self):
-        self.data["shopping_list"] = [
-            i for i in self.data["shopping_list"] if not i.get("bought")
-        ]
-        # Full re-sync shopping to Sheet
+        """No-op kept for backward compat — list is always rebuilt from stock."""
+        self._rebuild_shopping_list()
+
+    def _rebuild_shopping_list(self):
+        """Rebuild the Shopping List from current low-stock items.
+        Compares stock_current against sop_data.STOCK_MINIMUMS, writes the
+        low-stock item names to the Shopping List sheet (single 'Item' column,
+        rebuilt from scratch), and updates the local JSON cache."""
+        try:
+            from sop_data import STOCK_MINIMUMS
+        except Exception as e:
+            logger.error(f"_rebuild_shopping_list: could not load STOCK_MINIMUMS: {e}")
+            return
+
+        stock_current = self.data.get("stock_current", {})
+        low_item_names = []
+
+        for min_name, min_data in STOCK_MINIMUMS.items():
+            min_qty = min_data.get("min", 0)
+
+            # Find matching current-stock entry (exact, then fuzzy normalized match)
+            current_qty = None
+            for item_name, qty in stock_current.items():
+                if item_name.lower() == min_name.lower():
+                    current_qty = qty
+                    break
+            if current_qty is None:
+                min_norm = normalize_item_name(min_name)
+                for item_name, qty in stock_current.items():
+                    if normalize_item_name(item_name) == min_norm:
+                        current_qty = qty
+                        break
+
+            if current_qty is None:
+                continue  # No stock data for this item — can't judge low/not
+
+            try:
+                current_qty = int(current_qty)
+            except (ValueError, TypeError):
+                continue
+
+            if current_qty < min_qty:
+                low_item_names.append(min_name)
+
+        # Update local JSON cache
+        self.data["shopping_list"] = [{"item": name} for name in low_item_names]
+
+        # Rebuild the Sheet tab from scratch
         if self._sheets:
             try:
-                self._sheets.sync_shopping(self.data.get("shopping_list", []))
+                self._sheets.clear_shopping_list()
+                for name in low_item_names:
+                    self._sheets.write_shopping_item({"item": name})
             except Exception as e:
-                logger.error(f"Sheet sync failed (clear_bought): {e}")
+                logger.error(f"Sheet rebuild failed (shopping list): {e}")
+
         self._save_local_only()
 
     # ─── Staff Registry ─────────────────────────────────────

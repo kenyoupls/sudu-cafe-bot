@@ -125,7 +125,7 @@ def _ensure_worksheets(spreadsheet):
         ws.append_row([
             "Date", "Item", "Qty", "Amount (RM)",
             "Total (RM)", "Category", "Supplier", "Paid By",
-            "Receipt Link", "Recorded By", "Notes", "Created At"
+            "Created At"
         ])
         logger.info("Created Expenses Detail worksheet")
 
@@ -201,6 +201,9 @@ def log_expense_detail(
     if ss is None:
         return False
 
+    from storage import clean_item_name
+    item_name = clean_item_name(item_name)
+
     # Normalise category
     from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
     cat = category.lower().strip() if category else DEFAULT_CATEGORY
@@ -223,9 +226,6 @@ def log_expense_detail(
             cat.capitalize(),
             supplier,
             paid_by,
-            receipt_link,
-            recorded_by,
-            notes,
             _fmt_ts(),
         ]
         ws.append_row(row_data, value_input_option="USER_ENTERED", table_range="A1")
