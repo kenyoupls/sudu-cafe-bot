@@ -294,12 +294,15 @@ def update_monthly_expenses(month: str = None) -> bool:
 
             key = (row_month, norm)
             if key not in agg:
-                agg[key] = {"qty": 0, "total": 0, "category": cat, "display_name": item}
+                agg[key] = {"qty": 0, "total": 0, "category": cat, "display_name": item, "latest_at": ""}
             agg[key]["qty"] += qty
             agg[key]["total"] += total
+            # Track the latest Created At for this item
+            created_at = str(row.get("Created At", ""))
+            if created_at > agg[key]["latest_at"]:
+                agg[key]["latest_at"] = created_at
 
         # Build rows sorted by month (newest first), then item name
-        now_str = _fmt_ts()
         header = [
             "Month", "Item", "Total Qty", "Total Spent (RM)",
             "Category", "Updated At"
@@ -312,7 +315,7 @@ def update_monthly_expenses(month: str = None) -> bool:
                 data["qty"],
                 f"{data['total']:.2f}",
                 data["category"].capitalize(),
-                now_str,
+                data["latest_at"] or _fmt_ts(),  # fallback to now if no Created At
             ])
 
         # Sort: newest month first, then alphabetical within month

@@ -1688,12 +1688,12 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
                 store.remove_stock(r_name)  # one-off — don't keep tracking it in stock
 
             if not was_known:
-                new_items.append(r_name)
+                new_items.append({"name": r_name, "qty": receipt_item.get("qty", 1)})
 
         if new_items:
             ctx.chat_data["new_receipt_items"] = new_items
             ctx.chat_data["new_receipt_items_idx"] = 0
-            item = new_items[0]
+            item = new_items[0]["name"]
             buttons = [
                 [
                     InlineKeyboardButton("🔄 Regular (track stock)", callback_data="newitem:regular"),
@@ -1722,18 +1722,21 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if idx >= len(items):
         return
 
-    item = items[idx]
+    item = items[idx]  # {"name": ..., "qty": ...}
+    item_name = item["name"]
+    item_qty = item.get("qty", 1)
 
     if choice == "oneoff":
-        store.record_oneoff_item(item)
-        store.remove_stock(item)
+        store.record_oneoff_item(item_name)
+        # No need to remove_stock since we never added it
         await query.edit_message_text(
-            f"🧪 Got it — *{item}* marked as one-off (won't track in stock).",
+            f"🧪 Got it — *{item_name}* marked as one-off (won't track in stock).",
             parse_mode="Markdown",
         )
     else:
+        store.add_receipt_to_stock(item_name, item_qty)
         await query.edit_message_text(
-            f"🔄 Got it — *{item}* will be tracked as regular stock.",
+            f"🔄 Got it — *{item_name}* will be tracked as regular stock.",
             parse_mode="Markdown",
         )
 
@@ -1742,7 +1745,7 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.chat_data["new_receipt_items_idx"] = idx
 
     if idx < len(items):
-        next_item = items[idx]
+        next_item = items[idx]["name"]
         buttons = [
             [
                 InlineKeyboardButton("🔄 Regular (track stock)", callback_data="newitem:regular"),
@@ -1890,7 +1893,15 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                 except Exception as e:
                     logger.error(f"Expense detail error for {item_name}: {e}")
 
-                store.add_receipt_to_stock(item_name, qty_int)
+                # Only update stock for items already being tracked.
+                # New items are handled by _detect_new_items (Regular vs One-off).
+                existing_stock = store.data.get("stock_current", {})
+                is_known = any(
+                    normalize_item_name(k) == normalize_item_name(item_name)
+                    for k in existing_stock
+                )
+                if is_known:
+                    store.add_receipt_to_stock(item_name, qty_int)
 
         if items:
             results.append(f"📦 {len(items)} items updated in stock")
@@ -2116,7 +2127,15 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Expense detail error for {item_name}: {e}")
 
-                store.add_receipt_to_stock(item_name, qty_int)
+                # Only update stock for items already being tracked.
+                # New items are handled by _detect_new_items (Regular vs One-off).
+                existing_stock = store.data.get("stock_current", {})
+                is_known = any(
+                    normalize_item_name(k) == normalize_item_name(item_name)
+                    for k in existing_stock
+                )
+                if is_known:
+                    store.add_receipt_to_stock(item_name, qty_int)
 
         if items:
             results.append(f"📦 {len(items)} items updated in stock")
