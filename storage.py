@@ -24,8 +24,8 @@ def _now():
 
 
 def _fmt_ts():
-    """Format current timestamp as '20260829-1425' style."""
-    return _now().strftime("%Y%m%d-%H%M")
+    """Format current timestamp as '29/08/26-1425' style."""
+    return _now().strftime("%d/%m/%y-%H%M")
 
 logger = logging.getLogger(__name__)
 
@@ -287,11 +287,6 @@ class SheetsSync:
             # Also merge existing sheet data (preserve old entries not in history)
             def is_date_col(s):
                 try:
-                    datetime.strptime(s, "%Y%m%d")
-                    return True
-                except (ValueError, TypeError):
-                    pass
-                try:
                     datetime.strptime(s, "%d/%m/%y")
                     return True
                 except (ValueError, TypeError):
@@ -314,10 +309,6 @@ class SheetsSync:
 
             # Sort dates newest first
             def parse_date(d):
-                try:
-                    return datetime.strptime(d, "%Y%m%d")
-                except ValueError:
-                    pass
                 try:
                     return datetime.strptime(d, "%d/%m/%y")
                 except ValueError:
@@ -433,11 +424,6 @@ class SheetsSync:
 
             def is_date_col(s):
                 try:
-                    _dt.strptime(s, "%Y%m%d")
-                    return True
-                except (ValueError, TypeError):
-                    pass
-                try:
                     _dt.strptime(s, "%d/%m/%y")
                     return True
                 except (ValueError, TypeError):
@@ -447,10 +433,6 @@ class SheetsSync:
 
             # Parse dates for sorting (find latest per item)
             def parse_d(d):
-                try:
-                    return _dt.strptime(d, "%Y%m%d")
-                except ValueError:
-                    pass
                 try:
                     return _dt.strptime(d, "%d/%m/%y")
                 except ValueError:
@@ -502,7 +484,7 @@ class SheetsSync:
                     stock[item] = {
                         "qty": latest_qty,
                         "updated_by": "sheet",
-                        "updated_at": _now().strftime("%Y%m%d-%H%M"),
+                        "updated_at": _now().strftime("%d/%m/%y-%H%M"),
                     }
 
             logger.info(f"Read {len(stock)} stock items from Sheet")
@@ -975,7 +957,7 @@ class LocalJsonStore:
             qty = "1"
         # Deduplicate: use existing name if it matches
         item = self._find_existing_stock_name(item)
-        today = _now().strftime("%Y%m%d")
+        today = _now().strftime("%d/%m/%y")
 
         # 1. Write to Sheet FIRST (source of truth)
         if self._sheets:
@@ -1071,7 +1053,7 @@ class LocalJsonStore:
             "total": total,
             "item_count": len(items),
             "recorded_by": recorded_by,
-            "recorded_at": _now().strftime("%Y%m%d-%H%M"),
+            "recorded_at": _now().strftime("%d/%m/%y-%H%M"),
         }
         self._save_local_only()
 
@@ -1134,7 +1116,7 @@ class LocalJsonStore:
         """Update multiple stock items under a specific date.
         stock_date should be dd/mm/yy format. Defaults to today."""
         if not stock_date:
-            stock_date = _now().strftime("%Y%m%d")
+            stock_date = _now().strftime("%d/%m/%y")
 
         if "stock_history" not in self.data:
             self.data["stock_history"] = {}
@@ -1200,7 +1182,7 @@ class LocalJsonStore:
         }
 
         # Also record in stock_history + sheet date column
-        date_col = receipt_date or _now().strftime("%Y%m%d")
+        date_col = receipt_date or _now().strftime("%d/%m/%y")
         if "stock_history" not in self.data:
             self.data["stock_history"] = {}
         if date_col not in self.data["stock_history"]:
@@ -1230,7 +1212,7 @@ class LocalJsonStore:
             self.data["stock_history"] = {}
 
         today_iso = _now().strftime("%Y-%m-%d")
-        today_sheet = _now().strftime("%Y%m%d")
+        today_sheet = _now().strftime("%d/%m/%y")
 
         if today_sheet not in self.data["stock_history"]:
             self.data["stock_history"][today_sheet] = {}
@@ -1341,7 +1323,7 @@ class LocalJsonStore:
         except (ValueError, TypeError):
             new_qty = 0
 
-        today_sheet = _now().strftime("%Y%m%d")
+        today_sheet = _now().strftime("%d/%m/%y")
 
         if "stock_current" not in self.data:
             self.data["stock_current"] = {}
@@ -1380,10 +1362,6 @@ class LocalJsonStore:
         norm = normalize_item_name(item)
 
         def parse_d(d):
-            try:
-                return datetime.strptime(d, "%Y%m%d")
-            except (ValueError, TypeError):
-                pass
             try:
                 return datetime.strptime(d, "%d/%m/%y")
             except (ValueError, TypeError):

@@ -70,13 +70,6 @@ store = get_store()
 def now_sg() -> datetime:
     return datetime.now(TZ)
 
-def _to_yyyymmdd(d: str) -> str:
-    """Normalize a date string to YYYYMMDD. Converts ISO (YYYY-MM-DD) by
-    stripping dashes; passes through anything already in YYYYMMDD form."""
-    if d and len(d) == 10 and d[4] == "-" and d[7] == "-":
-        return d.replace("-", "")
-    return d
-
 def today_day() -> str:
     return now_sg().strftime("%a").lower()
 
@@ -85,7 +78,7 @@ def user_name(update: Update) -> str:
     return u.full_name or u.username or str(u.id)
 
 def _parse_ts(s: str) -> datetime:
-    """Parse timestamp in either old ISO or new '20260829-1425' format."""
+    """Parse timestamp in either old ISO or '29/08/26-1425' format."""
     if not s:
         return datetime.min.replace(tzinfo=TZ)
     try:
@@ -93,7 +86,7 @@ def _parse_ts(s: str) -> datetime:
     except (ValueError, TypeError):
         pass
     try:
-        dt = datetime.strptime(s, "%Y%m%d-%H%M")
+        dt = datetime.strptime(s, "%d/%m/%y-%H%M")
         return dt.replace(tzinfo=TZ)
     except (ValueError, TypeError):
         return datetime.min.replace(tzinfo=TZ)
@@ -1664,7 +1657,7 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
     try:
         from storage import get_alias_store
         alias_store = get_alias_store()
-        today_str = now_sg().strftime("%Y%m%d")
+        today_str = now_sg().strftime("%d/%m/%y")
         new_items = []
         for receipt_item in items:
             r_name = receipt_item.get("name", "")
@@ -1852,7 +1845,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         # Always default paid_by to the person who sent the receipt
         paid_by = receipt_data.get("paid_by", "") or receipt_user
         receipt_data["paid_by"] = paid_by  # ensure it's saved in data too
-        expense_date = _to_yyyymmdd(receipt_data.get("date", now_sg().strftime("%Y%m%d")))
+        expense_date = receipt_data.get("date", now_sg().strftime("%d/%m/%y"))
         detail_count = 0
 
         # Use receipt's final total — the amount actually paid
@@ -2078,7 +2071,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         items = receipt_data.get("items", [])
         paid_by = receipt_data.get("paid_by", "") or receipt_user
         receipt_data["paid_by"] = paid_by
-        expense_date = _to_yyyymmdd(receipt_data.get("date", now_sg().strftime("%Y%m%d")))
+        expense_date = receipt_data.get("date", now_sg().strftime("%d/%m/%y"))
         detail_count = 0
 
         # Use receipt's final total — the amount actually paid

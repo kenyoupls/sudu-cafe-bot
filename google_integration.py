@@ -29,8 +29,8 @@ def _now():
 
 
 def _fmt_ts():
-    """Format current timestamp as '20260829-1425' style."""
-    return _now().strftime("%Y%m%d-%H%M")
+    """Format current timestamp as '29/08/26-1425' style."""
+    return _now().strftime("%d/%m/%y-%H%M")
 
 logger = logging.getLogger(__name__)
 
