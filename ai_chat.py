@@ -927,7 +927,7 @@ STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
 
 
 # ─── Condensed prompt for Groq (primary provider) ───────────
-# Trimmed to ~500 tokens: no SOP recipes, no verbose examples.
+# Condensed core prompt; SOP recipes appended below via build_sop_prompt().
 # Groq is fast/cheap so we keep its system prompt small to save tokens
 # and reduce 413 "request too large" errors.
 _GROQ_SYSTEM_PROMPT = f"""You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
@@ -985,6 +985,8 @@ Use show_expenses when someone asks "how much we spend", "total expenses", "bera
 You can include multiple actions in one array. Always give your natural chat reply BEFORE the actions block. If no action is needed, reply with no actions block at all.
 
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers."""
+
+_GROQ_SYSTEM_PROMPT += "\n\n" + build_sop_prompt()
 
 _GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
 
