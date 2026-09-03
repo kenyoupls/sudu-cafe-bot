@@ -1187,6 +1187,29 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
         if today_events:
             parts.append("TODAY'S EVENTS: " + ", ".join(e.get("title", "") for e in today_events))
 
+    # Google Places info (hours, address)
+    google_info = get_cafe_google_info()
+    if google_info:
+        if google_info.get("hours"):
+            parts.append("OPENING HOURS:\n" + "\n".join(f"  {h}" for h in google_info["hours"]))
+        if google_info.get("open_now") is not None:
+            parts.append(f"Currently: {'OPEN' if google_info['open_now'] else 'CLOSED'}")
+        if google_info.get("address"):
+            parts.append(f"Address: {google_info['address']}")
+        if google_info.get("rating"):
+            parts.append(f"Rating: {google_info['rating']}⭐ ({google_info.get('total_reviews', 0)} reviews)")
+    else:
+        # Fallback to config hours
+        hours = store.get_hours() or config.DEFAULT_HOURS
+        h_lines = []
+        for day in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]:
+            h = hours.get(day, {})
+            if h.get("open") == "Closed":
+                h_lines.append(f"  {day.title()}: Closed")
+            else:
+                h_lines.append(f"  {day.title()}: {h.get('open', '?')} – {h.get('close', '?')}")
+        parts.append("OPENING HOURS:\n" + "\n".join(h_lines))
+
     # Upcoming holidays
     try:
         from google_integration import get_upcoming_holidays
