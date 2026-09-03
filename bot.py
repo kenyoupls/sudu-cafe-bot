@@ -30,7 +30,7 @@ from telegram.ext import (
 import functools
 
 import config
-from storage import get_store, normalize_item_name
+from storage import get_store, normalize_item_name, clean_item_name
 from ai_chat import (
     ask_ai, get_content_idea, analyze_stock_and_suggest, suggest_for_event,
     handle_voice, handle_photo, handle_video, remember, process_message,
@@ -1890,7 +1890,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
 
         import re as _re
         for item in items:
-            item_name = item.get("name", "")
+            item_name = clean_item_name(item.get("name", ""))
             qty = item.get("qty", 0)
             price = item.get("price", 0)
             category = item.get("category", "ingredients")
@@ -2132,7 +2132,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         import re as _re
         for item in items:
-            item_name = item.get("name", "")
+            item_name = clean_item_name(item.get("name", ""))
             qty = item.get("qty", 0)
             price = item.get("price", 0)
             category = item.get("category", "ingredients")

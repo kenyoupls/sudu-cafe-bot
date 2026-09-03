@@ -939,6 +939,10 @@ class LocalJsonStore:
         for existing in self.data.get("stock", {}):
             if normalize_item_name(existing) == new_norm:
                 return existing
+        # Also check stock_current keys
+        for existing in self.data.get("stock_current", {}):
+            if normalize_item_name(existing) == new_norm:
+                return existing
         # Check alias store
         alias_store = get_alias_store()
         canonical = alias_store.resolve(new_name)
@@ -954,6 +958,16 @@ class LocalJsonStore:
                 existing_norm = normalize_item_name(existing)
                 existing_words = existing_norm.split()
                 if len(existing_words) >= 2 and _words_prefix_match(new_words, existing_words):
+                    return existing
+        # Substring fallback: "coconut milk" matches "coconut milk 400ml" and vice versa
+        if len(new_norm) >= 4:  # avoid matching very short strings
+            for existing in self.data.get("stock", {}):
+                existing_norm = normalize_item_name(existing)
+                if len(existing_norm) >= 4 and (new_norm in existing_norm or existing_norm in new_norm):
+                    return existing
+            for existing in self.data.get("stock_current", {}):
+                existing_norm = normalize_item_name(existing)
+                if len(existing_norm) >= 4 and (new_norm in existing_norm or existing_norm in new_norm):
                     return existing
         return new_name
 
