@@ -381,6 +381,13 @@ class SheetsSync:
         try:
             # Read existing sheet items
             existing = ws.get_all_values()
+
+            # Ensure header exists FIRST
+            if not existing or not existing[0] or existing[0][0].strip().lower() != "item":
+                ws.update("A1", [["Item"]])
+                ws.format("A1:A1", {"textFormat": {"bold": True}})
+                existing = ws.get_all_values()
+
             sheet_items = []
             if existing and len(existing) > 1:
                 for row in existing[1:]:
@@ -400,9 +407,6 @@ class SheetsSync:
             for item in new_items:
                 ws.append_row([item])
 
-            # Ensure header exists
-            if not existing or not existing[0]:
-                ws.update("A1", [["Item"]])
             ws.format("A1:A1", {"textFormat": {"bold": True}})
         except Exception as e:
             logger.error(f"Sheets sync error (Shopping): {e}")
@@ -2292,12 +2296,15 @@ class LocalJsonStore:
         # Update JSON cache
         self.data["shopping_list"] = [{"item": name} for name in final_items]
 
-        # Write merged list to sheet
+        # Write merged list to sheet — header + all items in one call
         if self._sheets:
             try:
-                self._sheets.clear_shopping_list()
-                for name in final_items:
-                    self._sheets.write_shopping_item({"item": name})
+                ws = self._sheets._get_ws("Shopping List")
+                if ws:
+                    ws.clear()
+                    rows = [["Item"]] + [[name] for name in final_items]
+                    ws.update("A1", rows)
+                    ws.format("A1:A1", {"textFormat": {"bold": True}})
             except Exception as e:
                 logger.error(f"Sheet rebuild failed (shopping list): {e}")
 
