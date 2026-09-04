@@ -300,14 +300,10 @@ class SheetsSync:
             # Ensure "Current Stock" occupies column B
             has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
             if not has_current_col:
-                new_header = [header[0], "Current Stock"] + header[1:]
-                new_rows = [new_header]
-                for row in existing[1:]:
-                    new_rows.append([row[0] if row else "", ""] + (row[1:] if row else []))
-                ws.clear()
-                ws.update("A1", new_rows)
-                existing = new_rows
-                header = list(new_header)
+                ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                ws.update_acell("B1", "Current Stock")
+                existing = ws.get_all_values()
+                header = list(existing[0]) if existing else []
 
             # Build lookup: normalized item name → sheet row index (1-based, skipping header)
             row_lookup = {}  # {norm_name: row_index}
@@ -1098,7 +1094,7 @@ class LocalJsonStore:
             try:
                 self._sheets = SheetsSync()
                 if self._sheets.spreadsheet:
-                    logger.info("Google Sheets sync enabled")
+                    logger.info("Google Sheets sync enabled — code version 2024-09-04-v2 (no ws.clear)")
                     # Read from Sheet (Sheet is source of truth)
                     self._refresh_from_sheet()
                     # Backfill current stock to sheet for items missing it
@@ -1671,14 +1667,10 @@ class LocalJsonStore:
 
             # Ensure "Current Stock" is column B; insert it if missing
             if len(header) < 2 or header[1] != "Current Stock":
-                new_header = [header[0], "Current Stock"] + header[1:]
-                new_rows = [new_header]
-                for row in existing[1:]:
-                    new_rows.append([row[0] if row else "", ""] + (row[1:] if row else []))
-                ws.clear()
-                ws.update("A1", new_rows)
-                existing = new_rows
-                header = new_header
+                ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                ws.update_acell("B1", "Current Stock")
+                existing = ws.get_all_values()
+                header = existing[0] if existing else []
 
             stock_current = self.data.get("stock_current", {})
 
