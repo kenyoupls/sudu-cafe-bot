@@ -1395,7 +1395,7 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     try:
         prompt = _groq_context(user_name, user_message, reply_context,
                                chat_id=chat_id, is_staff_group=is_staff_group)
-        raw = await _groq_text(prompt, system=groq_sys, temperature=0.7, max_tokens=500)
+        raw = await _groq_text(prompt, system=groq_sys, temperature=0.7, max_tokens=2000)
         if raw:
             chat_reply, actions = _parse_actions(raw)
             if chat_reply:
