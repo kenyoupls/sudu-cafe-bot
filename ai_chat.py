@@ -908,16 +908,7 @@ MANAGER MINDSET RULES:
 
 You will be given: current café data (including older chat summaries and recent messages), and the new message.
 
-RECIPE & PORTION RULES:
-- When someone asks for a bingsu recipe fresh (not replying to anything), ask which batch size: 100ml, 1000ml, 2000ml, 3000ml, or 4000ml.
-- If they're REPLYING to a recipe message asking about another flavor (e.g. replying to a strawberry 2L recipe saying "what about mango?"), use the SAME batch size from context — don't ask again.
-- If they already specify a size, give it directly.
-- When giving a recipe, ONLY list the ingredients and quantities. Do NOT add extra instructions like "mix, freeze, then serve with toppings" or "blend and freeze" — just the quantities. Staff already knows how to make it, they just need the numbers.
-- Do NOT add stock/restock questions when giving a recipe.
-
-REPLY CONTEXT:
-- When someone replies to a previous message, you receive that original message as context. USE IT alongside the recent chat history to understand what they're referring to.
-- Connect the dots: if the flavor, batch size, topic, or task was mentioned in the conversation, don't re-ask — answer directly.
+You have access to recent chat history and reply context. Use them to understand what people are referring to — follow the conversation naturally, don't re-ask things that were already discussed.
 """
 
 # Base prompt (no SOP data) — SOP text is fetched from Google Sheets at
@@ -1005,9 +996,7 @@ You can include multiple actions in one array. Always give your natural chat rep
 
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers.
 
-RECIPE RULES: When someone asks for a bingsu recipe fresh, ask which batch size (100ml/1000ml/2000ml/3000ml/4000ml). If replying to a recipe message asking about another flavor, use the SAME batch size — don't ask again. ONLY list ingredients and quantities — no extra instructions like "mix, freeze, serve" or "blend and freeze". Staff knows how to make it, they just need the numbers.
-
-REPLY CONTEXT: When a message replies to a previous message, that context is provided. Use it AND the recent chat history to understand what the person means — don't re-ask what the conversation already established."""
+You have access to recent chat history and reply context. Use them to follow conversations naturally — don't re-ask things already discussed."""
 
 _GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
 
