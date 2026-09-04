@@ -4623,7 +4623,7 @@ def main():
 
     # ── SOP auto-refresh (always, not just owner group) ──
     if jq and store._sheets:
-        jq.run_repeating(scheduled_sop_refresh, interval=300, first=300, name="sop_refresh")
+        jq.run_repeating(scheduled_sop_refresh, interval=60, first=60, name="sop_refresh")
 
     # ─── Set bot commands menu ──────────────────────────────
     async def post_init(application):
