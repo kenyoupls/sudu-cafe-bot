@@ -389,19 +389,37 @@ class SheetsSync:
             logger.error(f"Sheets sync error (Stock): {e}")
 
     def sync_shopping(self, shopping_data: list):
-        """Sync shopping list to Sheets — single 'Item' column, auto-generated from low stock."""
+        """Sync shopping list to Sheets — merge JSON items with existing sheet.
+        Keeps manually added items, adds JSON items not already present."""
         ws = self._get_ws("Shopping List")
         if not ws:
             return
         try:
-            rows = [["Item"]]
-            for item in shopping_data:
-                rows.append([item.get("item", "")])
+            # Read existing sheet items
+            existing = ws.get_all_values()
+            sheet_items = []
+            if existing and len(existing) > 1:
+                for row in existing[1:]:
+                    if row and row[0].strip():
+                        sheet_items.append(row[0].strip())
 
-            ws.clear()
-            if rows:
-                ws.update("A1", rows)
-                ws.format("A1:A1", {"textFormat": {"bold": True}})
+            sheet_norms = {normalize_item_name(i) for i in sheet_items}
+
+            # Add JSON items not already on sheet
+            json_items = [item.get("item", "") for item in shopping_data if item.get("item")]
+            new_items = []
+            for item in json_items:
+                if normalize_item_name(item) not in sheet_norms:
+                    new_items.append(item)
+
+            # Append new items (don't clear existing)
+            for item in new_items:
+                ws.append_row([item])
+
+            # Ensure header exists
+            if not existing or not existing[0]:
+                ws.update("A1", [["Item"]])
+            ws.format("A1:A1", {"textFormat": {"bold": True}})
         except Exception as e:
             logger.error(f"Sheets sync error (Shopping): {e}")
 
@@ -697,6 +715,31 @@ class SheetsSync:
             ws.format("A1:A1", {"textFormat": {"bold": True}})
         except Exception as e:
             logger.error(f"Sheet clear error (shopping): {e}")
+
+    def remove_shopping_item(self, item_name: str):
+        """Remove a single item from the Shopping List sheet by name."""
+        ws = self._get_ws("Shopping List")
+        if not ws:
+            return
+        try:
+            existing = ws.get_all_values()
+            if not existing:
+                return
+            norm = normalize_item_name(item_name)
+            for i, row in enumerate(existing[1:], 2):  # 2 = sheet row (1-indexed, skip header)
+                if row and normalize_item_name(row[0]) == norm:
+                    ws.delete_rows(i)
+                    return
+            # Substring fallback
+            if len(norm) >= 4:
+                for i, row in enumerate(existing[1:], 2):
+                    if row:
+                        row_norm = normalize_item_name(row[0])
+                        if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
+                            ws.delete_rows(i)
+                            return
+        except Exception as e:
+            logger.error(f"Sheet remove error (shopping): {e}")
 
     def write_event(self, event_data: dict):
         """Append an event to the Sheet."""
@@ -2066,12 +2109,19 @@ class LocalJsonStore:
         return self.data.get("shopping_list", [])
 
     def mark_bought(self, index: int):
-        """Backward compat: remove an item from the local list and rebuild
-        from current low-stock state (stock updates are the real source now)."""
+        """Remove an item from the shopping list (JSON + Sheet), then rebuild.
+        Works for both auto-added (low stock) and manually added items."""
         items = self.data.get("shopping_list", [])
         if 0 <= index < len(items):
+            removed_item = items[index].get("item", "")
             del items[index]
             self._save_local_only()
+            # Also remove from sheet so _rebuild_shopping_list doesn't re-add it
+            if self._sheets and removed_item:
+                try:
+                    self._sheets.remove_shopping_item(removed_item)
+                except Exception as e:
+                    logger.error(f"Sheet remove shopping item failed: {e}")
         self._rebuild_shopping_list()
 
     def clear_bought(self):
@@ -2079,18 +2129,21 @@ class LocalJsonStore:
         self._rebuild_shopping_list()
 
     def _rebuild_shopping_list(self):
-        """Rebuild the Shopping List from current low-stock items.
-        Compares stock_current against the Stock Minimums (from Google Sheets,
-        falling back to sop_data.STOCK_MINIMUMS), writes the low-stock item
-        names to the Shopping List sheet (single 'Item' column, rebuilt from
-        scratch), and updates the local JSON cache."""
+        """Smart-merge the Shopping List based on stock levels.
+        - ADD items that are below stock minimum and not already listed
+        - REMOVE items that are tracked (in Stock Minimums) and now above minimum
+        - KEEP items manually added by humans (not in Stock Minimums)
+        Sheet is respected — never wipe manually added items."""
         STOCK_MINIMUMS = self._get_stock_minimums()
         if not STOCK_MINIMUMS:
             logger.error("_rebuild_shopping_list: no stock minimums available")
             return
 
         stock_current = self.data.get("stock_current", {})
-        low_item_names = []
+
+        # Classify each tracked item as low or OK
+        low_norms = set()   # normalized names of items below minimum
+        ok_norms = set()    # normalized names of items at/above minimum
 
         for min_name, min_data in STOCK_MINIMUMS.items():
             min_qty = min_data.get("min", 0)
@@ -2109,24 +2162,61 @@ class LocalJsonStore:
                         break
 
             if current_qty is None:
-                continue  # No stock data for this item — can't judge low/not
+                continue  # No stock data — can't judge
 
             try:
                 current_qty = int(current_qty)
             except (ValueError, TypeError):
                 continue
 
+            norm = normalize_item_name(min_name)
             if current_qty < min_qty:
-                low_item_names.append(min_name)
+                low_norms.add(norm)
+            else:
+                ok_norms.add(norm)
 
-        # Update local JSON cache
-        self.data["shopping_list"] = [{"item": name} for name in low_item_names]
+        # Build {norm: display_name} for low items (use the minimums display name)
+        low_display = {}
+        for min_name in STOCK_MINIMUMS:
+            norm = normalize_item_name(min_name)
+            if norm in low_norms:
+                low_display[norm] = min_name
 
-        # Rebuild the Sheet tab from scratch
+        # Read existing items from sheet (or JSON cache if no sheets)
+        existing_items = []
+        if self._sheets:
+            try:
+                sheet_items = self._sheets.read_shopping_from_sheet()
+                if sheet_items is not None:
+                    existing_items = [s["item"] for s in sheet_items]
+            except Exception as e:
+                logger.error(f"Shopping list read failed: {e}")
+                existing_items = [s["item"] for s in self.data.get("shopping_list", [])]
+        else:
+            existing_items = [s["item"] for s in self.data.get("shopping_list", [])]
+
+        # Filter existing: remove restocked trackable items, keep everything else
+        final_items = []
+        for item in existing_items:
+            norm = normalize_item_name(item)
+            if norm in ok_norms:
+                continue  # restocked above minimum — remove
+            final_items.append(item)
+
+        # Add low-stock items not already present
+        final_norms = {normalize_item_name(i) for i in final_items}
+        for norm, display in low_display.items():
+            if norm not in final_norms:
+                final_items.append(display)
+
+        # Update JSON cache
+        self.data["shopping_list"] = [{"item": name} for name in final_items]
+
+        # Write merged list to sheet
         if self._sheets:
             try:
                 self._sheets.clear_shopping_list()
-                for name in low_item_names:
+                for name in final_items:
                     self._sheets.write_shopping_item({"item": name})
             except Exception as e:
                 logger.error(f"Sheet rebuild failed (shopping list): {e}")
