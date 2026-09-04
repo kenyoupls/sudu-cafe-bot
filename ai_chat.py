@@ -909,7 +909,15 @@ MANAGER MINDSET RULES:
 You will be given: current café data (including older chat summaries and recent messages), and the new message.
 """
 
-SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace("CAFE_NAME_HERE", config.CAFE_NAME) + "\n\n" + build_sop_prompt()
+# Base prompt (no SOP data) — SOP text is fetched from Google Sheets at
+# startup / refresh time via refresh_sop_prompt(), not hardcoded here.
+_GEMINI_BASE_PROMPT = _SYSTEM_PROMPT_TEMPLATE.replace("CAFE_NAME_HERE", config.CAFE_NAME)
+
+# SOP knowledge block text, populated by refresh_sop_prompt(). Empty until
+# the bot has loaded SOP data from Google Sheets.
+_sop_text = ""
+
+SYSTEM_PROMPT = _GEMINI_BASE_PROMPT
 
 # Staff group gets an extra instruction block that blocks financial queries
 _STAFF_RESTRICTION = """
@@ -930,7 +938,7 @@ STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
 # Condensed core prompt; SOP recipes appended below via build_sop_prompt().
 # Groq is fast/cheap so we keep its system prompt small to save tokens
 # and reduce 413 "request too large" errors.
-_GROQ_SYSTEM_PROMPT = f"""You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
+_GROQ_BASE_PROMPT = f"""You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
 
 Reply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.
 
@@ -986,9 +994,44 @@ You can include multiple actions in one array. Always give your natural chat rep
 
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers."""
 
-_GROQ_SYSTEM_PROMPT += "\n\n" + build_sop_prompt()
+_GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
 
-_GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
+_GROQ_SYSTEM_PROMPT = _GROQ_BASE_PROMPT
+_GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + _GROQ_STAFF_SUFFIX
+
+
+def refresh_sop_prompt(sheets_sync):
+    """Fetch current SOP data (recipes, stock minimums, checklists, inspection)
+    from Google Sheets and rebuild all four system prompt variants. Call this
+    once at bot startup (after the SheetsSync is connected) and any time the
+    SOP data in the sheet is expected to have changed.
+
+    If the sheets read fails or returns nothing, the prompts fall back to
+    their base (no-SOP) versions rather than raising — the bot should still
+    start even if Sheets is briefly unavailable."""
+    global SYSTEM_PROMPT, STAFF_SYSTEM_PROMPT, _GROQ_SYSTEM_PROMPT, _GROQ_STAFF_SYSTEM_PROMPT, _sop_text
+
+    try:
+        sop_data = sheets_sync.read_sop_from_sheets() if sheets_sync else {}
+    except Exception as e:
+        logger.error(f"refresh_sop_prompt: failed to read SOP from sheets: {e}")
+        sop_data = {}
+
+    try:
+        _sop_text = build_sop_prompt(**sop_data) if sop_data else ""
+    except Exception as e:
+        logger.error(f"refresh_sop_prompt: failed to build SOP prompt: {e}")
+        _sop_text = ""
+
+    sop_block = ("\n\n" + _sop_text) if _sop_text else ""
+
+    SYSTEM_PROMPT = _GEMINI_BASE_PROMPT + sop_block
+    STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
+
+    _GROQ_SYSTEM_PROMPT = _GROQ_BASE_PROMPT + sop_block
+    _GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + _GROQ_STAFF_SUFFIX
+
+    logger.info(f"SOP prompt refreshed from Google Sheets ({len(_sop_text)} chars)")
 
 
 # ═══════════════════════════════════════════════════════════

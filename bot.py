@@ -51,6 +51,21 @@ logger = logging.getLogger(__name__)
 TZ = ZoneInfo(config.TIMEZONE)
 store = get_store()
 
+# ─── SOP data: seed Google Sheets on first run, then load AI prompts ───
+if store._sheets:
+    try:
+        store._sheets.seed_sop_to_sheets()
+    except Exception as e:
+        logger.error(f"seed_sop_to_sheets failed: {e}")
+    try:
+        from ai_chat import refresh_sop_prompt
+        refresh_sop_prompt(store._sheets)
+    except Exception as e:
+        logger.error(f"refresh_sop_prompt failed: {e}")
+else:
+    logger.warning("Google Sheets not connected — SOP data (recipes, checklists, "
+                    "inspection) will not be available to the AI or stock checks.")
+
 # ─── Conversation states ────────────────────────────────────
 (
     STOCK_ITEM, STOCK_QTY,
