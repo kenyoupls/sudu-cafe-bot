@@ -756,14 +756,7 @@ Available actions:
   urgency: "normal" or "urgent"
 - mark_bought: {"action": "mark_bought", "item": "Oat milk"}
 - save_instruction: {"action": "save_instruction", "instruction": "always reply in Malay when staff writes in Malay"}
-  IMPORTANT — trigger this generously. Save ANY feedback, preference, correction, or rule that should apply going forward. Triggers include:
-  - Direct rules: "from now on...", "remember that...", "always...", "never...", "our rule is..."
-  - Corrections: "don't do that", "stop doing this", "don't reply like that", "that's wrong way to do it"
-  - Preferences: "I prefer...", "we like it when...", "I don't like when you...", "do it this way instead"
-  - Feedback on behavior: "too long", "keep it shorter", "don't add extra stuff", "just give me the numbers"
-  - Business rules: "we close early on...", "we don't sell...", "our supplier is...", "we always..."
-  - ANY time someone corrects how you respond — save what they want so you don't repeat the mistake.
-  Write the instruction as a clear rule (e.g. "When giving recipes, only list ingredients and quantities — no cooking instructions"). When in doubt, SAVE IT — it's better to save too many instructions than to forget and repeat the same mistake.
+  If someone tells you something that should apply permanently — a rule, a correction, a preference, how the business works — save it. When in doubt, save it. You're building long-term memory for this café.
 - learn_alias: {"action": "learn_alias", "canonical": "Nata de Coco", "alias": "ndc"}
   Use when staff refers to an item by a nickname, abbreviation, or alternate name. This teaches the bot to map the alias to the correct stock item going forward.
 - add_event: {"action": "add_event", "title": "Live Music", "date": "2026-09-15", "details": "Jazz band 7-10pm"}
@@ -982,7 +975,7 @@ Available actions (name — brief format):
 - log_cleaning — {{"action":"log_cleaning","zone":"..."}}
 - add_shopping — {{"action":"add_shopping","item":"...","urgency":"normal|urgent"}}
 - mark_bought — {{"action":"mark_bought","item":"..."}}
-- save_instruction — {{"action":"save_instruction","instruction":"..."}} Trigger generously: "from now on", "remember", "always/never", "don't do that", "stop doing this", "I prefer", "too long", corrections, preferences, any feedback on your behavior. When in doubt, save it.
+- save_instruction — {{"action":"save_instruction","instruction":"..."}} Save any rule, correction, preference, or business info that should apply permanently. When in doubt, save it.
 - learn_alias — {{"action":"learn_alias","canonical":"...","alias":"..."}}
 - add_event — {{"action":"add_event","title":"...","date":"YYYY-MM-DD","details":"..."}}
 - stock_count — {{"action":"stock_count","item":"...","count":"...","note":"..."}} (single item only)
