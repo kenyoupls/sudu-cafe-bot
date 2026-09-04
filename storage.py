@@ -1345,9 +1345,14 @@ class LocalJsonStore:
         return new_name
 
     def update_stock(self, item: str, qty: str, updated_by: str):
-        # Never store "OK" — default to "1" if somehow passed
-        if str(qty).upper() == "OK":
+        # Sanitize word-based qty values to numbers
+        qty_upper = str(qty).strip().upper()
+        if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
+            qty = "0"
+        elif qty_upper in ("OK", "YES", "ADA"):
             qty = "1"
+        elif qty_upper == "LOW":
+            qty = "0"
         # Deduplicate: use existing name if it matches
         item = self._find_existing_stock_name(item)
         today = _now().strftime("%d/%m/%y")
