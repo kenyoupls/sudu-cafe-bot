@@ -156,7 +156,7 @@ _groq_client: Optional[Groq] = None
 
 GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
-GROQ_TEXT_MODEL_SMALL = "llama-3.1-8b-instant"
+GROQ_TEXT_MODEL_SMALL = "llama-3.3-70b-versatile"
 
 
 def get_groq_client() -> Optional[Groq]:
