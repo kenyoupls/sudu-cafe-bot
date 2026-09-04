@@ -4046,6 +4046,18 @@ async def cmd_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  ⏰ SCHEDULED REMINDERS (JobQueue)
 # ═══════════════════════════════════════════════════════════
 
+async def scheduled_sop_refresh(context):
+    """Re-read SOP data from Google Sheets every few minutes."""
+    if not store._sheets:
+        return
+    try:
+        from ai_chat import refresh_sop_prompt
+        refresh_sop_prompt(store._sheets)
+        logger.debug("SOP prompt refreshed from Google Sheets")
+    except Exception as e:
+        logger.error(f"Scheduled SOP refresh failed: {e}")
+
+
 async def scheduled_cleaning_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Auto-sent cleaning reminder."""
     if not config.OWNER_GROUP_ID:
@@ -4608,6 +4620,10 @@ def main():
         logger.info("✅ Scheduled jobs registered")
     elif not config.OWNER_GROUP_ID:
         logger.warning("⚠️ GROUP_CHAT_ID not set — scheduled reminders disabled. Use /setup to get your chat ID.")
+
+    # ── SOP auto-refresh (always, not just owner group) ──
+    if jq and store._sheets:
+        jq.run_repeating(scheduled_sop_refresh, interval=300, first=300, name="sop_refresh")
 
     # ─── Set bot commands menu ──────────────────────────────
     async def post_init(application):
