@@ -39,7 +39,7 @@ STAFF_BLOCKED_ACTIONS = {
 # ─── Google Sheets (free database) ──────────────────────────
 GOOGLE_SHEETS_CREDS_FILE = os.getenv("GOOGLE_SHEETS_CREDS_FILE", "credentials.json")
 SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "SuduBot")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1W5KA1lNt7qj5gDoZLKyhaeECMoUhzPVVoDh0jDDhQeg")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 
 # ─── Gemini AI (free tier — primary) ─────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
