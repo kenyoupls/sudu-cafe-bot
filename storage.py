@@ -352,26 +352,14 @@ class SheetsSync:
                     row_idx = _find_row(item)
                     if row_idx is not None:
                         cell_updates[(row_idx + 1, col_idx + 1)] = qty
-                    else:
-                        # Append new row
-                        norm = normalize_item_name(item)
-                        row_lookup[norm] = next_row - 1  # store 1-based index for existing[1:]
-                        cell_updates[(next_row, 1)] = item
-                        cell_updates[(next_row, col_idx + 1)] = qty
-                        next_row += 1
+                    # Sheet is master list — don't append items not already on it
 
             # Process stock_current: update column B
             for item, val in stock_current.items():
                 row_idx = _find_row(item)
                 if row_idx is not None:
                     cell_updates[(row_idx + 1, 2)] = val
-                else:
-                    # Append new row
-                    norm = normalize_item_name(item)
-                    row_lookup[norm] = next_row - 1
-                    cell_updates[(next_row, 1)] = item
-                    cell_updates[(next_row, 2)] = val
-                    next_row += 1
+                # Sheet is master list — don't append items not already on it
 
             # Apply all updates in batch
             if cell_updates:
@@ -1711,15 +1699,19 @@ class LocalJsonStore:
                         row_idx = i
                         break
 
+                # Substring fallback if exact match fails
+                if row_idx is None and len(norm) >= 4:
+                    for i, row in enumerate(existing[1:], 1):
+                        if row:
+                            row_norm = normalize_item_name(row[0])
+                            if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
+                                row_idx = i
+                                break
+
                 if row_idx is not None:
                     cell = gspread.utils.rowcol_to_a1(row_idx + 1, 2)
                     ws.update_acell(cell, qty)
-                else:
-                    new_row = [""] * len(header)
-                    new_row[0] = it
-                    new_row[1] = qty
-                    ws.append_row(new_row)
-                    existing.append(new_row)
+                # Sheet is master list — don't append items not already on it
 
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
 
