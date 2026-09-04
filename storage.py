@@ -55,7 +55,8 @@ def normalize_item_name(name: str) -> str:
     s = name.strip()
     s = _BRAND_PREFIX_RE.sub('', s)          # Strip known brand prefixes
     s = _SIZE_SUFFIX_RE.sub(' ', s)          # Strip size/weight suffixes
-    s = _re.sub(r'[(){}[\]]', ' ', s)       # Remove brackets/parens
+    s = _re.sub(r'\([^)]*\)', ' ', s)       # Strip parenthesized annotations entirely
+    s = _re.sub(r'[{}[\]]', ' ', s)         # Remove remaining brackets
     s = _re.sub(r'[-/\\.,;:]+', ' ', s)      # Dashes, slashes, dots → space
     s = _re.sub(r'\s+', ' ', s).strip()      # Collapse whitespace
     return s.lower()
@@ -615,6 +616,15 @@ class SheetsSync:
                 if row and normalize_item_name(row[0]) == norm:
                     row_idx = i
                     break
+
+            # Substring fallback (handles AI sending shorter/longer name variants)
+            if row_idx is None and len(norm) >= 4:
+                for i, row in enumerate(existing[1:], 1):
+                    if row:
+                        row_norm = normalize_item_name(row[0])
+                        if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
+                            row_idx = i
+                            break
 
             if row_idx is not None:
                 # Update existing row
