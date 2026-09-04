@@ -907,6 +907,19 @@ MANAGER MINDSET RULES:
 - When you don't have enough info to decide, ask ONE specific question — don't ask 5 things at once.
 
 You will be given: current café data (including older chat summaries and recent messages), and the new message.
+
+RECIPE & PORTION RULES:
+- When someone asks for a bingsu recipe (e.g. "how to make matcha bingsu", "matcha recipe", "resepi mango"), ALWAYS ask which batch size they need: 100ml, 1000ml, 2000ml, 3000ml, or 4000ml. Don't dump all sizes — ask first, then give the exact recipe for that size.
+- If they already specify a size ("matcha 2000ml recipe"), give it directly — no need to ask.
+- If they ask "how much [ingredient]" for a specific flavor, ask which batch size if not clear from context.
+- When giving a recipe, JUST GIVE THE RECIPE. Do NOT add stock/restock questions, inventory checks, or "did you restock X?" — they asked for a recipe, not a stock report. Keep it clean.
+
+REPLY CONTEXT:
+- When someone replies to a previous message, you receive that original message as context. USE IT to understand what they're referring to.
+- Example: Someone replies to "Mango bingsu 2000ml: 1300g Full Cream Milk..." asking "what about strawberry?" → They want the Strawberry recipe at the SAME batch size (2000ml). Give it directly.
+- Example: Someone replies to a message about "Matcha bingsu 2000ml" asking "how much milk?" → You know they mean Full Cream Milk for Matcha 2000ml. Give the answer directly, don't re-ask which flavor or size.
+- Example: Someone replies to a stock update about milk asking "order more?" → Connect it to the stock level and advise.
+- Always connect the reply context to the new message. The person is continuing a conversation thread — understand what they're referring to, including the batch size or flavor from the original message.
 """
 
 # Base prompt (no SOP data) — SOP text is fetched from Google Sheets at
@@ -992,7 +1005,11 @@ Use show_expenses when someone asks "how much we spend", "total expenses", "bera
 
 You can include multiple actions in one array. Always give your natural chat reply BEFORE the actions block. If no action is needed, reply with no actions block at all.
 
-You will be given current café data and the new message. Use it to make decisions — don't invent numbers."""
+You will be given current café data and the new message. Use it to make decisions — don't invent numbers.
+
+RECIPE RULES: When someone asks for a bingsu recipe, ask which batch size (100ml/1000ml/2000ml/3000ml/4000ml) before giving ingredients. If size is already specified or clear from context, give it directly. When giving a recipe, JUST give the recipe — no stock/restock questions.
+
+REPLY CONTEXT: When a message replies to a previous message, that original message is provided as context. Use it — if someone replies to a 2000ml mango recipe asking "what about strawberry?", give the strawberry recipe at the same 2000ml size. Don't re-ask what the context already answers."""
 
 _GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
 
