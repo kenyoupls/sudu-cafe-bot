@@ -321,10 +321,38 @@ def update_monthly_expenses(month: str = None) -> bool:
         # Sort: newest month first, then alphabetical within month
         data_rows.sort(key=lambda r: (-int(r[0].replace("-", "")), r[1].lower()))
 
+        # Insert month separator rows for visual clarity
+        final_rows = []
+        current_month = None
+        separator_row_indices = []  # track which rows are separators (1-indexed, after header)
+        for row in data_rows:
+            if row[0] != current_month:
+                current_month = row[0]
+                try:
+                    from datetime import datetime as _dt
+                    month_label = _dt.strptime(current_month, "%Y-%m").strftime("%B %Y")
+                except ValueError:
+                    month_label = current_month
+                separator_row_indices.append(len(final_rows) + 2)  # +2 for header row + 1-index
+                final_rows.append([f"═══ {month_label} ═══", "", "", "", "", ""])
+            final_rows.append(row)
+
         ws_exp = ss.worksheet("Expenses")
         ws_exp.clear()
-        ws_exp.update("A1", [header] + data_rows)
+        ws_exp.update("A1", [header] + final_rows)
         ws_exp.format("A1:F1", {"textFormat": {"bold": True}})
+
+        # Bold the month separator rows
+        import time as _time
+        for row_idx in separator_row_indices:
+            try:
+                ws_exp.format(f"A{row_idx}:F{row_idx}", {
+                    "textFormat": {"bold": True},
+                    "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+                })
+                _time.sleep(1)  # Rate limit
+            except Exception:
+                pass  # Non-critical formatting
 
         logger.info(f"Updated expenses: {len(data_rows)} rows across {len(set(k[0] for k in agg))} months")
         return True

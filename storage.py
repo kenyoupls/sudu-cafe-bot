@@ -2020,6 +2020,10 @@ class LocalJsonStore:
     # Auto-generated from low stock — see _rebuild_shopping_list().
     def add_shopping_item(self, item: str, added_by: str = "", urgency: str = "normal"):
         item = clean_item_name(item)
+        # Skip if already on the list
+        existing = {normalize_item_name(s["item"]) for s in self.data.get("shopping_list", [])}
+        if normalize_item_name(item) in existing:
+            return
         entry = {"item": item}
         # 1. Write to Sheet FIRST
         if self._sheets:
