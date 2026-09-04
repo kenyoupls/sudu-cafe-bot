@@ -765,6 +765,7 @@ Available actions:
   Prefer bulk_stock over stock_count — use stock_count only when staff explicitly reports just ONE item's count.
 - bulk_stock: {"action": "bulk_stock", "checked_by": "Edwin", "date": "20/08/26", "items": [{"item": "Full Cream Milk", "qty": "112"}, {"item": "Low Fat Milk", "qty": "73"}, {"item": "Matcha Powder", "qty": "2"}]}
   IMPORTANT: Use this when someone sends a full stock list or multiple items at once. Put EVERY item as a separate entry in the items array. Include ALL items from the message — do not skip any. If qty is empty or unclear, use dash. The "date" field is the date the stock was counted (format dd/mm/yy). Extract the date from the message if mentioned (e.g. "Updated by: 20.08.2026" → "20/08/26"). If no date is mentioned, omit the date field and it defaults to today. This saves each item individually to Google Sheets with history by date.
+  CRITICAL: For bulk_stock, qty must ALWAYS be a number (e.g. "0", "5", "112"). Use "0" for out-of-stock items. Never use words like "OUT", "LOW", or "OK" in bulk_stock — those are only for update_stock (single item reports).
   When staff sends a list of items with quantities, ALWAYS use bulk_stock — even for just 2-3 items.
   This is a PHYSICAL COUNT: set each item's stock to the number given (overwrite, not add).
   Examples that should trigger bulk_stock:

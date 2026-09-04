@@ -1577,6 +1577,19 @@ class LocalJsonStore:
                     for entry in items:
                         item_name = entry.get("item", "")
                         qty = entry.get("qty", "—")
+                        # Sanitize: AI sometimes sends words instead of numbers
+                        qty_upper = str(qty).strip().upper()
+                        if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
+                            qty = 0
+                        elif qty_upper in ("OK", "YES", "ADA"):
+                            qty = 1
+                        elif qty_upper == "LOW":
+                            qty = 0
+                        else:
+                            try:
+                                qty = int(float(str(qty)))
+                            except (ValueError, TypeError):
+                                pass  # Keep original string (e.g. "—") if not convertible
                         if not item_name:
                             continue
                         row_idx = _find_row(item_name)
