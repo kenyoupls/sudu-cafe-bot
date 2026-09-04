@@ -606,30 +606,24 @@ class SheetsSync:
             # Ensure "Current Stock" occupies column B — insert if missing
             has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
             if not has_current_col:
-                new_header = [header[0], "Current Stock"] + header[1:]
-                new_rows = [new_header]
-                for row in existing[1:]:
-                    new_rows.append([row[0] if row else "", ""] + (row[1:] if row else []))
-                ws.clear()
-                ws.update("A1", new_rows)
-                existing = new_rows
-                header = new_header
+                # Insert a blank column at position 2 (becomes column B)
+                ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                ws.update_acell("B1", "Current Stock")
+                # Re-read the sheet so the rest of this function sees the updated layout
+                existing = ws.get_all_values()
+                header = existing[0] if existing else []
 
             # Find or create date column (date columns start at column C / index 2)
             if date_str in header[2:]:
                 col_idx = header.index(date_str, 2)
             else:
-                # Insert as column C (newest date first, after "Item" and "Current Stock")
+                # Insert a blank column at position 3 (becomes column C — newest date first)
                 col_idx = 2
-                # Shift existing date columns right by inserting new col
-                new_header = header[:2] + [date_str] + header[2:]
-                new_rows = [new_header]
-                for row in existing[1:]:
-                    new_rows.append((row[:2] if row else ["", ""]) + [""] + (row[2:] if row else []))
-                ws.clear()
-                ws.update("A1", new_rows)
-                existing = new_rows
-                header = new_header
+                ws.insert_cols([[""] for _ in range(len(existing))], col=3)
+                ws.update_acell("C1", date_str)
+                # Re-read the sheet so item lookup below sees correct layout
+                existing = ws.get_all_values()
+                header = existing[0] if existing else []
 
             # Find item row (by normalized name)
             norm = normalize_item_name(item)
@@ -1385,6 +1379,7 @@ class LocalJsonStore:
         except (ValueError, TypeError):
             pass
 
+        self._sync_current_stock_to_sheet(item)
         self._save_local_only()
         self._rebuild_shopping_list()
 
@@ -1549,6 +1544,7 @@ class LocalJsonStore:
                 except (ValueError, TypeError):
                     pass
 
+        self._sync_current_stock_to_sheet()
         self._save_local_only()
         self._rebuild_shopping_list()
 
