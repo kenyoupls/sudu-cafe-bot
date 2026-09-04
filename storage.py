@@ -273,102 +273,118 @@ class SheetsSync:
         return self._worksheets.get(name)
 
     def sync_stock(self, stock_data: dict, stock_history: dict = None, stock_current: dict = None):
-        """Sync stock data to Sheets — history format: items as rows, dates as columns (newest first).
-        Uses stock_history {date: {item: qty}} as primary source.
+        """Sync stock data to Sheets — MERGE only, never delete rows.
+        Sheet is source of truth. Updates existing rows in place, appends new items.
+        Uses stock_history {date: {item: qty}} and stock_current {item: qty}.
         Column A = Item, Column B = Current Stock, columns C+ = date columns."""
         ws = self._get_ws("Stock")
         if not ws:
             return
         try:
-            from datetime import datetime
-
-            # Build all_items from stock_history
-            all_items = {}  # {item_name: {date: qty}}
-            dates = set()
-
-            if stock_history:
-                for date_str, items in stock_history.items():
-                    for item, qty in items.items():
-                        if str(qty).upper() == "OK":
-                            continue  # Skip legacy "OK" values
-                        dates.add(date_str)
-                        if item not in all_items:
-                            all_items[item] = {}
-                        all_items[item][date_str] = qty
-
-            # Also merge existing sheet data (preserve old entries not in history)
-            def is_date_col(s):
-                try:
-                    datetime.strptime(s, "%d/%m/%y")
-                    return True
-                except (ValueError, TypeError):
-                    return False
-
-            existing = ws.get_all_values()
-            if existing and existing[0]:
-                header = existing[0]
-                date_cols = [(i, h) for i, h in enumerate(header[1:], 1) if is_date_col(h)]
-                for row in existing[1:]:
-                    if row and row[0]:
-                        for col_idx, d in date_cols:
-                            val = row[col_idx] if col_idx < len(row) else ""
-                            if val and str(val).upper() != "OK":
-                                dates.add(d)
-                                if row[0] not in all_items:
-                                    all_items[row[0]] = {}
-                                if d not in all_items[row[0]]:
-                                    all_items[row[0]][d] = val
-
-            # Sort dates newest first
-            def parse_date(d):
-                try:
-                    return datetime.strptime(d, "%d/%m/%y")
-                except ValueError:
-                    return datetime.min
-            sorted_dates = sorted(dates, key=parse_date, reverse=True)
-
+            stock_history = stock_history or {}
             stock_current = stock_current or {}
 
-            if not sorted_dates and not stock_current:
+            if not stock_history and not stock_current:
                 return
 
-            # Deduplicate items by normalized name
-            merged = {}  # {norm_key: {display_name: str, dates: {d: qty}}}
-            for item, date_vals in all_items.items():
-                norm = normalize_item_name(item)
-                if norm not in merged:
-                    merged[norm] = {"display_name": item, "dates": {}}
-                for d, v in date_vals.items():
-                    # Keep the latest value for each date
-                    merged[norm]["dates"][d] = v
+            existing = ws.get_all_values()
 
-            # Also include items that only appear in stock_current
-            for item in stock_current:
-                norm = normalize_item_name(item)
-                if norm not in merged:
-                    merged[norm] = {"display_name": item, "dates": {}}
+            # If sheet is completely empty, create header
+            if not existing or not existing[0]:
+                ws.update("A1", [["Item", "Current Stock"]])
+                ws.format("A1:B1", {"textFormat": {"bold": True}})
+                existing = [["Item", "Current Stock"]]
 
-            # Build final rows: Item | Current Stock | date1 | date2 ...
-            header = ["Item", "Current Stock"] + sorted_dates
-            rows = [header]
-            for norm_key, info in sorted(merged.items(), key=lambda x: x[1]["display_name"].lower()):
-                display_name = info["display_name"]
-                current_val = stock_current.get(display_name)
-                if current_val is None:
-                    # Try matching by normalized name in case display name differs
-                    for ck, cv in stock_current.items():
-                        if normalize_item_name(ck) == norm_key:
-                            current_val = cv
-                            break
-                row = [display_name, current_val if current_val is not None else ""]
-                for d in sorted_dates:
-                    row.append(info["dates"].get(d, ""))
-                rows.append(row)
+            header = list(existing[0])
 
-            ws.clear()
-            ws.update("A1", rows)
-            col_letter = chr(ord('A') + len(header) - 1) if len(header) <= 26 else 'Z'
-            ws.format(f"A1:{col_letter}1", {"textFormat": {"bold": True}})
+            # Ensure "Current Stock" occupies column B
+            has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
+            if not has_current_col:
+                new_header = [header[0], "Current Stock"] + header[1:]
+                new_rows = [new_header]
+                for row in existing[1:]:
+                    new_rows.append([row[0] if row else "", ""] + (row[1:] if row else []))
+                ws.clear()
+                ws.update("A1", new_rows)
+                existing = new_rows
+                header = list(new_header)
+
+            # Build lookup: normalized item name → sheet row index (1-based, skipping header)
+            row_lookup = {}  # {norm_name: row_index}
+            for i, row in enumerate(existing[1:], 1):
+                if row and row[0].strip():
+                    norm = normalize_item_name(row[0])
+                    if norm not in row_lookup:  # first match wins
+                        row_lookup[norm] = i
+
+            # Helper: find row by normalized name, with substring fallback
+            def _find_row(item_name):
+                norm = normalize_item_name(item_name)
+                if norm in row_lookup:
+                    return row_lookup[norm]
+                # Substring fallback
+                if len(norm) >= 4:
+                    for existing_norm, idx in row_lookup.items():
+                        if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
+                            return idx
+                return None
+
+            # Track next available row for appending
+            next_row = len(existing) + 1
+
+            # Collect all cell updates: {(row, col): value}
+            cell_updates = {}
+
+            # Process stock_history: update date columns
+            for date_str, items in stock_history.items():
+                # Find or create date column
+                if date_str in header:
+                    col_idx = header.index(date_str)
+                else:
+                    # Add new date column at end of header
+                    header.append(date_str)
+                    col_idx = len(header) - 1
+                    cell_updates[(1, col_idx + 1)] = date_str
+
+                for item, qty in items.items():
+                    if str(qty).upper() == "OK":
+                        continue
+                    row_idx = _find_row(item)
+                    if row_idx is not None:
+                        cell_updates[(row_idx + 1, col_idx + 1)] = qty
+                    else:
+                        # Append new row
+                        norm = normalize_item_name(item)
+                        row_lookup[norm] = next_row - 1  # store 1-based index for existing[1:]
+                        cell_updates[(next_row, 1)] = item
+                        cell_updates[(next_row, col_idx + 1)] = qty
+                        next_row += 1
+
+            # Process stock_current: update column B
+            for item, val in stock_current.items():
+                row_idx = _find_row(item)
+                if row_idx is not None:
+                    cell_updates[(row_idx + 1, 2)] = val
+                else:
+                    # Append new row
+                    norm = normalize_item_name(item)
+                    row_lookup[norm] = next_row - 1
+                    cell_updates[(next_row, 1)] = item
+                    cell_updates[(next_row, 2)] = val
+                    next_row += 1
+
+            # Apply all updates in batch
+            if cell_updates:
+                # gspread batch_update for efficiency
+                batch = []
+                for (row, col), val in cell_updates.items():
+                    cell_label = gspread.utils.rowcol_to_a1(row, col)
+                    batch.append({"range": cell_label, "values": [[val]]})
+                # batch_update accepts up to ~50k cells
+                if batch:
+                    ws.batch_update(batch, value_input_option="RAW")
+
+            ws.format("A1:Z1", {"textFormat": {"bold": True}})
         except Exception as e:
             logger.error(f"Sheets sync error (Stock): {e}")
 
