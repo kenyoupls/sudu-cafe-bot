@@ -914,13 +914,9 @@ RECIPE & PORTION RULES:
 - If they ask "how much [ingredient]" for a specific flavor, ask which batch size if not clear from context.
 - When giving a recipe, JUST GIVE THE RECIPE. Do NOT add stock/restock questions, inventory checks, or "did you restock X?" — they asked for a recipe, not a stock report. Keep it clean.
 
-REPLY CONTEXT (VERY IMPORTANT):
-- When someone replies to a previous message, you receive that original message as context. READ IT CAREFULLY and use ALL information from it.
-- FOLLOW YOUR OWN CONVERSATION: If YOU asked "which batch size?" about a specific flavor (e.g. strawberry), and the user replies with just a size (e.g. "2L", "2000ml", "1L"), YOU ALREADY KNOW THE FLAVOR from your own question. Give the recipe immediately — do NOT ask which flavor again.
-- Example: You asked "Which batch size do you need for strawberry bingsu?" → User replies "2L" → Give the strawberry 2000ml recipe directly. The flavor was already established.
-- Example: Someone replies to "Mango bingsu 2000ml: 1300g Full Cream Milk..." asking "what about strawberry?" → They want the Strawberry recipe at the SAME batch size (2000ml). Give it directly.
-- Example: Someone replies to a message about "Matcha bingsu 2000ml" asking "how much milk?" → You know they mean Full Cream Milk for Matcha 2000ml. Give the answer directly.
-- RULE: Look at the FULL reply chain. If the flavor or size was mentioned ANYWHERE in the replied-to message or the conversation thread, don't ask again. Connect the dots.
+REPLY CONTEXT:
+- When someone replies to a previous message, you receive that original message as context. USE IT alongside the recent chat history to understand what they're referring to.
+- Connect the dots: if the flavor, batch size, topic, or task was mentioned in the conversation, don't re-ask — answer directly.
 """
 
 # Base prompt (no SOP data) — SOP text is fetched from Google Sheets at
@@ -1010,7 +1006,7 @@ You will be given current café data and the new message. Use it to make decisio
 
 RECIPE RULES: When someone asks for a bingsu recipe, ask which batch size (100ml/1000ml/2000ml/3000ml/4000ml) before giving ingredients. If size is already specified or clear from context, give it directly. When giving a recipe, JUST give the recipe — no stock/restock questions.
 
-REPLY CONTEXT (CRITICAL): When a message replies to a previous message, that original message is provided as context. USE ALL info from it. If YOU asked "which batch size?" for a specific flavor and the user replies with just a size like "2L", YOU ALREADY KNOW THE FLAVOR — give the recipe directly, don't ask which flavor again. Same for any reply: if the flavor, size, or topic was in the replied-to message, don't re-ask it."""
+REPLY CONTEXT: When a message replies to a previous message, that context is provided. Use it AND the recent chat history to understand what the person means — don't re-ask what the conversation already established."""
 
 _GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
 
@@ -1307,6 +1303,34 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     now = _now().strftime("%A, %d %B %Y, %I:%M %p")
     parts.append(f"Time: {now}")
     parts.append(f"Staff: {user_name}")
+
+    # Recent chat history (last 15 messages — enough to follow conversation threads)
+    try:
+        _init_memory(chat_id)
+        all_days = _get_all_recent_days(chat_id)
+        recent_msgs = []
+        for day_str in reversed(all_days):
+            msgs = _load_day(day_str, chat_id)
+            for msg in reversed(msgs):
+                if msg.get("important", True) or msg.get("type") in ("bot_response", "voice", "photo"):
+                    recent_msgs.append(msg)
+                    if len(recent_msgs) >= 15:
+                        break
+            if len(recent_msgs) >= 15:
+                break
+        if recent_msgs:
+            recent_msgs.reverse()
+            chat_lines = []
+            for msg in recent_msgs:
+                who = msg.get("who", "?")
+                text = msg.get("text", "")[:200]
+                if msg.get("type") == "bot_response":
+                    chat_lines.append(f"Bot: {text}")
+                else:
+                    chat_lines.append(f"{who}: {text}")
+            parts.append("RECENT CHAT:\n" + "\n".join(chat_lines))
+    except Exception as e:
+        logger.debug(f"Groq recent chat failed: {e}")
 
     if reply_context:
         # Trim reply context to 300 chars
