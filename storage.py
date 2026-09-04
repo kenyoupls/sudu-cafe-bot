@@ -1504,7 +1504,7 @@ class LocalJsonStore:
 
     def update_stock_bulk(self, items: list, stock_date: str = None):
         """Update multiple stock items under a specific date.
-        stock_date should be dd/mm/yy format. Defaults to today."""
+        Uses batch_update for efficiency — one API call instead of per-item."""
         if not stock_date:
             stock_date = _now().strftime("%d/%m/%y")
 
@@ -1513,18 +1513,108 @@ class LocalJsonStore:
         if stock_date not in self.data["stock_history"]:
             self.data["stock_history"][stock_date] = {}
 
+        # --- Sheet batch update ---
+        if self._sheets:
+            try:
+                ws = self._sheets._get_ws("Stock")
+                if ws:
+                    existing = ws.get_all_values()
+
+                    # If sheet is empty, create header
+                    if not existing or not existing[0]:
+                        ws.update("A1", [["Item", "Current Stock"]])
+                        ws.format("A1:B1", {"textFormat": {"bold": True}})
+                        existing = [["Item", "Current Stock"]]
+
+                    header = list(existing[0])
+
+                    # Ensure "Current Stock" occupies column B
+                    has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
+                    if not has_current_col:
+                        ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                        ws.update_acell("B1", "Current Stock")
+                        existing = ws.get_all_values()
+                        header = list(existing[0]) if existing else []
+
+                    # Find or create date column
+                    if stock_date in header[2:]:
+                        col_idx = header.index(stock_date, 2)
+                    else:
+                        # Insert as column C (newest date first)
+                        col_idx = 2
+                        ws.insert_cols([[""] for _ in range(len(existing))], col=3)
+                        ws.update_acell("C1", stock_date)
+                        existing = ws.get_all_values()
+                        header = list(existing[0]) if existing else []
+
+                    # Build lookup: normalized item name → sheet row index
+                    row_lookup = {}
+                    for i, row in enumerate(existing[1:], 1):
+                        if row and row[0].strip():
+                            norm = normalize_item_name(row[0])
+                            if norm not in row_lookup:
+                                row_lookup[norm] = i
+
+                    # Helper: find row by normalized name, with substring fallback
+                    def _find_row(item_name):
+                        norm = normalize_item_name(item_name)
+                        if norm in row_lookup:
+                            return row_lookup[norm]
+                        if len(norm) >= 4:
+                            for existing_norm, idx in row_lookup.items():
+                                if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
+                                    return idx
+                        return None
+
+                    # Build batch updates
+                    cell_updates = {}
+                    unmatched = []  # Items not on the sheet yet
+
+                    for entry in items:
+                        item_name = entry.get("item", "")
+                        qty = entry.get("qty", "—")
+                        if not item_name:
+                            continue
+                        row_idx = _find_row(item_name)
+                        if row_idx is not None:
+                            # Date column
+                            cell_updates[(row_idx + 1, col_idx + 1)] = qty
+                            # Current Stock column B
+                            try:
+                                cell_updates[(row_idx + 1, 2)] = int(qty)
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            unmatched.append((item_name, qty))
+
+                    # Apply batch update
+                    if cell_updates:
+                        batch = []
+                        for (row, col), val in cell_updates.items():
+                            cell_label = gspread.utils.rowcol_to_a1(row, col)
+                            batch.append({"range": cell_label, "values": [[val]]})
+                        ws.batch_update(batch, value_input_option="RAW")
+
+                    # Append unmatched items (real-time user update — CAN add new rows)
+                    for item_name, qty in unmatched:
+                        new_row = [""] * len(header)
+                        new_row[0] = item_name
+                        new_row[col_idx] = qty
+                        try:
+                            new_row[1] = int(qty)  # Current Stock
+                        except (ValueError, TypeError):
+                            pass
+                        ws.append_row(new_row)
+
+                    ws.format("A1:Z1", {"textFormat": {"bold": True}})
+            except Exception as e:
+                logger.error(f"Sheet batch write failed (stock bulk): {e}")
+
+        # --- Update JSON cache ---
         for entry in items:
             item_name = entry.get("item", "")
             qty = entry.get("qty", "—")
             if item_name:
-                # 1. Write to Sheet FIRST
-                if self._sheets:
-                    try:
-                        self._sheets.write_stock_item(item_name, qty, stock_date)
-                    except Exception as e:
-                        logger.error(f"Direct sheet write failed (stock bulk): {e}")
-
-                # 2. Update JSON cache
                 self.data["stock"][item_name] = {
                     "qty": qty,
                     "updated_by": entry.get("checked_by", ""),
@@ -1532,7 +1622,6 @@ class LocalJsonStore:
                 }
                 self.data["stock_history"][stock_date][item_name] = qty
 
-                # Keep stock_current in sync
                 if "stock_current" not in self.data:
                     self.data["stock_current"] = {}
                 try:
@@ -1540,7 +1629,6 @@ class LocalJsonStore:
                 except (ValueError, TypeError):
                     pass
 
-        self._sync_current_stock_to_sheet()
         self._save_local_only()
         self._rebuild_shopping_list()
 
@@ -1652,7 +1740,8 @@ class LocalJsonStore:
 
     def _sync_current_stock_to_sheet(self, item: str = None):
         """Update the Current Stock (column B) values on the Stock sheet.
-        If item is given, only that item's row is updated; otherwise all items."""
+        If item is given, only that item's row is updated; otherwise all items.
+        Uses batch_update for efficiency."""
         if not self._sheets:
             return
         ws = self._sheets._get_ws("Stock")
@@ -1679,27 +1768,38 @@ class LocalJsonStore:
             else:
                 items_to_sync = stock_current
 
+            # Build row lookup
+            row_lookup = {}
+            for i, row in enumerate(existing[1:], 1):
+                if row and row[0].strip():
+                    norm = normalize_item_name(row[0])
+                    if norm not in row_lookup:
+                        row_lookup[norm] = i
+
+            # Build batch updates for column B
+            cell_updates = {}
             for it, qty in items_to_sync.items():
                 norm = normalize_item_name(it)
-                row_idx = None
-                for i, row in enumerate(existing[1:], 1):
-                    if row and normalize_item_name(row[0]) == norm:
-                        row_idx = i
-                        break
+                row_idx = row_lookup.get(norm)
 
                 # Substring fallback if exact match fails
                 if row_idx is None and len(norm) >= 4:
-                    for i, row in enumerate(existing[1:], 1):
-                        if row:
-                            row_norm = normalize_item_name(row[0])
-                            if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
-                                row_idx = i
-                                break
+                    for existing_norm, idx in row_lookup.items():
+                        if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
+                            row_idx = idx
+                            break
 
                 if row_idx is not None:
-                    cell = gspread.utils.rowcol_to_a1(row_idx + 1, 2)
-                    ws.update_acell(cell, qty)
+                    cell_updates[(row_idx + 1, 2)] = qty
                 # Sheet is master list — don't append items not already on it
+
+            # Apply batch update
+            if cell_updates:
+                batch = []
+                for (row, col), val in cell_updates.items():
+                    cell_label = gspread.utils.rowcol_to_a1(row, col)
+                    batch.append({"range": cell_label, "values": [[val]]})
+                ws.batch_update(batch, value_input_option="RAW")
 
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
 
