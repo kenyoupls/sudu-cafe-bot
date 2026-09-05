@@ -3096,15 +3096,9 @@ async def _execute_actions(actions: list, name: str, update: Update):
                         for a in actions if a is not act
                     )
                     if not has_write_action:
-                        if data and data.get("rows"):
-                            header_line = " | ".join(data["headers"][:8])
-                            lines = [f"📋 {tab} ({data['total_rows']} rows):"]
-                            lines.append(header_line)
-                            for row in data["rows"][:20]:
-                                lines.append(" | ".join(str(row.get(h, ""))[:30] for h in data["headers"][:8]))
-                            feedback.append("\n".join(lines))
-                        else:
+                        if not data or not data.get("rows"):
                             feedback.append(f"❌ Could not read tab '{tab}'")
+                        # Success = silent. AI's chat reply already summarizes the data naturally.
 
             elif action_type == "append_row":
                 tab = act.get("tab", "")
