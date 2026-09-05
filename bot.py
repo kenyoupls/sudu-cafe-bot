@@ -3106,6 +3106,20 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     result = store.append_to_tab(tab, row_data)
                     feedback.append(f"✅ Added row to {tab}" if result else f"❌ Failed to add to {tab}")
 
+            elif action_type == "update_row":
+                tab = act.get("tab", "")
+                match_col = act.get("match_col", "")
+                match_val = act.get("match_val", "")
+                row_data = act.get("data", {})
+                if tab and match_col and match_val and row_data:
+                    result = store.update_in_tab(tab, match_col, match_val, row_data)
+                    if result == "updated":
+                        feedback.append(f"✅ Updated {match_val} in {tab}")
+                    elif result == "not_found":
+                        feedback.append(f"❌ '{match_val}' not found in {tab}")
+                    else:
+                        feedback.append(f"❌ Failed to update {tab}")
+
         except Exception as e:
             logger.error(f"Action execution error ({action_type}): {e}")
 

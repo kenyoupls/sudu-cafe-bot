@@ -1147,6 +1147,56 @@ class SheetsSync:
             logger.error(f"append_row_to_tab({tab_name}): {e}")
             return False
 
+    def update_row_in_tab(self, tab_name: str, match_col: str, match_val: str, data: dict) -> str:
+        """Find a row where match_col == match_val and update it with data.
+        Returns: 'updated', 'not_found', or 'error'."""
+        try:
+            tab_name = self._fuzzy_tab_name(tab_name)
+            ws = self._get_ws(tab_name)
+            if not ws:
+                return "error"
+            headers = ws.row_values(1)
+            if not headers:
+                return "error"
+            if match_col not in headers:
+                # Fuzzy match the column name
+                match_col_lower = match_col.lower()
+                for h in headers:
+                    if h.lower() == match_col_lower:
+                        match_col = h
+                        break
+            if match_col not in headers:
+                return "error"
+            col_idx = headers.index(match_col)
+            all_values = ws.get_all_values()
+            target_row = None
+            match_lower = match_val.strip().lower()
+            for i, row in enumerate(all_values[1:], start=2):  # row 2 onwards
+                cell_val = row[col_idx].strip().lower() if col_idx < len(row) else ""
+                if cell_val == match_lower:
+                    target_row = i
+                    break
+            if not target_row:
+                return "not_found"
+            # Build cell updates
+            cells_to_update = []
+            for key, val in data.items():
+                if key in headers:
+                    c = headers.index(key) + 1  # 1-indexed
+                    cells_to_update.append(gspread.Cell(target_row, c, str(val)))
+                else:
+                    # Fuzzy column match
+                    for h_idx, h in enumerate(headers):
+                        if h.lower() == key.lower():
+                            cells_to_update.append(gspread.Cell(target_row, h_idx + 1, str(val)))
+                            break
+            if cells_to_update:
+                ws.update_cells(cells_to_update, value_input_option='USER_ENTERED')
+            return "updated"
+        except Exception as e:
+            logger.error(f"update_row_in_tab({tab_name}): {e}")
+            return "error"
+
 
 # ═══════════════════════════════════════════════════════════
 #  LOCAL JSON STORE (with Sheets sync)
@@ -2418,6 +2468,12 @@ class LocalJsonStore:
         if self._sheets:
             return self._sheets.read_any_tab(tab_name, max_rows)
         return {}
+
+    def update_in_tab(self, tab_name: str, match_col: str, match_val: str, data: dict) -> str:
+        """Update a row in any Google Sheets tab. Returns 'updated', 'not_found', or 'error'."""
+        if self._sheets:
+            return self._sheets.update_row_in_tab(tab_name, match_col, match_val, data)
+        return "error"
 
     def append_to_tab(self, tab_name: str, data: dict) -> bool:
         """Append a row to any Google Sheets tab."""

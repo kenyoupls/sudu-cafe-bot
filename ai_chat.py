@@ -901,6 +901,10 @@ MONTHLY P&L SUMMARY:
   Events → {"Title": "Live Music", "Date": "2026-09-15", "Details": "Jazz band 7-10pm", "Added By": "Ken", "Status": "upcoming"}
   For other tabs, use read_tab first to see the headers.
 
+- update_row: {"action": "update_row", "tab": "Stock Minimums", "match_col": "Item", "match_val": "Orange Cordial", "data": {"Min": "1"}}
+  Update an EXISTING row. Finds the row where match_col equals match_val, then updates the columns in data.
+  Use this when changing/correcting existing data. Use append_row only for NEW items that don't exist yet.
+
 WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
 - Stock updates → always use update_stock or bulk_stock (they have sanitization logic)
 - Shopping list → always use add_shopping / mark_bought
@@ -1024,6 +1028,7 @@ Use show_expenses when someone asks "how much we spend", "total expenses", "bera
   Stock Minimums: {{"Item":"...","Min":"2","Unit":"bottles","Location":"..."}}
   Expenses Detail: {{"Date":"YYYY-MM-DD","Item":"...","Qty":"...","Amount (RM)":"...","Total (RM)":"...","Category":"...","Supplier":"...","Paid By":"..."}}
   For other tabs, use read_tab first to check headers.
+- update_row — {{"action":"update_row","tab":"...","match_col":"Item","match_val":"Orange Cordial","data":{{"Min":"1"}}}} Update an EXISTING row. Use when changing/correcting data. Use append_row only for NEW items.
 
 WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
 - Stock updates → use update_stock or bulk_stock (they have sanitization)
