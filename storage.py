@@ -1074,9 +1074,37 @@ class SheetsSync:
             logger.error(f"read_stock_minimums_from_sheet: {e}")
         return stock_minimums
 
+    def _fuzzy_tab_name(self, tab_name: str):
+        """Resolve a tab name even if the AI gets it slightly wrong.
+        Tries: exact → case-insensitive → startswith → substring."""
+        if not self.spreadsheet:
+            return tab_name
+        try:
+            all_tabs = [ws.title for ws in self.spreadsheet.worksheets()]
+        except Exception:
+            return tab_name
+        # Exact match
+        if tab_name in all_tabs:
+            return tab_name
+        # Case-insensitive
+        lower = tab_name.lower()
+        for t in all_tabs:
+            if t.lower() == lower:
+                return t
+        # Startswith (e.g. "Stock Minimum" → "Stock Minimums")
+        for t in all_tabs:
+            if t.lower().startswith(lower) or lower.startswith(t.lower()):
+                return t
+        # Substring
+        for t in all_tabs:
+            if lower in t.lower() or t.lower() in lower:
+                return t
+        return tab_name
+
     def read_any_tab(self, tab_name: str, max_rows: int = 50) -> dict:
         """Read any worksheet tab dynamically. Returns headers + rows."""
         try:
+            tab_name = self._fuzzy_tab_name(tab_name)
             ws = self._get_ws(tab_name)
             if not ws:
                 return {}
@@ -1103,6 +1131,7 @@ class SheetsSync:
     def append_row_to_tab(self, tab_name: str, data: dict) -> bool:
         """Append a row to any worksheet tab. data keys must match column headers."""
         try:
+            tab_name = self._fuzzy_tab_name(tab_name)
             ws = self._get_ws(tab_name)
             if not ws:
                 return False
