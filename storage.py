@@ -300,7 +300,7 @@ class SheetsSync:
             # Ensure "Current Stock" occupies column B
             has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
             if not has_current_col:
-                ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                ws.insert_cols([[""]], col=2)
                 ws.update_acell("B1", "Current Stock")
                 existing = ws.get_all_values()
                 header = list(existing[0]) if existing else []
@@ -607,7 +607,7 @@ class SheetsSync:
             has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
             if not has_current_col:
                 # Insert a blank column at position 2 (becomes column B)
-                ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                ws.insert_cols([[""]], col=2)
                 ws.update_acell("B1", "Current Stock")
                 # Re-read the sheet so the rest of this function sees the updated layout
                 existing = ws.get_all_values()
@@ -619,7 +619,7 @@ class SheetsSync:
             else:
                 # Insert a blank column at position 3 (becomes column C — newest date first)
                 col_idx = 2
-                ws.insert_cols([[""] for _ in range(len(existing))], col=3)
+                ws.insert_cols([[""]], col=3)
                 ws.update_acell("C1", date_str)
                 # Re-read the sheet so item lookup below sees correct layout
                 existing = ws.get_all_values()
@@ -1540,7 +1540,7 @@ class LocalJsonStore:
                     # Ensure "Current Stock" occupies column B
                     has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
                     if not has_current_col:
-                        ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                        ws.insert_cols([[""]], col=2)
                         ws.update_acell("B1", "Current Stock")
                         existing = ws.get_all_values()
                         header = list(existing[0]) if existing else []
@@ -1551,7 +1551,7 @@ class LocalJsonStore:
                     else:
                         # Insert as column C (newest date first)
                         col_idx = 2
-                        ws.insert_cols([[""] for _ in range(len(existing))], col=3)
+                        ws.insert_cols([[""]], col=3)
                         ws.update_acell("C1", stock_date)
                         existing = ws.get_all_values()
                         header = list(existing[0]) if existing else []
@@ -1778,7 +1778,7 @@ class LocalJsonStore:
 
             # Ensure "Current Stock" is column B; insert it if missing
             if len(header) < 2 or header[1] != "Current Stock":
-                ws.insert_cols([[""] for _ in range(len(existing))], col=2)
+                ws.insert_cols([[""]], col=2)
                 ws.update_acell("B1", "Current Stock")
                 existing = ws.get_all_values()
                 header = existing[0] if existing else []
