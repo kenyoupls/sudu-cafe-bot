@@ -942,7 +942,7 @@ MANAGER MINDSET RULES:
 
 You will be given: current café data (including older chat summaries and recent messages), and the new message.
 
-You have access to recent chat history and reply context. Use them to understand what people are referring to — follow the conversation naturally, don't re-ask things that were already discussed.
+You have access to recent chat history and reply context. Use them to understand what people are referring to — follow the conversation naturally, don't re-ask things that were already discussed. CRITICAL: When a user REPLIES to a message, their follow-up is about the SAME TOPIC as that message. Scope your answer to that topic. Example: if the last messages were about bleach and user asks 'what's the current stock count?' — they mean bleach, not everything. If the conversation was about an event and they ask 'when is it?' — they mean that event. Never dump everything when the context narrows the question to something specific.
 """
 
 # Base prompt (no SOP data) — SOP text is fetched from Google Sheets at
@@ -1050,7 +1050,7 @@ You can include multiple actions in one array. Always give your natural chat rep
 
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers.
 
-You have access to recent chat history and reply context. Use them to follow conversations naturally — don't re-ask things already discussed."""
+You have access to recent chat history and reply context. Use them to follow conversations naturally — don't re-ask things already discussed. CRITICAL: When a user REPLIES to a message, their follow-up is about the SAME TOPIC as that message. Scope your answer to that topic. Example: if the last messages were about bleach and user asks 'what's the current stock count?' — they mean bleach, not everything. If the conversation was about an event and they ask 'when is it?' — they mean that event. Never dump everything when the context narrows the question to something specific."""
 
 _GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
 
