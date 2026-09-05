@@ -1322,7 +1322,7 @@ def _full_context(user_name: str, user_message: str, reply_context: str = None,
     ]
 
     if reply_context:
-        parts.append(f"[This message is a REPLY to the following message]\n{reply_context}\n[End of replied-to message]")
+        parts.append(f"⚠️ REPLY CONTEXT — The user is replying to this message: \"{reply_context}\"\nTHEIR FOLLOW-UP IS ABOUT THIS TOPIC ONLY. Do NOT answer broadly — scope your response to what was being discussed above.")
 
     parts.append(f"New message: {user_message}")
 
@@ -1451,8 +1451,7 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
             pass
 
     if reply_context:
-        # Trim reply context to 300 chars
-        parts.append(f"[Replying to: {reply_context[:300]}]")
+        parts.append(f"⚠️ REPLY CONTEXT — User is replying to: \"{reply_context[:300]}\"\nSCOPE YOUR ANSWER TO THIS TOPIC ONLY. Do NOT answer broadly.")
 
     parts.append(f"Message: {user_message}")
 
