@@ -273,10 +273,24 @@ def update_monthly_expenses(month: str = None) -> bool:
         # Key: (month_str, norm_name) → {qty, total, category, display_name}
         agg = {}
         for row in all_rows:
-            date_str = str(row.get("Date", ""))
-            if len(date_str) < 7:
+            date_str = str(row.get("Date", "")).strip()
+            if len(date_str) < 6:
                 continue  # skip bad dates
-            row_month = date_str[:7]  # "2026-08"
+            # Parse month from multiple date formats
+            row_month = None
+            if "-" in date_str and len(date_str) >= 7:
+                # YYYY-MM-DD format → take first 7 chars
+                row_month = date_str[:7]  # "2026-08"
+            elif "/" in date_str:
+                # dd/mm/yy or dd/mm/yyyy format
+                parts = date_str.split("/")
+                if len(parts) >= 3:
+                    dd, mm, yy = parts[0], parts[1], parts[2]
+                    if len(yy) == 2:
+                        yy = "20" + yy
+                    row_month = f"{yy}-{mm.zfill(2)}"  # "2026-09"
+            if not row_month:
+                continue
 
             item = row.get("Item", "")
             if not item or not str(item).strip():
