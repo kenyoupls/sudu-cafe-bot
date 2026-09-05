@@ -3085,6 +3085,27 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     if warning:
                         feedback.append(warning)
 
+            elif action_type == "read_tab":
+                tab = act.get("tab", "")
+                if tab:
+                    data = store.read_tab(tab)
+                    if data and data.get("rows"):
+                        header_line = " | ".join(data["headers"][:8])
+                        lines = [f"📋 {tab} ({data['total_rows']} rows):"]
+                        lines.append(header_line)
+                        for row in data["rows"][:20]:
+                            lines.append(" | ".join(str(row.get(h, ""))[:30] for h in data["headers"][:8]))
+                        feedback.append("\n".join(lines))
+                    else:
+                        feedback.append(f"❌ Could not read tab '{tab}'")
+
+            elif action_type == "append_row":
+                tab = act.get("tab", "")
+                row_data = act.get("data", {})
+                if tab and row_data:
+                    result = store.append_to_tab(tab, row_data)
+                    feedback.append(f"✅ Added row to {tab}" if result else f"❌ Failed to add to {tab}")
+
         except Exception as e:
             logger.error(f"Action execution error ({action_type}): {e}")
 

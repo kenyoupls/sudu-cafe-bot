@@ -34,7 +34,7 @@ except ImportError:
 import requests
 
 import config
-from storage import get_store
+from storage import get_store, normalize_item_name
 from sop_data import build_sop_prompt
 
 logger = logging.getLogger(__name__)
@@ -864,6 +864,16 @@ DATA STORAGE:
 - When you trigger actions like update_stock, add_shopping, log_cleaning, etc., the data is saved locally AND synced to the team's Google Sheet automatically.
 - You DO have Google Sheets integration. Never say you don't. The sync happens in the background — just trigger the actions as normal.
 
+CROSS-TAB AWARENESS:
+You can see summaries from ALL tabs in your context data: Stock, Stock Minimums, Shopping List, Expenses, Sales, P&L, Staff, Checklists, Recipes, Events. Use this to:
+- Compare Stock vs Stock Minimums — flag items missing from either
+- Check if expensive items are actually being used (expenses vs stock depletion)
+- Spot trends: sales up but stock not replenished, expenses rising on certain items
+- Answer questions that span multiple tabs: "are we spending more on milk this month?"
+- Use read_tab to pull detailed data when the summary in context isn't enough
+- Use append_row to add data to any tab dynamically (read headers first if unsure)
+When you notice a discrepancy, say it proactively — don't wait to be asked.
+
 OPERATIONS CHECKLIST TRACKING:
 - You can track daily opening/6pm/closing checklist completion.
 - When staff says they did opening tasks, closing tasks, or 6pm tasks, use the checklist_done action.
@@ -879,6 +889,19 @@ MONTHLY P&L SUMMARY:
 - Action: {"action": "monthly_summary", "month": "2026-08"}
   month: YYYY-MM format. If not specified, use current month.
 - Examples: "summarize this month", "what's our P&L for July?", "monthly report", "how did we do last month?"
+
+- read_tab: {"action": "read_tab", "tab": "Expenses Detail"}
+  Use to read ANY tab dynamically. Returns headers + recent rows.
+  Tab names: Stock, Stock Minimums, Shopping List, Events, Bingsu Recipes, Other Recipes, Checklists, Inspection, Expenses Detail, Expenses, Monthly Summary, Daily Sales, POS Reports
+
+- append_row: {"action": "append_row", "tab": "Expenses Detail", "data": {"Date": "2026-09-05", "Item": "Milk", "Qty": "5", "Amount (RM)": "25.00", "Category": "Ingredients", "Supplier": "Giant", "Paid By": "Kendrick"}}
+  Add a row to ANY tab. Match column headers exactly. Use read_tab first if unsure of headers.
+
+WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
+- Stock updates → always use update_stock or bulk_stock (they have sanitization logic)
+- Shopping list → always use add_shopping / mark_bought
+- Checklists → always use checklist_done
+- Everything else (expenses, recipes, any other tab data) → use read_tab / append_row
 
 IMPORTANT:
 - Only include actions when the message CLEARLY implies something actionable
@@ -992,6 +1015,23 @@ Available actions (name — brief format):
 
 Use show_whopaid when someone asks "how much did X pay", "siapa bayar", "who paid", "berapa X spent", expenses by person.
 Use show_expenses when someone asks "how much we spend", "total expenses", "berapa belanja".
+- read_tab — {{"action":"read_tab","tab":"<tab name>"}} Read ANY tab dynamically. Tab names: Stock, Stock Minimums, Shopping List, Events, Bingsu Recipes, Other Recipes, Checklists, Inspection, Expenses Detail, Expenses, Monthly Summary, Daily Sales, POS Reports
+- append_row — {{"action":"append_row","tab":"<tab name>","data":{{"Column Header":"value",...}}}} Add a row to ANY tab. Match column headers exactly. Use read_tab first if unsure of headers.
+
+WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
+- Stock updates → use update_stock or bulk_stock (they have sanitization)
+- Shopping list → use add_shopping / mark_bought
+- Checklists → use checklist_done
+- Everything else (expenses, recipes, new data) → use read_tab / append_row
+
+CROSS-TAB AWARENESS:
+You can see summaries from ALL tabs in the context data. Use this to:
+- Compare Stock vs Stock Minimums — flag items missing from either
+- Spot trends: sales vs expenses vs stock depletion
+- Answer questions spanning multiple tabs
+- Use read_tab to pull detailed data when the summary isn't enough
+- Use append_row to add data to any tab (read headers first if unsure)
+When you notice a discrepancy, say it proactively.
 
 You can include multiple actions in one array. Always give your natural chat reply BEFORE the actions block. If no action is needed, reply with no actions block at all.
 
@@ -1200,6 +1240,54 @@ def _build_context(is_staff_group: bool = False) -> str:
     except Exception as e:
         logger.warning(f"Holiday context error: {e}")
 
+    # ── Stock vs Stock Minimums cross-reference (always visible) ──
+    try:
+        stock_minimums = store._get_stock_minimums()
+        if stock and stock_minimums:
+            stock_norm = {normalize_item_name(k) for k in stock}
+            min_norm = {normalize_item_name(k) for k in stock_minimums}
+            in_stock_not_min = [k for k in stock if normalize_item_name(k) not in min_norm]
+            in_min_not_stock = [k for k in stock_minimums if normalize_item_name(k) not in stock_norm]
+            if in_stock_not_min:
+                parts.append("⚠️ IN STOCK TAB BUT NO MINIMUM SET: " + ", ".join(in_stock_not_min[:15]))
+            if in_min_not_stock:
+                parts.append("⚠️ HAS MINIMUM BUT NOT IN STOCK TAB: " + ", ".join(in_min_not_stock[:15]))
+    except Exception as e:
+        logger.warning(f"Stock cross-reference error: {e}")
+
+    # ── Staff list (owners only) ──
+    if not is_staff_group:
+        try:
+            staff = store.get_staff()
+            if staff:
+                staff_lines = [f"  {name}: {info.get('role', '?')}" for name, info in staff.items()]
+                parts.append("STAFF:\n" + "\n".join(staff_lines))
+        except Exception as e:
+            logger.warning(f"Staff context error: {e}")
+
+    # ── Financial summaries (owners only) ──
+    if not is_staff_group:
+        try:
+            from google_integration import get_expenses_detail, get_daily_sales_for_month, get_pl_summary
+
+            expenses = get_expenses_detail()
+            if expenses:
+                total_exp = sum(float(e.get('Total (RM)', 0) or 0) for e in expenses)
+                parts.append(f"THIS MONTH EXPENSES: RM{total_exp:,.2f} ({len(expenses)} items)")
+
+            sales = get_daily_sales_for_month()
+            if sales:
+                total_sales = sum(float(s.get('Total Sales (RM)', 0) or 0) for s in sales)
+                days_count = len(sales)
+                avg_daily = total_sales / days_count if days_count else 0
+                parts.append(f"THIS MONTH SALES: RM{total_sales:,.2f} over {days_count} days (avg RM{avg_daily:,.2f}/day)")
+
+            pl = get_pl_summary()
+            if pl and pl.get('total_revenue'):
+                parts.append(f"P&L: Revenue RM{pl['total_revenue']:,.2f} | Expenses RM{pl['total_expenses']:,.2f} | Profit RM{pl['gross_profit']:,.2f}")
+        except Exception as e:
+            logger.warning(f"Financial context failed: {e}")
+
     if not parts:
         return "No café data available yet. Staff should use /stockcheck, /addshift, etc. to set up."
 
@@ -1322,6 +1410,32 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
             parts.append("RECENT CHAT:\n" + "\n".join(chat_lines))
     except Exception as e:
         logger.debug(f"Groq recent chat failed: {e}")
+
+    # ── Stock cross-reference (always visible) ──
+    try:
+        stock_minimums = store._get_stock_minimums()
+        stock = store.get_stock()
+        if stock and stock_minimums:
+            stock_norm = {normalize_item_name(k) for k in stock}
+            min_norm = {normalize_item_name(k) for k in stock_minimums}
+            missing_min = [k for k in stock if normalize_item_name(k) not in min_norm]
+            missing_stock = [k for k in stock_minimums if normalize_item_name(k) not in stock_norm]
+            if missing_min:
+                parts.append("⚠️ NO MINIMUM SET: " + ", ".join(missing_min[:10]))
+            if missing_stock:
+                parts.append("⚠️ NOT IN STOCK: " + ", ".join(missing_stock[:10]))
+    except Exception:
+        pass
+
+    # ── Financial one-liner (owners only) ──
+    if not is_staff_group:
+        try:
+            from google_integration import get_pl_summary
+            pl = get_pl_summary()
+            if pl and pl.get('total_revenue'):
+                parts.append(f"FINANCES: Sales RM{pl['total_revenue']:,.0f} | Expenses RM{pl['total_expenses']:,.0f} | Profit RM{pl['gross_profit']:,.0f}")
+        except Exception:
+            pass
 
     if reply_context:
         # Trim reply context to 300 chars

@@ -1074,6 +1074,50 @@ class SheetsSync:
             logger.error(f"read_stock_minimums_from_sheet: {e}")
         return stock_minimums
 
+    def read_any_tab(self, tab_name: str, max_rows: int = 50) -> dict:
+        """Read any worksheet tab dynamically. Returns headers + rows."""
+        try:
+            ws = self._get_ws(tab_name)
+            if not ws:
+                return {}
+            values = ws.get_all_values()
+            if not values:
+                return {}
+            headers = values[0]
+            data_rows = values[1:]
+            total = len(data_rows)
+            # Return last max_rows to keep recent data
+            if len(data_rows) > max_rows:
+                data_rows = data_rows[-max_rows:]
+            rows = []
+            for row in data_rows:
+                row_dict = {}
+                for i, h in enumerate(headers):
+                    row_dict[h] = row[i] if i < len(row) else ""
+                rows.append(row_dict)
+            return {"headers": headers, "rows": rows, "total_rows": total}
+        except Exception as e:
+            logger.error(f"read_any_tab({tab_name}): {e}")
+            return {}
+
+    def append_row_to_tab(self, tab_name: str, data: dict) -> bool:
+        """Append a row to any worksheet tab. data keys must match column headers."""
+        try:
+            ws = self._get_ws(tab_name)
+            if not ws:
+                return False
+            headers = ws.row_values(1)
+            if not headers:
+                return False
+            row_values = []
+            for h in headers:
+                row_values.append(str(data.get(h, "")))
+            ws.append_row(row_values, value_input_option='USER_ENTERED')
+            return True
+        except Exception as e:
+            logger.error(f"append_row_to_tab({tab_name}): {e}")
+            return False
+
 
 # ═══════════════════════════════════════════════════════════
 #  LOCAL JSON STORE (with Sheets sync)
@@ -2339,6 +2383,18 @@ class LocalJsonStore:
 
     def get_staff(self) -> dict:
         return self.data.get("staff", {})
+
+    def read_tab(self, tab_name: str, max_rows: int = 50) -> dict:
+        """Read any Google Sheets tab dynamically."""
+        if self._sheets:
+            return self._sheets.read_any_tab(tab_name, max_rows)
+        return {}
+
+    def append_to_tab(self, tab_name: str, data: dict) -> bool:
+        """Append a row to any Google Sheets tab."""
+        if self._sheets:
+            return self._sheets.append_row_to_tab(tab_name, data)
+        return False
 
     def remove_staff(self, name: str):
         if name in self.data.get("staff", {}):
