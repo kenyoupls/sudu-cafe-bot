@@ -1128,8 +1128,29 @@ class SheetsSync:
             logger.error(f"read_any_tab({tab_name}): {e}")
             return {}
 
+    @staticmethod
+    def _fuzzy_col_match(data: dict, headers: list) -> dict:
+        """Match data keys to actual headers using fuzzy logic.
+        E.g. 'Minimum' → 'Min', 'Amount' → 'Amount (RM)'."""
+        matched = {}
+        header_lower = {h.lower(): h for h in headers}
+        for key, val in data.items():
+            if key in headers:
+                matched[key] = val
+            elif key.lower() in header_lower:
+                matched[header_lower[key.lower()]] = val
+            else:
+                # Substring: 'Minimum' matches 'Min', 'Amount' matches 'Amount (RM)'
+                kl = key.lower()
+                for h in headers:
+                    hl = h.lower()
+                    if kl in hl or hl in kl:
+                        matched[h] = val
+                        break
+        return matched
+
     def append_row_to_tab(self, tab_name: str, data: dict) -> bool:
-        """Append a row to any worksheet tab. data keys must match column headers."""
+        """Append a row to any worksheet tab. Fuzzy-matches data keys to headers."""
         try:
             tab_name = self._fuzzy_tab_name(tab_name)
             ws = self._get_ws(tab_name)
@@ -1138,6 +1159,7 @@ class SheetsSync:
             headers = ws.row_values(1)
             if not headers:
                 return False
+            data = self._fuzzy_col_match(data, headers)
             row_values = []
             for h in headers:
                 row_values.append(str(data.get(h, "")))
@@ -1158,13 +1180,10 @@ class SheetsSync:
             headers = ws.row_values(1)
             if not headers:
                 return "error"
-            if match_col not in headers:
-                # Fuzzy match the column name
-                match_col_lower = match_col.lower()
-                for h in headers:
-                    if h.lower() == match_col_lower:
-                        match_col = h
-                        break
+            # Fuzzy match the match_col name
+            resolved = self._fuzzy_col_match({match_col: ""}, headers)
+            if resolved:
+                match_col = list(resolved.keys())[0]
             if match_col not in headers:
                 return "error"
             col_idx = headers.index(match_col)
@@ -1178,18 +1197,12 @@ class SheetsSync:
                     break
             if not target_row:
                 return "not_found"
-            # Build cell updates
+            # Fuzzy match data keys to actual headers, then build cell updates
+            data = self._fuzzy_col_match(data, headers)
             cells_to_update = []
             for key, val in data.items():
-                if key in headers:
-                    c = headers.index(key) + 1  # 1-indexed
-                    cells_to_update.append(gspread.Cell(target_row, c, str(val)))
-                else:
-                    # Fuzzy column match
-                    for h_idx, h in enumerate(headers):
-                        if h.lower() == key.lower():
-                            cells_to_update.append(gspread.Cell(target_row, h_idx + 1, str(val)))
-                            break
+                c = headers.index(key) + 1  # 1-indexed
+                cells_to_update.append(gspread.Cell(target_row, c, str(val)))
             if cells_to_update:
                 ws.update_cells(cells_to_update, value_input_option='USER_ENTERED')
             return "updated"

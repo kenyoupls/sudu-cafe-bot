@@ -895,21 +895,23 @@ MONTHLY P&L SUMMARY:
   Tab names: Stock, Stock Minimums, Shopping List, Events, Bingsu Recipes, Other Recipes, Checklists, Inspection, Expenses Detail, Expenses, Monthly Summary, Daily Sales, POS Reports
 
 - append_row: {"action": "append_row", "tab": "...", "data": {"Column Header": "value", ...}}
-  Add a row to ANY tab. You MUST use the exact column headers. Common tabs and their headers:
-  Stock Minimums → {"Item": "Orange Cordial", "Min": "2", "Unit": "bottles", "Location": "Dry store"}
-  Expenses Detail → {"Date": "2026-09-05", "Item": "Milk", "Qty": "5", "Amount (RM)": "25.00", "Total (RM)": "25.00", "Category": "Ingredients", "Supplier": "Giant", "Paid By": "Kendrick"}
-  Events → {"Title": "Live Music", "Date": "2026-09-15", "Details": "Jazz band 7-10pm", "Added By": "Ken", "Status": "upcoming"}
-  For other tabs, use read_tab first to see the headers.
+  Add a NEW row to any tab. RULE: You MUST use read_tab on that tab FIRST to see the exact column headers, then use those exact headers in the data dict. Never guess column names.
 
-- update_row: {"action": "update_row", "tab": "Stock Minimums", "match_col": "Item", "match_val": "Orange Cordial", "data": {"Min": "1"}}
+- update_row: {"action": "update_row", "tab": "...", "match_col": "Item", "match_val": "Orange Cordial", "data": {"Min": "1"}}
   Update an EXISTING row. Finds the row where match_col equals match_val, then updates the columns in data.
-  Use this when changing/correcting existing data. Use append_row only for NEW items that don't exist yet.
+  RULE: Use read_tab first to confirm the item exists and to see exact column headers.
+
+WRITING DATA — MANDATORY WORKFLOW:
+1. ALWAYS read_tab first to see headers and existing data
+2. If the item already exists → use update_row to change it
+3. If the item is new → use append_row to add it
+4. Never guess column names — use exactly what read_tab returned
 
 WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
 - Stock updates → always use update_stock or bulk_stock (they have sanitization logic)
 - Shopping list → always use add_shopping / mark_bought
 - Checklists → always use checklist_done
-- Everything else (expenses, recipes, any other tab data) → use read_tab / append_row
+- Everything else (expenses, recipes, any other tab data) → read_tab first, then append_row or update_row
 
 IMPORTANT:
 - Only include actions when the message CLEARLY implies something actionable
@@ -1024,17 +1026,16 @@ Available actions (name — brief format):
 Use show_whopaid when someone asks "how much did X pay", "siapa bayar", "who paid", "berapa X spent", expenses by person.
 Use show_expenses when someone asks "how much we spend", "total expenses", "berapa belanja".
 - read_tab — {{"action":"read_tab","tab":"<tab name>"}} Read ANY tab dynamically. Tab names: Stock, Stock Minimums, Shopping List, Events, Bingsu Recipes, Other Recipes, Checklists, Inspection, Expenses Detail, Expenses, Monthly Summary, Daily Sales, POS Reports
-- append_row — {{"action":"append_row","tab":"...","data":{{"Header":"value",...}}}} Add a row to ANY tab. MUST use exact column headers:
-  Stock Minimums: {{"Item":"...","Min":"2","Unit":"bottles","Location":"..."}}
-  Expenses Detail: {{"Date":"YYYY-MM-DD","Item":"...","Qty":"...","Amount (RM)":"...","Total (RM)":"...","Category":"...","Supplier":"...","Paid By":"..."}}
-  For other tabs, use read_tab first to check headers.
-- update_row — {{"action":"update_row","tab":"...","match_col":"Item","match_val":"Orange Cordial","data":{{"Min":"1"}}}} Update an EXISTING row. Use when changing/correcting data. Use append_row only for NEW items.
+- append_row — {{"action":"append_row","tab":"...","data":{{"Header":"value",...}}}} Add a NEW row. MUST read_tab first to see exact headers.
+- update_row — {{"action":"update_row","tab":"...","match_col":"Item","match_val":"...","data":{{"Col":"val"}}}} Update EXISTING row. MUST read_tab first.
+
+WRITING DATA WORKFLOW: ALWAYS read_tab first → if item exists use update_row, if new use append_row. Never guess column names.
 
 WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
 - Stock updates → use update_stock or bulk_stock (they have sanitization)
 - Shopping list → use add_shopping / mark_bought
 - Checklists → use checklist_done
-- Everything else (expenses, recipes, new data) → use read_tab / append_row
+- Everything else → read_tab first, then append_row or update_row
 
 CROSS-TAB AWARENESS:
 You can see summaries from ALL tabs in the context data. Use this to:
