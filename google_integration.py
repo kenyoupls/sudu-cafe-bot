@@ -34,6 +34,67 @@ def _fmt_ts():
 
 logger = logging.getLogger(__name__)
 
+
+def _parse_month_from_date(date_str: str) -> str:
+    """Extract YYYY-MM from various date formats.
+    Handles: YYYY-MM-DD, dd/mm/yy, dd/mm/yyyy, YYYY-MM."""
+    date_str = str(date_str).strip()
+    if not date_str or len(date_str) < 6:
+        return ""
+    if "-" in date_str and date_str[:4].isdigit():
+        return date_str[:7]  # YYYY-MM-DD → YYYY-MM
+    if "/" in date_str:
+        parts = date_str.split("/")
+        if len(parts) >= 3:
+            dd, mm, yy = parts[0], parts[1], parts[2]
+            if len(yy) == 2:
+                yy = "20" + yy
+            return f"{yy}-{mm.zfill(2)}"
+    return ""
+
+
+def _maybe_insert_month_separator(ws, new_date_str: str, col_count: int):
+    """Insert a month separator row if the new row's month differs from the last row.
+    Checks the last non-empty row's first cell for its month."""
+    new_month = _parse_month_from_date(new_date_str)
+    if not new_month:
+        return
+    try:
+        all_vals = ws.col_values(1)  # Column A — dates
+        if len(all_vals) <= 1:
+            return  # only header or empty
+        # Find last non-separator row (skip rows starting with ═══)
+        last_date = ""
+        for val in reversed(all_vals[1:]):  # skip header
+            val = str(val).strip()
+            if val and not val.startswith("═══"):
+                last_date = val
+                break
+        if not last_date:
+            return
+        last_month = _parse_month_from_date(last_date)
+        if not last_month or last_month == new_month:
+            return  # same month, no separator needed
+        # Different month — insert separator
+        try:
+            month_label = datetime.strptime(new_month, "%Y-%m").strftime("%B %Y")
+        except ValueError:
+            month_label = new_month
+        separator = [f"═══ {month_label} ═══"] + [""] * (col_count - 1)
+        ws.append_row(separator, value_input_option="USER_ENTERED")
+        # Bold + grey background for the separator
+        row_num = len(ws.col_values(1))
+        try:
+            ws.format(f"A{row_num}:{chr(64 + min(col_count, 26))}{row_num}", {
+                "textFormat": {"bold": True},
+                "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+            })
+        except Exception:
+            pass  # formatting is non-critical
+    except Exception as e:
+        logger.debug(f"Month separator check failed: {e}")
+
+
 # ─── Lazy imports (don't crash if not configured) ──────────
 _sheets_client = None
 _drive_service = None
@@ -217,6 +278,7 @@ def log_expense_detail(
 
     try:
         ws = ss.worksheet("Expenses Detail")
+        _maybe_insert_month_separator(ws, expense_date, 9)
         row_data = [
             expense_date,
             item_name,
@@ -274,21 +336,7 @@ def update_monthly_expenses(month: str = None) -> bool:
         agg = {}
         for row in all_rows:
             date_str = str(row.get("Date", "")).strip()
-            if len(date_str) < 6:
-                continue  # skip bad dates
-            # Parse month from multiple date formats
-            row_month = None
-            if "-" in date_str and len(date_str) >= 7:
-                # YYYY-MM-DD format → take first 7 chars
-                row_month = date_str[:7]  # "2026-08"
-            elif "/" in date_str:
-                # dd/mm/yy or dd/mm/yyyy format
-                parts = date_str.split("/")
-                if len(parts) >= 3:
-                    dd, mm, yy = parts[0], parts[1], parts[2]
-                    if len(yy) == 2:
-                        yy = "20" + yy
-                    row_month = f"{yy}-{mm.zfill(2)}"  # "2026-09"
+            row_month = _parse_month_from_date(date_str)
             if not row_month:
                 continue
 
@@ -526,6 +574,7 @@ def log_daily_sales(
 
     try:
         ws = ss.worksheet("Daily Sales")
+        _maybe_insert_month_separator(ws, report_date, 17)
 
         # Extract payment amounts by method
         pay_map = {}

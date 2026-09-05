@@ -729,15 +729,58 @@ class SheetsSync:
         if not ws:
             return
         try:
+            # Insert month separator if month changed
+            event_date = event_data.get("date", "")
+            self._event_month_separator(ws, event_date)
             ws.append_row([
                 event_data.get("title", ""),
-                event_data.get("date", ""),
+                event_date,
                 event_data.get("details", ""),
                 event_data.get("added_by", ""),
                 event_data.get("status", "upcoming"),
             ])
         except Exception as e:
             logger.error(f"Sheet write error (event): {e}")
+
+    def _event_month_separator(self, ws, new_date_str: str):
+        """Insert a month separator row in Events if month changed."""
+        try:
+            if not new_date_str or len(new_date_str) < 7:
+                return
+            # Extract month from YYYY-MM-DD
+            new_month = new_date_str[:7] if "-" in new_date_str else ""
+            if not new_month:
+                return
+            all_vals = ws.col_values(2)  # Column B = Date column in Events
+            if len(all_vals) <= 1:
+                return
+            last_date = ""
+            for val in reversed(all_vals[1:]):
+                val = str(val).strip()
+                if val and not val.startswith("═══"):
+                    last_date = val
+                    break
+            if not last_date:
+                return
+            last_month = last_date[:7] if "-" in last_date else ""
+            if not last_month or last_month == new_month:
+                return
+            from datetime import datetime as _dt
+            try:
+                month_label = _dt.strptime(new_month, "%Y-%m").strftime("%B %Y")
+            except ValueError:
+                month_label = new_month
+            ws.append_row([f"═══ {month_label} ═══", "", "", "", ""])
+            row_num = len(ws.col_values(1))
+            try:
+                ws.format(f"A{row_num}:E{row_num}", {
+                    "textFormat": {"bold": True},
+                    "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+                })
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"Event month separator failed: {e}")
 
     # ─── Full sync (JSON → Sheet) ──────────────────────────
 
@@ -1113,6 +1156,8 @@ class SheetsSync:
                 return {}
             headers = values[0]
             data_rows = values[1:]
+            # Filter out month separator rows (═══ Month Year ═══)
+            data_rows = [r for r in data_rows if not (r and str(r[0]).strip().startswith("═══"))]
             total = len(data_rows)
             # Return last max_rows to keep recent data
             if len(data_rows) > max_rows:
