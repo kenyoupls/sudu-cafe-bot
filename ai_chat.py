@@ -894,8 +894,12 @@ MONTHLY P&L SUMMARY:
   Use to read ANY tab dynamically. Returns headers + recent rows.
   Tab names: Stock, Stock Minimums, Shopping List, Events, Bingsu Recipes, Other Recipes, Checklists, Inspection, Expenses Detail, Expenses, Monthly Summary, Daily Sales, POS Reports
 
-- append_row: {"action": "append_row", "tab": "Expenses Detail", "data": {"Date": "2026-09-05", "Item": "Milk", "Qty": "5", "Amount (RM)": "25.00", "Category": "Ingredients", "Supplier": "Giant", "Paid By": "Kendrick"}}
-  Add a row to ANY tab. Match column headers exactly. Use read_tab first if unsure of headers.
+- append_row: {"action": "append_row", "tab": "...", "data": {"Column Header": "value", ...}}
+  Add a row to ANY tab. You MUST use the exact column headers. Common tabs and their headers:
+  Stock Minimums → {"Item": "Orange Cordial", "Min": "2", "Unit": "bottles", "Location": "Dry store"}
+  Expenses Detail → {"Date": "2026-09-05", "Item": "Milk", "Qty": "5", "Amount (RM)": "25.00", "Total (RM)": "25.00", "Category": "Ingredients", "Supplier": "Giant", "Paid By": "Kendrick"}
+  Events → {"Title": "Live Music", "Date": "2026-09-15", "Details": "Jazz band 7-10pm", "Added By": "Ken", "Status": "upcoming"}
+  For other tabs, use read_tab first to see the headers.
 
 WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
 - Stock updates → always use update_stock or bulk_stock (they have sanitization logic)
@@ -1016,7 +1020,10 @@ Available actions (name — brief format):
 Use show_whopaid when someone asks "how much did X pay", "siapa bayar", "who paid", "berapa X spent", expenses by person.
 Use show_expenses when someone asks "how much we spend", "total expenses", "berapa belanja".
 - read_tab — {{"action":"read_tab","tab":"<tab name>"}} Read ANY tab dynamically. Tab names: Stock, Stock Minimums, Shopping List, Events, Bingsu Recipes, Other Recipes, Checklists, Inspection, Expenses Detail, Expenses, Monthly Summary, Daily Sales, POS Reports
-- append_row — {{"action":"append_row","tab":"<tab name>","data":{{"Column Header":"value",...}}}} Add a row to ANY tab. Match column headers exactly. Use read_tab first if unsure of headers.
+- append_row — {{"action":"append_row","tab":"...","data":{{"Header":"value",...}}}} Add a row to ANY tab. MUST use exact column headers:
+  Stock Minimums: {{"Item":"...","Min":"2","Unit":"bottles","Location":"..."}}
+  Expenses Detail: {{"Date":"YYYY-MM-DD","Item":"...","Qty":"...","Amount (RM)":"...","Total (RM)":"...","Category":"...","Supplier":"...","Paid By":"..."}}
+  For other tabs, use read_tab first to check headers.
 
 WHEN TO USE GENERIC vs SPECIFIC ACTIONS:
 - Stock updates → use update_stock or bulk_stock (they have sanitization)
