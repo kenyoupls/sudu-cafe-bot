@@ -3089,15 +3089,22 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 tab = act.get("tab", "")
                 if tab:
                     data = store.read_tab(tab)
-                    if data and data.get("rows"):
-                        header_line = " | ".join(data["headers"][:8])
-                        lines = [f"📋 {tab} ({data['total_rows']} rows):"]
-                        lines.append(header_line)
-                        for row in data["rows"][:20]:
-                            lines.append(" | ".join(str(row.get(h, ""))[:30] for h in data["headers"][:8]))
-                        feedback.append("\n".join(lines))
-                    else:
-                        feedback.append(f"❌ Could not read tab '{tab}'")
+                    # Only show read_tab output if it's NOT followed by a write action
+                    # (read before write = silent lookup, read alone = user wants to see data)
+                    has_write_action = any(
+                        a.get("action") in ("append_row", "update_row")
+                        for a in actions if a is not act
+                    )
+                    if not has_write_action:
+                        if data and data.get("rows"):
+                            header_line = " | ".join(data["headers"][:8])
+                            lines = [f"📋 {tab} ({data['total_rows']} rows):"]
+                            lines.append(header_line)
+                            for row in data["rows"][:20]:
+                                lines.append(" | ".join(str(row.get(h, ""))[:30] for h in data["headers"][:8]))
+                            feedback.append("\n".join(lines))
+                        else:
+                            feedback.append(f"❌ Could not read tab '{tab}'")
 
             elif action_type == "append_row":
                 tab = act.get("tab", "")
