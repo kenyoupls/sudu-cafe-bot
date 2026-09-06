@@ -1703,17 +1703,23 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
                 continue
             norm = normalize_item_name(r_name)
 
-            # Check if it was in stock BEFORE this receipt (any date other than today)
+            # Check current stock list first (covers items on the sheet)
             was_known = False
-            for date_str, date_items in store.data.get("stock_history", {}).items():
-                if date_str == today_str:
-                    continue  # skip today (just added by this receipt)
-                for hist_item in date_items:
-                    if normalize_item_name(hist_item) == norm:
-                        was_known = True
-                        break
-                if was_known:
+            for k in store.data.get("stock_current", {}):
+                if normalize_item_name(k) == norm:
+                    was_known = True
                     break
+            # Also check stock history
+            if not was_known:
+                for date_str, date_items in store.data.get("stock_history", {}).items():
+                    if date_str == today_str:
+                        continue  # skip today (just added by this receipt)
+                    for hist_item in date_items:
+                        if normalize_item_name(hist_item) == norm:
+                            was_known = True
+                            break
+                    if was_known:
+                        break
 
             # Also check aliases and one-off purchase history
             if not was_known:
@@ -1761,15 +1767,22 @@ def _detect_new_items_list(items: list) -> list:
                 continue
             norm = normalize_item_name(r_name)
             was_known = False
-            for date_str, date_items in store.data.get("stock_history", {}).items():
-                if date_str == today_str:
-                    continue
-                for hist_item in date_items:
-                    if normalize_item_name(hist_item) == norm:
-                        was_known = True
-                        break
-                if was_known:
+            # Check current stock list first (covers items on the sheet)
+            for k in store.data.get("stock_current", {}):
+                if normalize_item_name(k) == norm:
+                    was_known = True
                     break
+            # Also check stock history
+            if not was_known:
+                for date_str, date_items in store.data.get("stock_history", {}).items():
+                    if date_str == today_str:
+                        continue
+                    for hist_item in date_items:
+                        if normalize_item_name(hist_item) == norm:
+                            was_known = True
+                            break
+                    if was_known:
+                        break
             if not was_known:
                 was_known = alias_store.resolve(r_name) != r_name
             if not was_known and store.is_known_oneoff(r_name):
