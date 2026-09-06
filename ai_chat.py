@@ -1136,12 +1136,11 @@ def _build_context(is_staff_group: bool = False) -> str:
         parts.append("LOW/OUT ITEMS: " + ", ".join(i for i, _ in low))
 
     # Proactive: items that have been low for multiple days
-    if stock:
+    if stock_current:
         persistent_low = []
-        stock_current = store.data.get("stock_current", {})
         last_count = store.data.get("last_full_count", {})
-        for item_name, info in stock.items():
-            qty_str = str(info.get("qty", "")).strip().upper()
+        for item_name, qty in stock_current.items():
+            qty_str = str(qty).strip().upper()
             if qty_str in ("LOW", "OUT", "0"):
                 lc = last_count.get(item_name, {})
                 if lc:
@@ -1271,11 +1270,11 @@ def _build_context(is_staff_group: bool = False) -> str:
     # ── Stock vs Stock Minimums cross-reference (always visible) ──
     try:
         stock_minimums = store._get_stock_minimums()
-        if stock and stock_minimums:
-            stock_norm = {normalize_item_name(k) for k in stock}
+        if stock_current and stock_minimums:
+            sc_norm = {normalize_item_name(k) for k in stock_current}
             min_norm = {normalize_item_name(k) for k in stock_minimums}
-            in_stock_not_min = [k for k in stock if normalize_item_name(k) not in min_norm]
-            in_min_not_stock = [k for k in stock_minimums if normalize_item_name(k) not in stock_norm]
+            in_stock_not_min = [k for k in stock_current if normalize_item_name(k) not in min_norm]
+            in_min_not_stock = [k for k in stock_minimums if normalize_item_name(k) not in sc_norm]
             if in_stock_not_min:
                 parts.append("⚠️ IN STOCK TAB BUT NO MINIMUM SET: " + ", ".join(in_stock_not_min[:15]))
             if in_min_not_stock:
@@ -1449,12 +1448,12 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     # ── Stock cross-reference (always visible) ──
     try:
         stock_minimums = store._get_stock_minimums()
-        stock = store.get_stock()
-        if stock and stock_minimums:
-            stock_norm = {normalize_item_name(k) for k in stock}
+        sc = store.data.get("stock_current", {})
+        if sc and stock_minimums:
+            sc_norm = {normalize_item_name(k) for k in sc}
             min_norm = {normalize_item_name(k) for k in stock_minimums}
-            missing_min = [k for k in stock if normalize_item_name(k) not in min_norm]
-            missing_stock = [k for k in stock_minimums if normalize_item_name(k) not in stock_norm]
+            missing_min = [k for k in sc if normalize_item_name(k) not in min_norm]
+            missing_stock = [k for k in stock_minimums if normalize_item_name(k) not in sc_norm]
             if missing_min:
                 parts.append("⚠️ NO MINIMUM SET: " + ", ".join(missing_min[:10]))
             if missing_stock:
