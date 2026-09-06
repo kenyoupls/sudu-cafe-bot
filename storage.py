@@ -2171,16 +2171,18 @@ class LocalJsonStore:
             info = stock.get(item_name, {})
             qty_str = str(info.get("qty", "")).strip()
 
-            # Find matching minimum (fuzzy match)
+            # Find matching minimum (fuzzy match via normalize_item_name)
             min_info = None
+            item_norm = normalize_item_name(item_name)
             for min_name, min_data in STOCK_MINIMUMS.items():
-                if min_name.lower() == item_name.lower():
+                if normalize_item_name(min_name) == item_norm:
                     min_info = min_data
                     break
             if not min_info:
                 # Try partial match
                 for min_name, min_data in STOCK_MINIMUMS.items():
-                    if min_name.lower() in item_name.lower() or item_name.lower() in min_name.lower():
+                    mn = normalize_item_name(min_name)
+                    if mn in item_norm or item_norm in mn:
                         min_info = min_data
                         break
 
@@ -2441,11 +2443,11 @@ class LocalJsonStore:
 
         stock_current = self.data.get("stock_current", {})
         logger.info(f"_rebuild_shopping_list: {len(STOCK_MINIMUMS)} minimums, {len(stock_current)} stock_current items")
-        # Debug: show lime-related keys in both dicts
-        lime_mins = {k: v for k, v in STOCK_MINIMUMS.items() if "lime" in k.lower()}
-        lime_stock = {k: v for k, v in stock_current.items() if "lime" in k.lower()}
-        if lime_mins or lime_stock:
-            logger.info(f"_rebuild_shopping_list DEBUG: lime in minimums={lime_mins}, lime in stock_current={lime_stock}")
+
+        # Pre-build normalized lookup for stock_current
+        stock_norm_map = {}  # normalized_name → qty
+        for item_name, qty in stock_current.items():
+            stock_norm_map[normalize_item_name(item_name)] = qty
 
         # Classify each tracked item as low or OK
         low_norms = set()   # normalized names of items below minimum
@@ -2454,23 +2456,11 @@ class LocalJsonStore:
         for min_name, min_data in STOCK_MINIMUMS.items():
             min_qty = min_data.get("min", 0)
 
-            # Find matching current-stock entry (exact, then fuzzy normalized match)
-            current_qty = None
-            min_clean = min_name.strip().rstrip(":;.,").lower()
-            for item_name, qty in stock_current.items():
-                if item_name.strip().rstrip(":;.,").lower() == min_clean:
-                    current_qty = qty
-                    break
-            if current_qty is None:
-                min_norm = normalize_item_name(min_name)
-                for item_name, qty in stock_current.items():
-                    if normalize_item_name(item_name) == min_norm:
-                        current_qty = qty
-                        break
+            # Find matching current-stock entry via normalize_item_name
+            min_norm = normalize_item_name(min_name)
+            current_qty = stock_norm_map.get(min_norm)
 
             if current_qty is None:
-                if "lime" in min_name.lower():
-                    logger.info(f"_rebuild_shopping_list: SKIP (no stock data) — {min_name!r}")
                 continue  # No stock data — can't judge
 
             try:
@@ -2478,12 +2468,11 @@ class LocalJsonStore:
             except (ValueError, TypeError):
                 continue
 
-            norm = normalize_item_name(min_name)
             if current_qty < min_qty:
-                low_norms.add(norm)
+                low_norms.add(min_norm)
                 logger.info(f"_rebuild_shopping_list: LOW — {min_name}: {current_qty} < {min_qty}")
             else:
-                ok_norms.add(norm)
+                ok_norms.add(min_norm)
 
         # Build {norm: display_name} for low items (use the minimums display name)
         low_display = {}
