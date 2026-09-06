@@ -507,12 +507,9 @@ class SheetsSync:
                             latest_date_parsed = pd
                             latest_qty = val
 
-                # Backfill stock_current from most recent date column if column B was empty
-                if item not in stock_current and latest_qty:
-                    try:
-                        stock_current[item] = int(float(latest_qty))
-                    except (ValueError, TypeError):
-                        pass
+                # Column B is source of truth for current stock.
+                # If Column B is empty, do NOT backfill from date columns —
+                # that's purchase history, not current count.
 
                 if latest_qty:
                     stock[item] = {
@@ -1313,18 +1310,7 @@ class LocalJsonStore:
             if stock_current is not None:
                 self.data["stock_current"] = stock_current
 
-            # Backfill stock_current from latest historical qty for items missing it
-            for item_name, info in self.data.get("stock", {}).items():
-                if item_name not in self.data.get("stock_current", {}):
-                    # Try to parse a number from the latest qty
-                    qty_str = str(info.get("qty", "")).strip()
-                    try:
-                        import re as _re_local
-                        nums = _re_local.findall(r'[\d.]+', qty_str)
-                        if nums:
-                            self.data["stock_current"][item_name] = int(float(nums[0]))
-                    except (ValueError, TypeError):
-                        pass
+            # Column B is source of truth — no backfill from date columns
 
             _time.sleep(2)  # Rate limit gap
 
