@@ -1123,16 +1123,17 @@ def _build_context(is_staff_group: bool = False) -> str:
         instr_lines = [f"  - {ci['instruction']} (set by {ci['added_by']})" for ci in custom_instructions]
         parts.append("CUSTOM INSTRUCTIONS (FOLLOW THESE):\n" + "\n".join(instr_lines))
 
-    # Stock
+    # Stock — prefer Column B (stock_current) over date-column history
     stock = store.get_stock()
     stock_current = store.data.get("stock_current", {})
     stock_lines = []
-    if stock:
-        for item, info in stock.items():
-            stock_lines.append(f"  {item}: {info.get('qty', '?')}")
-    # Add items from stock_current that have no date-column history
+    seen = set()
+    for item, info in (stock or {}).items():
+        qty = stock_current.get(item, info.get('qty', '?'))
+        stock_lines.append(f"  {item}: {qty}")
+        seen.add(item)
     for item, qty in stock_current.items():
-        if item not in (stock or {}):
+        if item not in seen:
             stock_lines.append(f"  {item}: {qty}")
     if stock_lines:
         parts.append("CURRENT STOCK:\n" + "\n".join(stock_lines))
@@ -1367,6 +1368,12 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     low = store.get_low_stock()
     if low:
         parts.append("LOW/OUT STOCK: " + ", ".join(i for i, _ in low))
+
+    # Full stock from Column B so Groq can answer stock questions
+    stock_current = store.data.get("stock_current", {})
+    if stock_current:
+        stock_items = [f"{item}: {qty}" for item, qty in stock_current.items()]
+        parts.append("STOCK: " + ", ".join(stock_items))
 
     # Shopping list (brief)
     shopping = store.get_shopping_list()
