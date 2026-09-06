@@ -1124,9 +1124,12 @@ def _build_context(is_staff_group: bool = False) -> str:
         parts.append("CUSTOM INSTRUCTIONS (FOLLOW THESE):\n" + "\n".join(instr_lines))
 
     # Stock — Column B (stock_current) is the source of truth
+    # Items on the Stock tab but missing from stock_current = empty Column B = 0
     stock_current = store.data.get("stock_current", {})
+    all_stock_items = set(stock_current.keys()) | set(store.data.get("stock", {}).keys())
     stock_lines = []
-    for item, qty in stock_current.items():
+    for item in sorted(all_stock_items):
+        qty = stock_current.get(item, 0)
         stock_lines.append(f"  {item}: {qty}")
     if stock_lines:
         parts.append("CURRENT STOCK:\n" + "\n".join(stock_lines))
@@ -1362,9 +1365,11 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
         parts.append("LOW/OUT STOCK: " + ", ".join(i for i, _ in low))
 
     # Full stock from Column B so Groq can answer stock questions
+    # Items missing from stock_current = empty Column B = 0
     stock_current = store.data.get("stock_current", {})
-    if stock_current:
-        stock_items = [f"{item}: {qty}" for item, qty in stock_current.items()]
+    all_items = set(stock_current.keys()) | set(store.data.get("stock", {}).keys())
+    if all_items:
+        stock_items = [f"{item}: {stock_current.get(item, 0)}" for item in sorted(all_items)]
         parts.append("STOCK: " + ", ".join(stock_items))
 
     # Shopping list (brief)
