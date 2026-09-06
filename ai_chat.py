@@ -1344,7 +1344,7 @@ def _full_context(user_name: str, user_message: str, reply_context: str = None,
     ]
 
     if reply_context:
-        parts.append(f"⚠️ REPLY CONTEXT — The user is replying to this message: \"{reply_context}\"\nTHEIR FOLLOW-UP IS ABOUT THIS TOPIC ONLY. Do NOT answer broadly — scope your response to what was being discussed above.\n⚠️ IMPORTANT: Any stock quantities, prices, or data mentioned in the replied message above may be OUTDATED. Always use the CURRENT STOCK section in this context for the latest numbers — never repeat old values from the reply context.")
+        parts.append(f"⚠️ REPLY CONTEXT — The user is replying to this message: \"{reply_context}\"\nTHEIR FOLLOW-UP IS ABOUT THIS TOPIC ONLY. Do NOT answer broadly — scope your response to what was being discussed above.\n⚠️ IMPORTANT: Any data (stock, prices, sales, events, shopping list, schedules, etc.) in the replied message above may be OUTDATED. Always use the LATEST data from the context sections below — never repeat old values from the reply context. Re-check every number against the current data before answering.")
 
     parts.append(f"New message: {user_message}")
 
@@ -1480,7 +1480,7 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
             pass
 
     if reply_context:
-        parts.append(f"⚠️ REPLY CONTEXT — User is replying to: \"{reply_context[:300]}\"\nSCOPE YOUR ANSWER TO THIS TOPIC ONLY. Do NOT answer broadly.\n⚠️ Data in the replied message may be OUTDATED — use CURRENT STOCK section for latest numbers.")
+        parts.append(f"⚠️ REPLY CONTEXT — User is replying to: \"{reply_context[:300]}\"\nSCOPE YOUR ANSWER TO THIS TOPIC ONLY. Do NOT answer broadly.\n⚠️ Data in the replied message may be OUTDATED — always use the latest data from context sections below, never repeat old values.")
 
     parts.append(f"Message: {user_message}")
 

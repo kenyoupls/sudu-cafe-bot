@@ -3667,7 +3667,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             # Both attempts returned "let me check" — AI genuinely doesn't have the data
             # Give a direct answer instead of a promise
-            chat_reply = "I don't have current stock data for those items. Their quantities may not be recorded in Column B of the Stock sheet — please check or update the sheet directly."
+            chat_reply = "I don't have the data for that right now. Please check the Google Sheet directly or try asking in a different way."
             actions = []
 
     if chat_reply:
