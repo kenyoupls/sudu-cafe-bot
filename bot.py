@@ -1209,7 +1209,9 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          f"RM{_r_total:.2f}]",
                          "receipt", chat_id, msg_id)
 
-                confirm_msg = _build_receipt_confirm_msg(receipt_data, name)
+                new_items = _detect_new_items_list(receipt_data.get("items", []))
+                ctx.chat_data["pending_new_items"] = new_items
+                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
 
                 ctx.chat_data["pending_receipt"] = {
                     "data": receipt_data,
@@ -1220,7 +1222,7 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 sent_msg = await update.message.reply_text(
                     confirm_msg,
-                    reply_markup=_receipt_confirm_buttons(),
+                    reply_markup=_receipt_confirm_buttons(new_items),
                     parse_mode="Markdown",
                 )
                 ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
@@ -1492,7 +1494,9 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          f"RM{receipt_data.get('total', 0):.2f}]",
                          "receipt", chat_id, msg_id)
 
-                confirm_msg = _build_receipt_confirm_msg(receipt_data, name)
+                new_items = _detect_new_items_list(receipt_data.get("items", []))
+                ctx.chat_data["pending_new_items"] = new_items
+                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
 
                 ctx.chat_data["pending_receipt"] = {
                     "data": receipt_data,
@@ -1503,7 +1507,7 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 sent_msg = await msg.reply_text(
                     confirm_msg,
-                    reply_markup=_receipt_confirm_buttons(),
+                    reply_markup=_receipt_confirm_buttons(new_items),
                     parse_mode="Markdown",
                 )
                 ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
@@ -1618,7 +1622,7 @@ def _fix_receipt_paid_by(receipt_data: dict, sender_name: str):
         receipt_data["paid_by"] = sender_name
 
 
-def _build_receipt_confirm_msg(receipt_data: dict, name: str) -> str:
+def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None) -> str:
     """Build the receipt confirmation message text from receipt_data."""
     _r_total = float(receipt_data.get('total') or receipt_data.get('subtotal') or 0)
     _r_subtotal = float(receipt_data.get('subtotal') or 0)
@@ -1634,7 +1638,8 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str) -> str:
         items_text += (
             f"\n  \U0001f4e6 {item.get('name', '?')} "
             f"x{_item_qty} "
-            f"@ RM{_item_price:.2f} [{_cat_label}]"
+            f"@ RM{_item_price:.2f}"
+            f"\n     \U0001f3f7️ {_item_cat.title()}"
         )
 
     paid_by = receipt_data.get("paid_by", "") or name
@@ -1649,21 +1654,39 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str) -> str:
     if _r_discount > 0:
         confirm_msg += f"\U0001f3f7️ Discount: -RM{_r_discount:.2f}\n"
     confirm_msg += f"\U0001f4b0 *Total: RM{_r_total:.2f}*"
+    if new_items:
+        confirm_msg += "\n\n\U0001f195 *New items — classify before confirming:*"
+        for ni in new_items:
+            confirm_msg += f"\n  • {ni['name']}"
     confirm_msg += "\n\n_Reply 'yes' to confirm, or tell me what to change (e.g. 'paid by Eric')._"
     return confirm_msg
 
 
-def _receipt_confirm_buttons():
-    """Return the standard confirm/amend button rows."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Confirm & Save", callback_data="receipt:confirm"),
-            InlineKeyboardButton("✏️ Change", callback_data="receipt:change"),
-        ],
-        [
-            InlineKeyboardButton("🏷️ Change Category", callback_data="receipt:chgcat"),
-        ],
+def _receipt_confirm_buttons(new_items=None):
+    """Return the standard confirm/amend button rows, with optional new-item classification buttons."""
+    rows = []
+    if new_items:
+        for i, item in enumerate(new_items):
+            name = item["name"]
+            choice = item.get("choice", "")
+            if choice == "regular":
+                rows.append([InlineKeyboardButton(f"✅ {name}: Regular stock", callback_data=f"noop")])
+            elif choice == "oneoff":
+                rows.append([InlineKeyboardButton(f"✅ {name}: One-off", callback_data=f"noop")])
+            else:
+                short = name[:20] if len(name) > 20 else name
+                rows.append([
+                    InlineKeyboardButton(f"🔄 {short}: Regular", callback_data=f"rcpnew:{i}:regular"),
+                    InlineKeyboardButton(f"🧪 {short}: One-off", callback_data=f"rcpnew:{i}:oneoff"),
+                ])
+    rows.append([
+        InlineKeyboardButton("✅ Confirm & Save", callback_data="receipt:confirm"),
+        InlineKeyboardButton("✏️ Change", callback_data="receipt:change"),
     ])
+    rows.append([
+        InlineKeyboardButton("🏷️ Change Category", callback_data="receipt:chgcat"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1725,6 +1748,40 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
         logger.error(f"New item detection error: {e}")
 
 
+def _detect_new_items_list(items: list) -> list:
+    """Detect genuinely new items (sync, no messages). Returns list of {"name": ..., "qty": ...}."""
+    try:
+        from storage import get_alias_store
+        alias_store = get_alias_store()
+        today_str = now_sg().strftime("%d/%m/%y")
+        new_items = []
+        for receipt_item in items:
+            r_name = receipt_item.get("name", "")
+            if not r_name:
+                continue
+            norm = normalize_item_name(r_name)
+            was_known = False
+            for date_str, date_items in store.data.get("stock_history", {}).items():
+                if date_str == today_str:
+                    continue
+                for hist_item in date_items:
+                    if normalize_item_name(hist_item) == norm:
+                        was_known = True
+                        break
+                if was_known:
+                    break
+            if not was_known:
+                was_known = alias_store.resolve(r_name) != r_name
+            if not was_known and store.is_known_oneoff(r_name):
+                was_known = True
+            if not was_known:
+                new_items.append({"name": r_name, "qty": receipt_item.get("qty", 1)})
+        return new_items
+    except Exception as e:
+        logger.error(f"New item detection error: {e}")
+        return []
+
+
 async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle Regular/One-off selection for new receipt items."""
     query = update.callback_query
@@ -1771,6 +1828,39 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🆕 *New item detected:* {next_item}\n\n"
             f"Is this a regular stock item or a one-off purchase?",
             reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+
+
+async def cb_rcpnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle Regular/One-off classification from receipt confirmation message."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+    _, idx_str, choice = parts
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        return
+
+    new_items = ctx.chat_data.get("pending_new_items", [])
+    if idx >= len(new_items):
+        return
+
+    new_items[idx]["choice"] = choice
+    ctx.chat_data["pending_new_items"] = new_items
+
+    # Re-render the confirmation message with updated buttons
+    pending = ctx.chat_data.get("pending_receipt")
+    if pending:
+        name = pending.get("user", "")
+        confirm_msg = _build_receipt_confirm_msg(pending["data"], name, new_items=new_items)
+        await query.edit_message_text(
+            confirm_msg,
+            reply_markup=_receipt_confirm_buttons(new_items),
             parse_mode="Markdown",
         )
 
@@ -2006,7 +2096,24 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         logger.error(f"Receipt save error: {e}")
         results.append(f"⚠️ Partial save: {e}")
 
-    await _detect_new_items(items, update, ctx)
+    # Apply pre-classified new item choices (from confirmation message buttons)
+    pre_classified = ctx.chat_data.get("pending_new_items", [])
+    if pre_classified:
+        for ni in pre_classified:
+            ni_name = ni.get("name", "")
+            ni_qty = ni.get("qty", 1)
+            ni_choice = ni.get("choice", "")
+            if ni_choice == "oneoff":
+                store.record_oneoff_item(ni_name)
+                store.remove_stock(ni_name)
+            elif ni_choice == "regular":
+                store.add_receipt_to_stock(ni_name, ni_qty)
+            # If no choice made, default to tracking as regular
+            elif ni_name:
+                store.add_receipt_to_stock(ni_name, ni_qty)
+    else:
+        # Fallback for receipts that didn't go through the new flow
+        await _detect_new_items(items, update, ctx)
 
     _clear_receipt_tracking(ctx)
 
@@ -2066,10 +2173,11 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "back":
-        confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"])
+        new_items = ctx.chat_data.get("pending_new_items", [])
+        confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"], new_items=new_items)
         await query.edit_message_text(
             confirm_msg,
-            reply_markup=_receipt_confirm_buttons(),
+            reply_markup=_receipt_confirm_buttons(new_items),
             parse_mode="Markdown",
         )
         return
@@ -2353,10 +2461,11 @@ async def cb_setcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     items[idx]["category"] = new_cat
     cat_label = ITEM_CATEGORIES.get(new_cat, new_cat)
     item_name = items[idx].get("name", "?")
-    confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"])
+    new_items = ctx.chat_data.get("pending_new_items", [])
+    confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"], new_items=new_items)
     await query.edit_message_text(
         f"✅ {item_name} → {cat_label}\n\n{confirm_msg}",
-        reply_markup=_receipt_confirm_buttons(),
+        reply_markup=_receipt_confirm_buttons(new_items),
         parse_mode="Markdown",
     )
 
@@ -3263,10 +3372,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         _fix_receipt_total_from_items(rd)
 
                 if change_descriptions:
-                    confirm_msg = _build_receipt_confirm_msg(rd, pending["user"])
+                    new_items = ctx.chat_data.get("pending_new_items", [])
+                    confirm_msg = _build_receipt_confirm_msg(rd, pending["user"], new_items=new_items)
                     sent_msg = await update.message.reply_text(
                         f"✅ Updated: {', '.join(change_descriptions)}\n\n{confirm_msg}",
-                        reply_markup=_receipt_confirm_buttons(),
+                        reply_markup=_receipt_confirm_buttons(new_items),
                         parse_mode="Markdown",
                     )
                     ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
@@ -3400,7 +3510,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         if extra_info and not receipt_data.get("paid_by"):
                             receipt_data["paid_by"] = extra_info
 
-                        confirm_msg = _build_receipt_confirm_msg(receipt_data, name)
+                        new_items = _detect_new_items_list(receipt_data.get("items", []))
+                        ctx.chat_data["pending_new_items"] = new_items
+                        confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
 
                         ctx.chat_data["pending_receipt"] = {
                             "data": receipt_data,
@@ -3411,7 +3523,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                         sent_msg = await update.message.reply_text(
                             confirm_msg,
-                            reply_markup=_receipt_confirm_buttons(),
+                            reply_markup=_receipt_confirm_buttons(new_items),
                             parse_mode="Markdown",
                         )
                         ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
@@ -4554,6 +4666,8 @@ def main():
 
     # New receipt item — regular vs one-off callback
     app.add_handler(CallbackQueryHandler(g(cb_newitem), pattern=r"^newitem:"))
+    app.add_handler(CallbackQueryHandler(g(cb_rcpnew), pattern=r"^rcpnew:"))
+    app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern=r"^noop$"))
     app.add_handler(CallbackQueryHandler(g(cb_duplicate_check), pattern=r"^dupcheck:"))
 
     # Voice note handler
