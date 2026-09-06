@@ -521,7 +521,14 @@ class SheetsSync:
                         "updated_at": _now().strftime("%d/%m/%y-%H%M"),
                     }
 
-            logger.info(f"Read {len(stock)} stock items from Sheet")
+            logger.info(f"Read {len(stock)} stock items, {len(stock_current)} stock_current items from Sheet")
+            # Debug: log items that have stock_current values
+            sc_sample = {k: v for k, v in list(stock_current.items())[:30]}
+            logger.info(f"stock_current sample: {sc_sample}")
+            # Debug: check specifically for Puffed Rice and Sin Sing Coffee
+            for name_check in ["Puffed Rice", "Sin Sing Coffee"]:
+                found = any(name_check.lower() in k.lower() for k in stock_current)
+                logger.info(f"DEBUG: '{name_check}' in stock_current: {found}")
             return stock, history, stock_current
 
         except Exception as e:
