@@ -3666,6 +3666,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "\n".join(feedback),
                 )
+
+            # Safety net: if AI triggered read_tab without a write action,
+            # force refresh and re-answer so user doesn't get left hanging
+            read_tab_actions = [a for a in actions if a.get("action") == "read_tab"]
+            write_actions = [a for a in actions if a.get("action") in ("append_row", "update_row")]
+            if read_tab_actions and not write_actions:
+                store.refresh_if_stale(cooldown=0)
+                followup_reply, _ = await process_message(
+                    text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
+                )
+                if followup_reply and followup_reply != chat_reply:
+                    await update.message.reply_text(followup_reply)
     else:
         # AI unavailable — simple fallback
         await update.message.reply_text(

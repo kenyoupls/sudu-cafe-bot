@@ -1303,10 +1303,8 @@ class LocalJsonStore:
                 self.data["stock"] = stock
             if history is not None:
                 self.data["stock_history"] = history
-            if stock_current is not None and stock_current:
-                if "stock_current" not in self.data:
-                    self.data["stock_current"] = {}
-                self.data["stock_current"].update(stock_current)
+            if stock_current is not None:
+                self.data["stock_current"] = stock_current
 
             # Backfill stock_current from latest historical qty for items missing it
             for item_name, info in self.data.get("stock", {}).items():
