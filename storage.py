@@ -2441,6 +2441,11 @@ class LocalJsonStore:
 
         stock_current = self.data.get("stock_current", {})
         logger.info(f"_rebuild_shopping_list: {len(STOCK_MINIMUMS)} minimums, {len(stock_current)} stock_current items")
+        # Debug: show lime-related keys in both dicts
+        lime_mins = {k: v for k, v in STOCK_MINIMUMS.items() if "lime" in k.lower()}
+        lime_stock = {k: v for k, v in stock_current.items() if "lime" in k.lower()}
+        if lime_mins or lime_stock:
+            logger.info(f"_rebuild_shopping_list DEBUG: lime in minimums={lime_mins}, lime in stock_current={lime_stock}")
 
         # Classify each tracked item as low or OK
         low_norms = set()   # normalized names of items below minimum
@@ -2463,6 +2468,8 @@ class LocalJsonStore:
                         break
 
             if current_qty is None:
+                if "lime" in min_name.lower():
+                    logger.info(f"_rebuild_shopping_list: SKIP (no stock data) — {min_name!r}")
                 continue  # No stock data — can't judge
 
             try:
