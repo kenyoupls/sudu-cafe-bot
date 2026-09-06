@@ -2440,6 +2440,7 @@ class LocalJsonStore:
             return
 
         stock_current = self.data.get("stock_current", {})
+        logger.info(f"_rebuild_shopping_list: {len(STOCK_MINIMUMS)} minimums, {len(stock_current)} stock_current items")
 
         # Classify each tracked item as low or OK
         low_norms = set()   # normalized names of items below minimum
@@ -2472,6 +2473,7 @@ class LocalJsonStore:
             norm = normalize_item_name(min_name)
             if current_qty < min_qty:
                 low_norms.add(norm)
+                logger.info(f"_rebuild_shopping_list: LOW — {min_name}: {current_qty} < {min_qty}")
             else:
                 ok_norms.add(norm)
 
@@ -2508,6 +2510,8 @@ class LocalJsonStore:
         for norm, display in low_display.items():
             if norm not in final_norms:
                 final_items.append(display)
+
+        logger.info(f"_rebuild_shopping_list: {len(low_norms)} low, {len(ok_norms)} ok, final list: {final_items}")
 
         # Update JSON cache
         self.data["shopping_list"] = [{"item": name} for name in final_items]
