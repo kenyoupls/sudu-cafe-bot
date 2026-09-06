@@ -3645,6 +3645,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
     )
 
+    # If AI reply is just a promise to check (no real answer), force refresh and re-ask
+    import re as _re_bot
+    _CHECK_PHRASES = _re_bot.compile(
+        r"(?:let me (?:check|pull|verify|look)|i'?ll (?:check|pull|verify|look|grab|get))",
+        _re_bot.IGNORECASE,
+    )
+    if chat_reply and _CHECK_PHRASES.search(chat_reply) and len(chat_reply) < 200:
+        logger.info("AI replied with 'let me check' — forcing refresh and re-asking")
+        store.refresh_if_stale(cooldown=0)
+        chat_reply2, actions2 = await process_message(
+            text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
+        )
+        if chat_reply2 and not _CHECK_PHRASES.search(chat_reply2):
+            chat_reply = chat_reply2
+            actions = actions2
+
     if chat_reply:
         await update.message.reply_text(chat_reply)
 
