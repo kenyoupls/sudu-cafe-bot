@@ -1124,10 +1124,16 @@ def _build_context(is_staff_group: bool = False) -> str:
 
     # Stock
     stock = store.get_stock()
+    stock_current = store.data.get("stock_current", {})
+    stock_lines = []
     if stock:
-        stock_lines = []
         for item, info in stock.items():
             stock_lines.append(f"  {item}: {info.get('qty', '?')}")
+    # Add items from stock_current that have no date-column history
+    for item, qty in stock_current.items():
+        if item not in (stock or {}):
+            stock_lines.append(f"  {item}: {qty}")
+    if stock_lines:
         parts.append("CURRENT STOCK:\n" + "\n".join(stock_lines))
 
     low = store.get_low_stock()
