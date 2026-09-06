@@ -489,7 +489,9 @@ class SheetsSync:
                         try:
                             stock_current[item] = int(float(cur_val))
                         except (ValueError, TypeError):
-                            pass
+                            stock_current[item] = 0  # unparseable → treat as 0
+                    else:
+                        stock_current[item] = 0  # empty Column B → assume 0
 
                 latest_qty = ""
                 latest_date_parsed = _dt.min
