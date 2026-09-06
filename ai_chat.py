@@ -1114,6 +1114,7 @@ def _build_context(is_staff_group: bool = False) -> str:
     """Pull current café state to feed as context.
     If is_staff_group=True, financial data (expenses, sales, P&L, staff list) is excluded."""
     store = get_store()
+    store.refresh_if_stale(cooldown=60)
     parts = []
 
     # Custom instructions from admin
@@ -1353,6 +1354,7 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
                    chat_id: int = 0, is_staff_group: bool = False) -> str:
     """Trimmed context for Groq — no memory/history, shorter café data."""
     store = get_store()
+    store.refresh_if_stale(cooldown=60)
     parts = []
 
     # Custom instructions (keep, these are short)

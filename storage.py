@@ -1339,8 +1339,24 @@ class LocalJsonStore:
             self._save_local_only()
             logger.info("Sheet → JSON refresh complete (Sheet is source of truth)")
 
+            # Auto-update shopping list based on new stock levels
+            self._rebuild_shopping_list()
+
         except Exception as e:
             logger.error(f"Error refreshing from Sheet: {e}")
+
+    def refresh_if_stale(self, cooldown: int = 60) -> bool:
+        """Refresh from sheet if last refresh was more than `cooldown` seconds ago.
+        Returns True if a refresh was performed."""
+        import time as _t
+        now = _t.time()
+        if not hasattr(self, '_last_refresh_time'):
+            self._last_refresh_time = 0
+        if now - self._last_refresh_time < cooldown:
+            return False
+        self._last_refresh_time = now
+        self._refresh_from_sheet()
+        return True
 
     def _save_local_only(self):
         """Save to JSON file WITHOUT triggering sync to Sheets."""
@@ -1356,14 +1372,14 @@ class LocalJsonStore:
                 logger.error(f"Periodic sheet refresh error: {e}")
             finally:
                 # Schedule next refresh
-                self._refresh_timer = threading.Timer(600, _do_refresh)
+                self._refresh_timer = threading.Timer(300, _do_refresh)
                 self._refresh_timer.daemon = True
                 self._refresh_timer.start()
 
-        self._refresh_timer = threading.Timer(600, _do_refresh)
+        self._refresh_timer = threading.Timer(300, _do_refresh)
         self._refresh_timer.daemon = True
         self._refresh_timer.start()
-        logger.info("Periodic Sheet refresh scheduled (every 10 min)")
+        logger.info("Periodic Sheet refresh scheduled (every 5 min)")
 
     def _load(self) -> dict:
         if self.file.exists():

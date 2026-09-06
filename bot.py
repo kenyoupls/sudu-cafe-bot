@@ -459,6 +459,12 @@ async def cmd_lowstock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force refresh all data from Google Sheets."""
+    store.refresh_if_stale(cooldown=0)
+    await update.message.reply_text("✅ Refreshed from Google Sheets")
+
+
 # ═══════════════════════════════════════════════════════════
 #  ✅ CHECKLISTS MODULE
 # ═══════════════════════════════════════════════════════════
@@ -4594,6 +4600,7 @@ def main():
     app.add_handler(CommandHandler("stockcheck", g(cmd_stockcheck)))
     app.add_handler(CommandHandler("removestock", g(cmd_removestock)))
     app.add_handler(CommandHandler("lowstock", g(cmd_lowstock)))
+    app.add_handler(CommandHandler("refresh", g(cmd_refresh)))
 
     # Checklists (allowed everywhere)
     app.add_handler(CommandHandler("open", g(cmd_open)))
@@ -4788,6 +4795,7 @@ def main():
             BotCommand("today", "Today's dashboard"),
             BotCommand("clean", "Start cleaning round"),
             BotCommand("stockcheck", "Run stock check"),
+            BotCommand("refresh", "Force refresh from Google Sheets"),
             BotCommand("open", "Opening checklist"),
             BotCommand("close", "Closing checklist"),
             BotCommand("shifts", "View shift schedule"),
