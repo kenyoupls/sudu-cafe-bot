@@ -1775,7 +1775,10 @@ def _detect_new_items_list(items: list) -> list:
             if not was_known and store.is_known_oneoff(r_name):
                 was_known = True
             if not was_known:
-                new_items.append({"name": r_name, "qty": receipt_item.get("qty", 1)})
+                # Deduplicate by normalized name
+                norm_existing = [normalize_item_name(n["name"]) for n in new_items]
+                if norm not in norm_existing:
+                    new_items.append({"name": r_name, "qty": receipt_item.get("qty", 1)})
         return new_items
     except Exception as e:
         logger.error(f"New item detection error: {e}")
@@ -3372,7 +3375,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         _fix_receipt_total_from_items(rd)
 
                 if change_descriptions:
-                    new_items = ctx.chat_data.get("pending_new_items", [])
+                    # Re-detect new items with updated names
+                    new_items = _detect_new_items_list(rd.get("items", []))
+                    ctx.chat_data["pending_new_items"] = new_items
                     confirm_msg = _build_receipt_confirm_msg(rd, pending["user"], new_items=new_items)
                     sent_msg = await update.message.reply_text(
                         f"✅ Updated: {', '.join(change_descriptions)}\n\n{confirm_msg}",
