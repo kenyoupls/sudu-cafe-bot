@@ -2819,7 +2819,7 @@ async def process_receipt(
         "DATES — Get the year right:\n"
         f'  - If the receipt shows only day/month (e.g. "16/6"), assume year {current_year}\n'
         f'  - If no date at all, use today: {today_str}\n'
-        '  - Format as YYYY-MM-DD always\n\n'
+        '  - Format as dd/mm/yyyy always (Malaysia format, e.g. 06/09/2026)\n\n'
 
         "PAID BY:\n"
         f'  - If the caption says who paid (e.g. "paid by Ali"), use that name\n'
@@ -2849,7 +2849,7 @@ async def process_receipt(
         '{\n'
         '  "type": "receipt" or "invoice",\n'
         '  "supplier": "shop/supplier name",\n'
-        '  "date": "YYYY-MM-DD",\n'
+        '  "date": "dd/mm/yyyy",\n'
         '  "items": [{"name": "Full Cream Milk 1L", "qty": 12, "price": 5.50, "category": "ingredients"}],\n'
         '  "subtotal": 66.00,\n'
         '  "discount": 0,\n'

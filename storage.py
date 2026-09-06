@@ -1639,11 +1639,12 @@ class LocalJsonStore:
 
     def _receipt_hash_key(self, supplier: str, receipt_date: str, total: float, items: list) -> str:
         """Generate a hash key for duplicate detection.
-        Uses only supplier + date + total (not item names — OCR is too noisy)."""
+        Uses supplier + normalized date only (total excluded — user edits change it)."""
         import hashlib
+        from google_integration import _normalize_date
         norm_supplier = normalize_item_name(supplier)
-        rounded_total = f"{float(total):.2f}"
-        raw = f"{norm_supplier}|{receipt_date}|{rounded_total}"
+        norm_date = _normalize_date(receipt_date)
+        raw = f"{norm_supplier}|{norm_date}"
         return hashlib.md5(raw.encode()).hexdigest()[:16]
 
     def record_oneoff_item(self, item: str):

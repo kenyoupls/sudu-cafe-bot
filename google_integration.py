@@ -35,21 +35,50 @@ def _fmt_ts():
 logger = logging.getLogger(__name__)
 
 
-def _parse_month_from_date(date_str: str) -> str:
-    """Extract YYYY-MM from various date formats.
-    Handles: YYYY-MM-DD, dd/mm/yy, dd/mm/yyyy, YYYY-MM."""
+def _normalize_date(date_str: str) -> str:
+    """Normalize any date format to dd/mm/yyyy (Malaysia standard).
+    Handles: YYYY-MM-DD, dd/mm/yy, dd/mm/yyyy, mm/dd/yy (with sanity check)."""
     date_str = str(date_str).strip()
-    if not date_str or len(date_str) < 6:
+    if not date_str:
         return ""
-    if "-" in date_str and date_str[:4].isdigit():
-        return date_str[:7]  # YYYY-MM-DD → YYYY-MM
+    # YYYY-MM-DD (ISO)
+    if "-" in date_str and date_str[:4].isdigit() and len(date_str) >= 10:
+        try:
+            dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+            return dt.strftime("%d/%m/%Y")
+        except ValueError:
+            pass
+    # dd/mm/yy or dd/mm/yyyy or possibly mm/dd/yy
     if "/" in date_str:
         parts = date_str.split("/")
-        if len(parts) >= 3:
+        if len(parts) == 3:
             dd, mm, yy = parts[0], parts[1], parts[2]
             if len(yy) == 2:
                 yy = "20" + yy
-            return f"{yy}-{mm.zfill(2)}"
+            # Sanity: if dd > 12, it's definitely dd/mm. If mm > 12, swap (it was mm/dd).
+            try:
+                d, m = int(dd), int(mm)
+                if m > 12 and d <= 12:
+                    dd, mm = mm, dd  # was mm/dd, swap to dd/mm
+                return f"{int(dd):02d}/{int(mm):02d}/{yy}"
+            except ValueError:
+                pass
+    return date_str  # return as-is if unparseable
+
+
+def _parse_month_from_date(date_str: str) -> str:
+    """Extract YYYY-MM from various date formats."""
+    normalized = _normalize_date(date_str)
+    if not normalized or len(normalized) < 8:
+        return ""
+    # normalized is dd/mm/yyyy
+    if "/" in normalized:
+        parts = normalized.split("/")
+        if len(parts) == 3 and len(parts[2]) == 4:
+            return f"{parts[2]}-{parts[1]}"  # YYYY-MM
+    # fallback for ISO format (if _normalize_date returned as-is)
+    if "-" in normalized and normalized[:4].isdigit():
+        return normalized[:7]
     return ""
 
 

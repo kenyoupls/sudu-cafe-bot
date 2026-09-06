@@ -1943,7 +1943,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
     if not skip_duplicate_check:
         supplier_check = receipt_data.get("supplier", "Unknown")
         receipt_total_check = float(receipt_data.get("total") or 0)
-        receipt_date_check = receipt_data.get("date", now_sg().date().isoformat())
+        receipt_date_check = receipt_data.get("date", now_sg().strftime("%d/%m/%Y"))
         items_check = receipt_data.get("items", [])
 
         existing = store.check_duplicate_receipt(
@@ -1996,14 +1996,8 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         # Always default paid_by to the person who sent the receipt
         paid_by = receipt_data.get("paid_by", "") or receipt_user
         receipt_data["paid_by"] = paid_by  # ensure it's saved in data too
-        expense_date = receipt_data.get("date", now_sg().strftime("%d/%m/%y"))
-        # Convert ISO date to dd/mm/yy if needed
-        if expense_date and "-" in expense_date and len(expense_date) == 10:
-            try:
-                from datetime import datetime
-                expense_date = datetime.strptime(expense_date, "%Y-%m-%d").strftime("%d/%m/%y")
-            except ValueError:
-                pass
+        from google_integration import _normalize_date
+        expense_date = _normalize_date(receipt_data.get("date", now_sg().strftime("%d/%m/%Y")))
         detail_count = 0
 
         # Use receipt's final total — the amount actually paid
@@ -2137,7 +2131,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
     try:
         store.record_receipt_hash(
             supplier=receipt_data.get("supplier", "Unknown"),
-            receipt_date=receipt_data.get("date", now_sg().date().isoformat()),
+            receipt_date=receipt_data.get("date", now_sg().strftime("%d/%m/%Y")),
             total=float(receipt_data.get("total") or 0),
             items=receipt_data.get("items", []),
             recorded_by=confirmed_by,
@@ -2206,7 +2200,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Check for duplicate receipt
     supplier_check = receipt_data.get("supplier", "Unknown")
     receipt_total_check = float(receipt_data.get("total") or 0)
-    receipt_date_check = receipt_data.get("date", now_sg().date().isoformat())
+    receipt_date_check = receipt_data.get("date", now_sg().strftime("%d/%m/%Y"))
     items_check = receipt_data.get("items", [])
 
     existing = store.check_duplicate_receipt(
@@ -2256,14 +2250,8 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         items = _merge_receipt_items(items)
         paid_by = receipt_data.get("paid_by", "") or receipt_user
         receipt_data["paid_by"] = paid_by
-        expense_date = receipt_data.get("date", now_sg().strftime("%d/%m/%y"))
-        # Convert ISO date to dd/mm/yy if needed
-        if expense_date and "-" in expense_date and len(expense_date) == 10:
-            try:
-                from datetime import datetime
-                expense_date = datetime.strptime(expense_date, "%Y-%m-%d").strftime("%d/%m/%y")
-            except ValueError:
-                pass
+        from google_integration import _normalize_date
+        expense_date = _normalize_date(receipt_data.get("date", now_sg().strftime("%d/%m/%Y")))
         detail_count = 0
 
         # Use receipt's final total — the amount actually paid
@@ -2380,7 +2368,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         store.record_receipt_hash(
             supplier=receipt_data.get("supplier", "Unknown"),
-            receipt_date=receipt_data.get("date", now_sg().date().isoformat()),
+            receipt_date=receipt_data.get("date", now_sg().strftime("%d/%m/%Y")),
             total=float(receipt_data.get("total") or 0),
             items=receipt_data.get("items", []),
             recorded_by=name,
