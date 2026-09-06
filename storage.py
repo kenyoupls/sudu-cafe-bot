@@ -479,7 +479,7 @@ class SheetsSync:
             for row in existing[1:]:
                 if not row or not row[0]:
                     continue
-                item = row[0].strip()
+                item = row[0].strip().rstrip(":;.,")
                 if not item:
                     continue
 
@@ -2456,8 +2456,9 @@ class LocalJsonStore:
 
             # Find matching current-stock entry (exact, then fuzzy normalized match)
             current_qty = None
+            min_clean = min_name.strip().rstrip(":;.,").lower()
             for item_name, qty in stock_current.items():
-                if item_name.lower() == min_name.lower():
+                if item_name.strip().rstrip(":;.,").lower() == min_clean:
                     current_qty = qty
                     break
             if current_qty is None:
