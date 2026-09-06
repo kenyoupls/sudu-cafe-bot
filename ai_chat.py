@@ -1123,18 +1123,11 @@ def _build_context(is_staff_group: bool = False) -> str:
         instr_lines = [f"  - {ci['instruction']} (set by {ci['added_by']})" for ci in custom_instructions]
         parts.append("CUSTOM INSTRUCTIONS (FOLLOW THESE):\n" + "\n".join(instr_lines))
 
-    # Stock — prefer Column B (stock_current) over date-column history
-    stock = store.get_stock()
+    # Stock — Column B (stock_current) is the source of truth
     stock_current = store.data.get("stock_current", {})
     stock_lines = []
-    seen = set()
-    for item, info in (stock or {}).items():
-        qty = stock_current.get(item, info.get('qty', '?'))
-        stock_lines.append(f"  {item}: {qty}")
-        seen.add(item)
     for item, qty in stock_current.items():
-        if item not in seen:
-            stock_lines.append(f"  {item}: {qty}")
+        stock_lines.append(f"  {item}: {qty}")
     if stock_lines:
         parts.append("CURRENT STOCK:\n" + "\n".join(stock_lines))
 

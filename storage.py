@@ -2205,18 +2205,20 @@ class LocalJsonStore:
         return low_items
 
     def get_low_stock(self) -> list:
-        result = [
-            (item, info)
-            for item, info in self.data.get("stock", {}).items()
-            if info.get("qty", "").upper() in ("LOW", "OUT", "0")
-        ]
-        # Also check stock_current against minimums
+        # Only use stock_current (Column B) — date-column history is not current stock
+        result = []
         STOCK_MINIMUMS = self._get_stock_minimums()
         stock_current = self.data.get("stock_current", {})
-        seen = {item for item, _ in result}
+        seen = set()
         for item_name, qty in stock_current.items():
             if item_name in seen:
                 continue
+            # Check if qty is a low/out string
+            if str(qty).upper() in ("LOW", "OUT", "0"):
+                result.append((item_name, {"qty": str(qty)}))
+                seen.add(item_name)
+                continue
+            # Check against minimums
             item_norm = normalize_item_name(item_name)
             for min_name, min_data in STOCK_MINIMUMS.items():
                 if normalize_item_name(min_name) == item_norm:
