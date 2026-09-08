@@ -3639,8 +3639,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if replied_text:
             reply_context = f"{replied_name}: {replied_text}"
 
-    # ─── Refresh from sheet every time bot gets a message (no cooldown) ──
-    store.refresh_if_stale(cooldown=0)
+    # ─── Quick stock refresh every time bot gets tagged — fast, stock only ──
+    store.quick_refresh_stock()
 
     # ─── Send to AI — get reply + actions ──────────────────
     is_staff = _is_staff_group(update)

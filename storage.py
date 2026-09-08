@@ -1351,6 +1351,22 @@ class LocalJsonStore:
         self._refresh_from_sheet()
         return True
 
+    def quick_refresh_stock(self):
+        """Fast stock-only refresh — reads just the Stock tab (no sleep, no other tabs).
+        Use this when bot gets tagged so it always has live stock data."""
+        if not self._sheets:
+            return
+        try:
+            stock, history, stock_current = self._sheets.read_stock_from_sheet()
+            if stock is not None:
+                self.data["stock"] = stock
+            if stock_current is not None:
+                self.data["stock_current"] = stock_current
+            # Don't save to JSON or rebuild shopping — keep it fast
+            logger.info(f"Quick stock refresh: {len(stock_current or {})} items")
+        except Exception as e:
+            logger.error(f"Quick stock refresh error: {e}")
+
     def _save_local_only(self):
         """Save to JSON file WITHOUT triggering sync to Sheets."""
         with open(self.file, "w") as f:
