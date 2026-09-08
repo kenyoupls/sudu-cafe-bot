@@ -599,6 +599,8 @@ class SheetsSync:
         try:
             from datetime import datetime as _dt
             existing = ws.get_all_values()
+            logger.info(f"[write_stock_item] item={item!r}, qty={qty!r}, date_str={date_str!r}")
+            logger.info(f"[write_stock_item] header={existing[0] if existing else 'EMPTY'}")
 
             if not existing or not existing[0]:
                 # Sheet is empty — create header + first row
@@ -622,6 +624,7 @@ class SheetsSync:
             # Find or create date column (date columns start at column C / index 2)
             if date_str in header[2:]:
                 col_idx = header.index(date_str, 2)
+                logger.info(f"[write_stock_item] Found existing date column at col_idx={col_idx}")
             else:
                 # Insert a blank column at position 3 (becomes column C — newest date first)
                 col_idx = 2
@@ -630,6 +633,7 @@ class SheetsSync:
                 # Re-read the sheet so item lookup below sees correct layout
                 existing = ws.get_all_values()
                 header = existing[0] if existing else []
+                logger.info(f"[write_stock_item] Created new date column, col_idx={col_idx}, new header={header}")
 
             # Find item row (by normalized name)
             norm = normalize_item_name(item)
@@ -648,21 +652,25 @@ class SheetsSync:
                             row_idx = i
                             break
 
+            logger.info(f"[write_stock_item] norm={norm!r}, row_idx={row_idx}")
+
             if row_idx is not None:
                 # Update existing row
                 cell = gspread.utils.rowcol_to_a1(row_idx + 1, col_idx + 1)
                 ws.update_acell(cell, qty)
+                logger.info(f"[write_stock_item] Updated cell {cell} with {qty}")
             else:
                 # Append new row
                 new_row = [""] * len(header)
                 new_row[0] = item
                 new_row[col_idx] = qty
                 ws.append_row(new_row)
+                logger.info(f"[write_stock_item] Appended new row for {item}")
 
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
 
         except Exception as e:
-            logger.error(f"Sheet write error (stock item): {e}")
+            logger.error(f"[write_stock_item] FAILED for item={item!r}, qty={qty!r}, date={date_str!r}: {e}", exc_info=True)
 
     def remove_stock_item(self, item: str):
         """Remove a stock item row from the Sheet."""
