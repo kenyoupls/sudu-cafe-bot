@@ -874,8 +874,10 @@ You can see summaries from ALL tabs in your context data: Stock, Stock Minimums,
 - Use append_row to add data to any tab dynamically (read headers first if unsure)
 When you notice a discrepancy, say it proactively — don't wait to be asked.
 
-DATA FRESHNESS:
+DATA FRESHNESS & PRIORITY:
 Your context data comes from Google Sheets — use it to answer directly. NEVER say "let me check", "I'll look it up", "I'll pull the latest", or "let me verify" — you ALREADY HAVE the latest data in the CURRENT STOCK section above. Just answer directly with the numbers you see. If an item shows 0 or is missing from the data, say so plainly — don't promise to look it up. If you also trigger read_tab, still include your answer in the chat reply — don't leave the user waiting for a second message.
+
+⚠️ CRITICAL DATA PRIORITY: The CURRENT STOCK section contains the LIVE numbers from the Google Sheet. These ALWAYS override anything in the chat history. If the chat history or a previous bot message says "Sin Sing Coffee is 1 unit" but CURRENT STOCK shows "Sin Sing Coffee: 0", the answer is 0 — the chat history is STALE. Never quote stock numbers from old chat messages — always use the CURRENT STOCK section.
 
 DATES:
 All dates are dd/mm/yyyy (Malaysia format). 06/09/2026 means 6th September 2026, NOT June 9th. When you write dates (in actions, replies, or data), always use dd/mm/yyyy.
@@ -1055,6 +1057,7 @@ You can see summaries from ALL tabs in the context data. Use this to:
 When you notice a discrepancy, say it proactively.
 
 DATA FRESHNESS: Your context data comes from Google Sheets — use it to answer directly. NEVER say "let me check", "I'll look it up", "I'll pull the latest", or "let me verify" — you ALREADY HAVE the latest data. Just answer with the numbers you see. If an item is missing or shows 0, say so — don't promise to check.
+⚠️ CURRENT STOCK numbers ALWAYS override old chat messages. If chat history says "1 unit" but STOCK section says 0, the answer is 0.
 
 DATES: All dates are dd/mm/yyyy (Malaysia format). 06/09/2026 = 6th September, NOT June 9th. Always use dd/mm/yyyy when writing dates.
 
@@ -1132,7 +1135,7 @@ def _build_context(is_staff_group: bool = False) -> str:
         qty = stock_current.get(item, 0)
         stock_lines.append(f"  {item}: {qty}")
     if stock_lines:
-        parts.append("CURRENT STOCK:\n" + "\n".join(stock_lines))
+        parts.append("⚡ CURRENT STOCK (LIVE from Google Sheet — these numbers override everything, including chat history):\n" + "\n".join(stock_lines))
 
     low = store.get_low_stock()
     if low:
