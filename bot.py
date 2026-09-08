@@ -3639,10 +3639,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if replied_text:
             reply_context = f"{replied_name}: {replied_text}"
 
-    # ─── Force refresh if replying to old message or asking "again" ──
-    _again_words = {"again", "lagi", "semula", "repeat", "check again", "recheck"}
-    if reply_context or text.strip().lower() in _again_words:
-        store.refresh_if_stale(cooldown=0)  # force fresh data from sheet
+    # ─── Always refresh from sheet before answering (60s cooldown for rate limits) ──
+    store.refresh_if_stale(cooldown=60)
 
     # ─── Send to AI — get reply + actions ──────────────────
     is_staff = _is_staff_group(update)
