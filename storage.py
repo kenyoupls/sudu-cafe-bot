@@ -1314,14 +1314,14 @@ class LocalJsonStore:
 
             # Column B is source of truth — no backfill from date columns
 
-            _time.sleep(2)  # Rate limit gap
+            _time.sleep(0.5)  # Small gap to avoid rate limit
 
             # Shopping List
             shopping = self._sheets.read_shopping_from_sheet()
             if shopping is not None:
                 self.data["shopping_list"] = shopping
 
-            _time.sleep(2)
+            _time.sleep(0.5)
 
             # Events
             events = self._sheets.read_events_from_sheet()
