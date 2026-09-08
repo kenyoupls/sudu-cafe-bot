@@ -3639,8 +3639,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if replied_text:
             reply_context = f"{replied_name}: {replied_text}"
 
-    # ─── Always refresh from sheet before answering (60s cooldown for rate limits) ──
-    store.refresh_if_stale(cooldown=60)
+    # ─── Refresh from sheet every time bot gets a message (no cooldown) ──
+    store.refresh_if_stale(cooldown=0)
 
     # ─── Send to AI — get reply + actions ──────────────────
     is_staff = _is_staff_group(update)
