@@ -593,84 +593,84 @@ class SheetsSync:
 
     def write_stock_item(self, item: str, qty: str, date_str: str):
         """Write a single stock item to the Sheet (update or add row/col)."""
-        ws = self._get_ws("Stock")
-        if not ws:
-            return
-        try:
-            from datetime import datetime as _dt
-            existing = ws.get_all_values()
-            logger.info(f"[write_stock_item] item={item!r}, qty={qty!r}, date_str={date_str!r}")
-            logger.info(f"[write_stock_item] header={existing[0] if existing else 'EMPTY'}")
-
-            if not existing or not existing[0]:
-                # Sheet is empty — create header + first row
-                # Layout: Item | Current Stock | date_str
-                ws.update("A1", [["Item", "Current Stock", date_str], [item, "", qty]])
-                ws.format("A1:C1", {"textFormat": {"bold": True}})
+        import time as _time
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            ws = self._get_ws("Stock")
+            if not ws:
                 return
-
-            header = existing[0]
-
-            # Ensure "Current Stock" occupies column B — insert if missing
-            has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
-            if not has_current_col:
-                # Insert a blank column at position 2 (becomes column B)
-                ws.insert_cols([[""]], col=2)
-                ws.update_acell("B1", "Current Stock")
-                # Re-read the sheet so the rest of this function sees the updated layout
+            try:
                 existing = ws.get_all_values()
-                header = existing[0] if existing else []
+                logger.info(f"[write_stock_item] attempt={attempt}, item={item!r}, qty={qty!r}, date_str={date_str!r}")
+                logger.info(f"[write_stock_item] header={existing[0] if existing else 'EMPTY'}")
 
-            # Find or create date column (date columns start at column C / index 2)
-            if date_str in header[2:]:
-                col_idx = header.index(date_str, 2)
-                logger.info(f"[write_stock_item] Found existing date column at col_idx={col_idx}")
-            else:
-                # Insert a blank column at position 3 (becomes column C — newest date first)
-                col_idx = 2
-                ws.insert_cols([[""]], col=3)
-                ws.update_acell("C1", date_str)
-                # Re-read the sheet so item lookup below sees correct layout
-                existing = ws.get_all_values()
-                header = existing[0] if existing else []
-                logger.info(f"[write_stock_item] Created new date column, col_idx={col_idx}, new header={header}")
+                if not existing or not existing[0]:
+                    ws.update("A1", [["Item", "Current Stock", date_str], [item, "", qty]])
+                    ws.format("A1:C1", {"textFormat": {"bold": True}})
+                    return
 
-            # Find item row (by normalized name)
-            norm = normalize_item_name(item)
-            row_idx = None
-            for i, row in enumerate(existing[1:], 1):
-                if row and normalize_item_name(row[0]) == norm:
-                    row_idx = i
-                    break
+                header = existing[0]
 
-            # Substring fallback (handles AI sending shorter/longer name variants)
-            if row_idx is None and len(norm) >= 4:
+                has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
+                if not has_current_col:
+                    ws.insert_cols([[""]], col=2)
+                    ws.update_acell("B1", "Current Stock")
+                    existing = ws.get_all_values()
+                    header = existing[0] if existing else []
+
+                # Find or create date column (date columns start at column C / index 2)
+                if date_str in header[2:]:
+                    col_idx = header.index(date_str, 2)
+                    logger.info(f"[write_stock_item] Found existing date column at col_idx={col_idx}")
+                else:
+                    col_idx = 2
+                    ws.insert_cols([[""]], col=3)
+                    ws.update_acell("C1", date_str)
+                    existing = ws.get_all_values()
+                    header = existing[0] if existing else []
+                    logger.info(f"[write_stock_item] Created new date column, col_idx={col_idx}, new header={header}")
+
+                # Find item row (by normalized name)
+                norm = normalize_item_name(item)
+                row_idx = None
                 for i, row in enumerate(existing[1:], 1):
-                    if row:
-                        row_norm = normalize_item_name(row[0])
-                        if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
-                            row_idx = i
-                            break
+                    if row and normalize_item_name(row[0]) == norm:
+                        row_idx = i
+                        break
 
-            logger.info(f"[write_stock_item] norm={norm!r}, row_idx={row_idx}")
+                if row_idx is None and len(norm) >= 4:
+                    for i, row in enumerate(existing[1:], 1):
+                        if row:
+                            row_norm = normalize_item_name(row[0])
+                            if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
+                                row_idx = i
+                                break
 
-            if row_idx is not None:
-                # Update existing row
-                cell = gspread.utils.rowcol_to_a1(row_idx + 1, col_idx + 1)
-                ws.update_acell(cell, qty)
-                logger.info(f"[write_stock_item] Updated cell {cell} with {qty}")
-            else:
-                # Append new row
-                new_row = [""] * len(header)
-                new_row[0] = item
-                new_row[col_idx] = qty
-                ws.append_row(new_row)
-                logger.info(f"[write_stock_item] Appended new row for {item}")
+                logger.info(f"[write_stock_item] norm={norm!r}, row_idx={row_idx}")
 
-            ws.format("A1:Z1", {"textFormat": {"bold": True}})
+                if row_idx is not None:
+                    cell = gspread.utils.rowcol_to_a1(row_idx + 1, col_idx + 1)
+                    ws.update_acell(cell, qty)
+                    logger.info(f"[write_stock_item] Updated cell {cell} with {qty}")
+                else:
+                    new_row = [""] * len(header)
+                    new_row[0] = item
+                    new_row[col_idx] = qty
+                    ws.append_row(new_row)
+                    logger.info(f"[write_stock_item] Appended new row for {item}")
 
-        except Exception as e:
-            logger.error(f"[write_stock_item] FAILED for item={item!r}, qty={qty!r}, date={date_str!r}: {e}", exc_info=True)
+                ws.format("A1:Z1", {"textFormat": {"bold": True}})
+                return  # success — exit the retry loop
+
+            except Exception as e:
+                is_rate_limit = "429" in str(e) or "Quota exceeded" in str(e)
+                if is_rate_limit and attempt < max_retries:
+                    wait = 3 * (attempt + 1)  # 3s first retry, 6s second
+                    logger.warning(f"[write_stock_item] Rate limited (attempt {attempt}), retrying in {wait}s...")
+                    _time.sleep(wait)
+                    continue
+                logger.error(f"[write_stock_item] FAILED for item={item!r}, qty={qty!r}, date={date_str!r}: {e}", exc_info=True)
+                return
 
     def remove_stock_item(self, item: str):
         """Remove a stock item row from the Sheet."""
