@@ -2235,26 +2235,41 @@ class LocalJsonStore:
         result = []
         STOCK_MINIMUMS = self._get_stock_minimums()
         stock_current = self.data.get("stock_current", {})
-        seen = set()
+        seen_norms = set()
+
+        # 1. Check items in stock_current
         for item_name, qty in stock_current.items():
-            if item_name in seen:
+            item_norm = normalize_item_name(item_name)
+            if item_norm in seen_norms:
                 continue
             # Check if qty is a low/out string
             if str(qty).upper() in ("LOW", "OUT", "0"):
                 result.append((item_name, {"qty": str(qty)}))
-                seen.add(item_name)
+                seen_norms.add(item_norm)
                 continue
             # Check against minimums
-            item_norm = normalize_item_name(item_name)
             for min_name, min_data in STOCK_MINIMUMS.items():
                 if normalize_item_name(min_name) == item_norm:
                     try:
                         if int(qty) < min_data.get("min", 0):
                             result.append((item_name, {"qty": str(qty)}))
-                            seen.add(item_name)
+                            seen_norms.add(item_norm)
                     except (ValueError, TypeError):
                         pass
                     break
+
+        # 2. Check items in Stock Minimums but MISSING from stock_current (empty Column B = 0)
+        for min_name, min_data in STOCK_MINIMUMS.items():
+            min_norm = normalize_item_name(min_name)
+            if min_norm in seen_norms:
+                continue
+            # Not in stock_current = empty Column B = 0
+            if not any(normalize_item_name(k) == min_norm for k in stock_current):
+                min_qty = min_data.get("min", 0)
+                if min_qty > 0:  # 0 stock is below any positive minimum
+                    result.append((min_name, {"qty": "0"}))
+                    seen_norms.add(min_norm)
+
         return result
 
     # ─── Operations Checklists ─────────────────────────────
@@ -2497,13 +2512,14 @@ class LocalJsonStore:
             min_norm = normalize_item_name(min_name)
             current_qty = stock_norm_map.get(min_norm)
 
+            # Empty Column B (None) = 0 stock, not "unknown"
             if current_qty is None:
-                continue  # No stock data — can't judge
-
-            try:
-                current_qty = int(current_qty)
-            except (ValueError, TypeError):
-                continue
+                current_qty = 0
+            else:
+                try:
+                    current_qty = int(current_qty)
+                except (ValueError, TypeError):
+                    current_qty = 0
 
             if current_qty < min_qty:
                 low_norms.add(min_norm)
