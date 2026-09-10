@@ -1345,7 +1345,82 @@ def refresh_holiday_cache() -> dict:
     return cache_data
 
 
-def get_upcoming_holidays(days_ahead: int = 14) -> list:
+def fetch_public_holidays(force: bool = False) -> list:
+    """Fetch MY + SG public holidays from Nager.Date API. Cached for 24h."""
+    import json as _json
+    import urllib.request
+    import urllib.error
+    from pathlib import Path
+    from datetime import timedelta
+
+    cache_file = Path(__file__).parent / "data" / "holidays.json"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check cache freshness
+    if not force and cache_file.exists():
+        try:
+            with open(cache_file) as f:
+                cache = _json.load(f)
+            fetched = cache.get("fetched_at", "")
+            if fetched:
+                fetched_dt = datetime.strptime(fetched, "%Y-%m-%d %H:%M")
+                if _now().replace(tzinfo=None) - fetched_dt < timedelta(hours=24):
+                    return cache.get("holidays", [])
+        except Exception:
+            pass  # stale or corrupt cache — re-fetch
+
+    # Fetch from API
+    holidays = []
+    current_year = _now().year
+    for year in [current_year, current_year + 1]:
+        for country, label in [("MY", "MY public holiday"), ("SG", "SG public holiday")]:
+            url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/{country}"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "CafeBot/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = _json.loads(resp.read().decode())
+                for h in data:
+                    holidays.append({
+                        "date": h["date"],
+                        "name": h.get("localName") or h.get("name", "Holiday"),
+                        "source": label,
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to fetch holidays for {country}/{year}: {e}")
+
+    # Deduplicate by date+name
+    seen = set()
+    unique = []
+    for h in holidays:
+        key = (h["date"], h["name"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(h)
+
+    # Save cache (even if partially failed — better than nothing)
+    if unique:
+        try:
+            cache_data = {
+                "fetched_at": _now().strftime("%Y-%m-%d %H:%M"),
+                "holidays": sorted(unique, key=lambda x: x["date"]),
+            }
+            with open(cache_file, "w") as f:
+                _json.dump(cache_data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write holiday cache: {e}")
+        return sorted(unique, key=lambda x: x["date"])
+
+    # If fetch failed entirely, try to return stale cache
+    if cache_file.exists():
+        try:
+            with open(cache_file) as f:
+                return _json.load(f).get("holidays", [])
+        except Exception:
+            pass
+    return []
+
+
+def get_upcoming_holidays(days_ahead: int = 90) -> list:
     """Read holiday cache + school holidays. Return holidays in the next N days."""
     import json as _json
     from pathlib import Path
@@ -1402,6 +1477,21 @@ def get_upcoming_holidays(days_ahead: int = 14) -> list:
                         upcoming.append(entry)
             except ValueError:
                 continue
+
+    # Public holidays from API (MY + SG)
+    try:
+        public = fetch_public_holidays()
+        for h in public:
+            try:
+                h_date = datetime.strptime(h["date"], "%Y-%m-%d").date()
+                if today <= h_date <= cutoff:
+                    # Avoid duplicates
+                    if not any(existing["date"] == h["date"] and existing["name"] == h["name"] for existing in upcoming):
+                        upcoming.append(h)
+            except (ValueError, KeyError):
+                continue
+    except Exception as e:
+        logger.warning(f"Public holiday fetch error: {e}")
 
     upcoming.sort(key=lambda x: x["date"])
     return upcoming

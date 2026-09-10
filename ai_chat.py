@@ -1260,14 +1260,14 @@ def _build_context(is_staff_group: bool = False) -> str:
     # Upcoming holidays
     try:
         from google_integration import get_upcoming_holidays
-        upcoming_holidays = get_upcoming_holidays(14)
+        upcoming_holidays = get_upcoming_holidays(90)
         if upcoming_holidays:
             h_lines = []
             for h in upcoming_holidays:
                 end = f" to {h['end_date']}" if h.get('end_date') else ""
                 source = f" ({h.get('source', '')})" if h.get('source') else ""
                 h_lines.append(f"  {h['date']}{end}: {h['name']}{source}")
-            parts.append("UPCOMING HOLIDAYS (next 14 days):\n" + "\n".join(h_lines))
+            parts.append("UPCOMING HOLIDAYS & PUBLIC HOLIDAYS:\n" + "\n".join(h_lines))
     except ImportError:
         pass
     except Exception as e:
@@ -1414,10 +1414,10 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     # Upcoming holidays
     try:
         from google_integration import get_upcoming_holidays
-        holidays = get_upcoming_holidays(14)
+        holidays = get_upcoming_holidays(90)
         if holidays:
-            h_list = [f"{h['date']}: {h['name']}" for h in holidays[:5]]
-            parts.append("UPCOMING HOLIDAYS: " + "; ".join(h_list))
+            h_list = [f"{h['date']}: {h['name']}" for h in holidays[:10]]
+            parts.append("UPCOMING HOLIDAYS & PUBLIC HOLIDAYS: " + "; ".join(h_list))
     except Exception:
         pass
 
