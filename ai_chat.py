@@ -1260,7 +1260,7 @@ def _build_context(is_staff_group: bool = False) -> str:
     # Upcoming holidays
     try:
         from google_integration import get_upcoming_holidays
-        upcoming_holidays = get_upcoming_holidays(90)
+        upcoming_holidays = get_upcoming_holidays(180)
         if upcoming_holidays:
             h_lines = []
             for h in upcoming_holidays:
@@ -1414,7 +1414,7 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     # Upcoming holidays
     try:
         from google_integration import get_upcoming_holidays
-        holidays = get_upcoming_holidays(90)
+        holidays = get_upcoming_holidays(180)
         if holidays:
             h_list = [f"{h['date']}: {h['name']}" for h in holidays[:10]]
             parts.append("UPCOMING HOLIDAYS & PUBLIC HOLIDAYS: " + "; ".join(h_list))
