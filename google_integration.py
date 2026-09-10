@@ -1478,7 +1478,20 @@ def get_upcoming_holidays(days_ahead: int = 90) -> list:
             except ValueError:
                 continue
 
-    # Public holidays from API (MY + SG)
+    # Malaysia public holidays from config (hardcoded, reliable)
+    for year in range(current_year, current_year + 2):
+        my_holidays = getattr(config, f"MY_PUBLIC_HOLIDAYS_{year}", [])
+        for h_date_str, h_name in my_holidays:
+            try:
+                h_date = datetime.strptime(h_date_str, "%Y-%m-%d").date()
+                if today <= h_date <= cutoff:
+                    entry = {"date": h_date_str, "name": h_name, "source": "MY public holiday"}
+                    if not any(h["date"] == h_date_str and h["name"] == h_name for h in upcoming):
+                        upcoming.append(entry)
+            except ValueError:
+                continue
+
+    # SG public holidays from API (Nager.Date — free, no key needed)
     try:
         public = fetch_public_holidays()
         for h in public:

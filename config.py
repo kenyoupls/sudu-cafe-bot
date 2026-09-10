@@ -201,6 +201,103 @@ SCHOOL_HOLIDAYS_2027 = [
 
 SCHOOL_HOLIDAY_REMINDER_MONTH = 10  # October — remind about upcoming year-end holidays
 
+# Malaysia federal public holidays — hardcoded from official calendar
+# Islamic dates are tentative (subject to JAKIM announcement)
+# Format: list of (date, holiday_name) tuples
+MY_PUBLIC_HOLIDAYS_2026 = [
+    ("2026-01-01", "New Year's Day"),
+    ("2026-02-01", "Thaipusam"),
+    ("2026-02-17", "Chinese New Year"),
+    ("2026-02-18", "Chinese New Year Holiday"),
+    ("2026-03-07", "Nuzul Al-Quran"),
+    ("2026-03-21", "Hari Raya Aidilfitri"),
+    ("2026-03-22", "Hari Raya Aidilfitri Day 2"),
+    ("2026-05-01", "Labour Day"),
+    ("2026-05-27", "Hari Raya Haji"),
+    ("2026-05-31", "Wesak Day"),
+    ("2026-06-01", "Agong's Birthday"),
+    ("2026-06-17", "Awal Muharram"),
+    ("2026-08-25", "Prophet Muhammad's Birthday"),
+    ("2026-08-31", "Merdeka Day"),
+    ("2026-09-16", "Malaysia Day"),
+    ("2026-11-08", "Deepavali"),
+    ("2026-12-25", "Christmas Day"),
+]
+
+MY_PUBLIC_HOLIDAYS_2027 = [
+    ("2027-01-01", "New Year's Day"),
+    ("2027-02-06", "Chinese New Year"),
+    ("2027-02-07", "Chinese New Year Holiday"),
+    ("2027-03-10", "Hari Raya Aidilfitri"),
+    ("2027-03-11", "Hari Raya Aidilfitri Day 2"),
+    ("2027-05-01", "Labour Day"),
+    ("2027-05-17", "Hari Raya Haji"),
+    ("2027-05-20", "Wesak Day"),
+    ("2027-06-06", "Awal Muharram"),
+    ("2027-06-07", "Agong's Birthday"),
+    ("2027-08-15", "Prophet Muhammad's Birthday"),
+    ("2027-08-31", "Merdeka Day"),
+    ("2027-09-16", "Malaysia Day"),
+    ("2027-10-28", "Deepavali"),
+    ("2027-12-25", "Christmas Day"),
+]
+
+MY_PUBLIC_HOLIDAYS_2028 = [
+    ("2028-01-01", "New Year's Day"),
+    ("2028-01-26", "Chinese New Year"),
+    ("2028-01-27", "Chinese New Year Holiday"),
+    ("2028-02-09", "Thaipusam"),
+    ("2028-02-27", "Hari Raya Aidilfitri"),
+    ("2028-02-28", "Hari Raya Aidilfitri Day 2"),
+    ("2028-05-01", "Labour Day"),
+    ("2028-05-05", "Hari Raya Haji"),
+    ("2028-05-09", "Wesak Day"),
+    ("2028-05-26", "Awal Muharram"),
+    ("2028-06-05", "Agong's Birthday"),
+    ("2028-08-04", "Prophet Muhammad's Birthday"),
+    ("2028-08-31", "Merdeka Day"),
+    ("2028-09-16", "Malaysia Day"),
+    ("2028-10-17", "Deepavali"),
+    ("2028-12-25", "Christmas Day"),
+]
+
+MY_PUBLIC_HOLIDAYS_2029 = [
+    ("2029-01-01", "New Year's Day"),
+    ("2029-02-13", "Chinese New Year"),
+    ("2029-02-14", "Chinese New Year Holiday"),
+    ("2029-02-15", "Hari Raya Aidilfitri"),
+    ("2029-02-16", "Hari Raya Aidilfitri Day 2"),
+    ("2029-04-24", "Hari Raya Haji"),
+    ("2029-05-01", "Labour Day"),
+    ("2029-05-15", "Awal Muharram"),
+    ("2029-05-28", "Wesak Day"),
+    ("2029-06-04", "Agong's Birthday"),
+    ("2029-07-24", "Prophet Muhammad's Birthday"),
+    ("2029-08-31", "Merdeka Day"),
+    ("2029-09-16", "Malaysia Day"),
+    ("2029-11-05", "Deepavali"),
+    ("2029-12-25", "Christmas Day"),
+]
+
+MY_PUBLIC_HOLIDAYS_2030 = [
+    ("2030-01-01", "New Year's Day"),
+    ("2030-01-22", "Nuzul Al-Quran"),
+    ("2030-02-03", "Chinese New Year"),
+    ("2030-02-04", "Chinese New Year Holiday"),
+    ("2030-02-05", "Hari Raya Aidilfitri"),
+    ("2030-02-06", "Hari Raya Aidilfitri Day 2"),
+    ("2030-04-14", "Hari Raya Haji"),
+    ("2030-05-01", "Labour Day"),
+    ("2030-05-02", "Wesak Day"),
+    ("2030-05-04", "Awal Muharram"),
+    ("2030-06-03", "Agong's Birthday"),
+    ("2030-07-13", "Prophet Muhammad's Birthday"),
+    ("2030-08-31", "Merdeka Day"),
+    ("2030-09-16", "Malaysia Day"),
+    ("2030-10-26", "Deepavali"),
+    ("2030-12-25", "Christmas Day"),
+]
+
 # ─── Content Ideas Pool ─────────────────────────────────────
 CONTENT_IDEAS = [
     "📸 Behind-the-scenes: barista making latte art",
