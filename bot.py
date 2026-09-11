@@ -1205,7 +1205,7 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _fix_receipt_total(receipt_data)
                 _fix_receipt_paid_by(receipt_data, name)
                 # Auto-apply saved item name corrections
-                _corrections = store.apply_receipt_corrections(receipt_data.get("items", []))
+                _corrections_applied = store.apply_receipt_corrections(receipt_data.get("items", []))
                 _r_total = float(receipt_data.get('total') or 0)
                 _r_subtotal = float(receipt_data.get('subtotal') or 0)
                 _r_tax = float(receipt_data.get('tax') or 0)
@@ -1215,7 +1215,7 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          "receipt", chat_id, msg_id)
 
                 new_items = _detect_new_items_list(receipt_data.get("items", []))
-                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
+                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections_applied)
 
                 sent_msg = await update.message.reply_text(
                     confirm_msg,
@@ -1504,7 +1504,7 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          "receipt", chat_id, msg_id)
 
                 new_items = _detect_new_items_list(receipt_data.get("items", []))
-                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
+                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections_applied)
 
                 sent_msg = await msg.reply_text(
                     confirm_msg,
@@ -1692,7 +1692,7 @@ def _fix_receipt_paid_by(receipt_data: dict, sender_name: str):
         receipt_data["paid_by"] = sender_name
 
 
-def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None) -> str:
+def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None, corrections=None) -> str:
     """Build the receipt confirmation message text from receipt_data."""
     _r_total = float(receipt_data.get('total') or receipt_data.get('subtotal') or 0)
     _r_subtotal = float(receipt_data.get('subtotal') or 0)
@@ -1728,6 +1728,10 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None) ->
         confirm_msg += "\n\n\U0001f195 *New items — classify before confirming:*"
         for ni in new_items:
             confirm_msg += f"\n  • {ni['name']}"
+    if corrections:
+        confirm_msg += "\n\n🔄 *Auto-corrected from memory:*"
+        for old_n, new_n in corrections:
+            confirm_msg += f"\n  • {old_n} → {new_n}"
     confirm_msg += "\n\n_Reply 'yes' to confirm, or tell me what to change (e.g. 'paid by Eric')._"
     return confirm_msg
 
@@ -3715,7 +3719,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             receipt_data["paid_by"] = extra_info
 
                         new_items = _detect_new_items_list(receipt_data.get("items", []))
-                        confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
+                        confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections_applied)
 
                         sent_msg = await update.message.reply_text(
                             confirm_msg,

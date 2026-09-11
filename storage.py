@@ -1742,6 +1742,24 @@ class LocalJsonStore:
                 applied.append((old, item["name"]))
         return applied
 
+    def clear_receipt_corrections(self):
+        """Clear all saved receipt corrections."""
+        self.data["receipt_corrections"] = {}
+        self._save_local_only()
+
+    def get_receipt_corrections(self) -> dict:
+        """Return the current receipt corrections dictionary."""
+        return dict(self.data.get("receipt_corrections", {}))
+
+    def remove_receipt_correction(self, key: str):
+        """Remove a single receipt correction by key."""
+        corrections = self.data.get("receipt_corrections", {})
+        # Try exact key, then lowercase
+        removed = corrections.pop(key, None)
+        if removed is None:
+            corrections.pop(key.lower(), None)
+        self._save_local_only()
+
     def is_known_oneoff(self, item: str) -> bool:
         """Check if item was previously marked as one-off."""
         norm = normalize_item_name(item)
