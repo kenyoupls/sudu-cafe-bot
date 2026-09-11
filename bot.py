@@ -3575,8 +3575,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                             cat_label = ITEM_CATEGORIES[new_cat]
                                             change_descriptions.append(
                                                 f"{items[idx].get('name', '?')} category → {cat_label}")
-                        # Recalculate total from items after item-level changes
-                        _fix_receipt_total_from_items(rd)
+                        # Only recalculate total when items are added or removed
+                        # (qty/name/price corrections fix AI misreads — receipt total is ground truth)
+                        has_add_remove = any(
+                            ic.get("action") in ("add", "remove") for ic in value
+                        )
+                        if has_add_remove:
+                            _fix_receipt_total_from_items(rd)
 
                 if change_descriptions:
                     # Re-detect new items with updated names
