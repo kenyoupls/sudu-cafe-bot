@@ -2235,17 +2235,18 @@ class LocalJsonStore:
         result = []
         STOCK_MINIMUMS = self._get_stock_minimums()
         stock_current = self.data.get("stock_current", {})
-        seen_norms = set()
+        seen_names = set()  # use original names (lowered), not normalized — avoids collision
 
         # 1. Check items in stock_current
         for item_name, qty in stock_current.items():
             item_norm = normalize_item_name(item_name)
-            if item_norm in seen_norms:
+            item_key = item_name.strip().lower()
+            if item_key in seen_names:
                 continue
             # Check if qty is a low/out string
             if str(qty).upper() in ("LOW", "OUT", "0"):
                 result.append((item_name, {"qty": str(qty)}))
-                seen_norms.add(item_norm)
+                seen_names.add(item_key)
                 continue
             # Check against minimums
             for min_name, min_data in STOCK_MINIMUMS.items():
@@ -2253,7 +2254,7 @@ class LocalJsonStore:
                     try:
                         if int(qty) < min_data.get("min", 0):
                             result.append((item_name, {"qty": str(qty)}))
-                            seen_norms.add(item_norm)
+                            seen_names.add(item_key)
                     except (ValueError, TypeError):
                         pass
                     break
@@ -2261,14 +2262,15 @@ class LocalJsonStore:
         # 2. Check items in Stock Minimums but MISSING from stock_current (empty Column B = 0)
         for min_name, min_data in STOCK_MINIMUMS.items():
             min_norm = normalize_item_name(min_name)
-            if min_norm in seen_norms:
+            min_key = min_name.strip().lower()
+            if min_key in seen_names:
                 continue
             # Not in stock_current = empty Column B = 0
             if not any(normalize_item_name(k) == min_norm for k in stock_current):
                 min_qty = min_data.get("min", 0)
                 if min_qty > 0:  # 0 stock is below any positive minimum
                     result.append((min_name, {"qty": "0"}))
-                    seen_norms.add(min_norm)
+                    seen_names.add(min_key)
 
         return result
 
