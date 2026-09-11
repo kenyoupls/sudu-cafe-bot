@@ -1204,6 +1204,8 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if receipt_data:
                 _fix_receipt_total(receipt_data)
                 _fix_receipt_paid_by(receipt_data, name)
+                # Auto-apply saved item name corrections
+                _corrections = store.apply_receipt_corrections(receipt_data.get("items", []))
                 _r_total = float(receipt_data.get('total') or 0)
                 _r_subtotal = float(receipt_data.get('subtotal') or 0)
                 _r_tax = float(receipt_data.get('tax') or 0)
@@ -1495,6 +1497,8 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if receipt_data:
                 _fix_receipt_total(receipt_data)
                 _fix_receipt_paid_by(receipt_data, name)
+                # Auto-apply saved item name corrections
+                _corrections = store.apply_receipt_corrections(receipt_data.get("items", []))
                 remember(name, f"[Receipt Video: {receipt_data.get('supplier', '?')} "
                          f"RM{receipt_data.get('total', 0):.2f}]",
                          "receipt", chat_id, msg_id)
@@ -3515,6 +3519,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     old_name = items[idx].get("name", "?")
                                     items[idx]["name"] = str(item_change["name"])
                                     change_descriptions.append(f"{old_name} → {item_change['name']}")
+                                    # Save correction for future receipts
+                                    if old_name and old_name != "?" and str(item_change["name"]).strip():
+                                        store.save_receipt_correction(old_name, str(item_change["name"]))
                                 if "category" in item_change:
                                     from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
                                     new_cat = str(item_change["category"]).lower().strip()
@@ -3665,6 +3672,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if receipt_data:
                         _fix_receipt_total(receipt_data)
                         _fix_receipt_paid_by(receipt_data, name)
+                        # Auto-apply saved item name corrections
+                        _corrections = store.apply_receipt_corrections(receipt_data.get("items", []))
 
                         # If user tagged with extra info like "by Eric", set paid_by
                         if extra_info and not receipt_data.get("paid_by"):

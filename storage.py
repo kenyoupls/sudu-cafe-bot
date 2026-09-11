@@ -1512,6 +1512,7 @@ class LocalJsonStore:
             "last_full_count": {},      # {item_name: {"qty": int, "date": "YYYY-MM-DD"}}
             "oneoff_items": {},         # For Phase 7 later
             "receipt_hashes": {},       # {hash_key: {supplier, date, total, item_count, recorded_by, recorded_at}}
+            "receipt_corrections": {},  # {normalized_or_exact_old_name: preferred_new_name}
         }
 
     # ─── Stock ──────────────────────────────────────────────
@@ -1698,6 +1699,48 @@ class LocalJsonStore:
                 "last_purchased": now_str,
             }
         self._save_local_only()
+
+    def save_receipt_correction(self, old_name: str, new_name: str):
+        """Save a receipt item name correction for future auto-apply.
+        Stored as normalized_old → preferred_new_name."""
+        if "receipt_corrections" not in self.data:
+            self.data["receipt_corrections"] = {}
+        # Normalize the old name for fuzzy matching
+        norm_old = normalize_item_name(old_name)
+        if not norm_old or not new_name.strip():
+            return
+        self.data["receipt_corrections"][norm_old] = new_name.strip()
+        # Also store exact lowercase for direct match
+        exact_old = old_name.strip().lower()
+        if exact_old != norm_old:
+            self.data["receipt_corrections"][exact_old] = new_name.strip()
+        self._save_local_only()
+
+    def apply_receipt_corrections(self, items: list) -> list:
+        """Auto-apply saved corrections to receipt item names.
+        Returns the items list (modified in place) and a list of corrections made."""
+        corrections = self.data.get("receipt_corrections", {})
+        if not corrections:
+            return []
+        applied = []
+        for item in items:
+            name = item.get("name", "")
+            if not name:
+                continue
+            # Try exact lowercase match first
+            exact_key = name.strip().lower()
+            if exact_key in corrections:
+                old = name
+                item["name"] = corrections[exact_key]
+                applied.append((old, item["name"]))
+                continue
+            # Try normalized match
+            norm_key = normalize_item_name(name)
+            if norm_key in corrections:
+                old = name
+                item["name"] = corrections[norm_key]
+                applied.append((old, item["name"]))
+        return applied
 
     def is_known_oneoff(self, item: str) -> bool:
         """Check if item was previously marked as one-off."""
