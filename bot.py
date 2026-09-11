@@ -3498,40 +3498,33 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         for item_change in value:
                             items = rd.get("items", [])
 
-                            # Resolve target item: prefer name matching over index
-                            idx = None
+                            # Resolve target item(s): prefer name matching over index
+                            from storage import normalize_item_name
                             match_str = item_change.get("match", "").strip().lower()
+                            matched_indices = []
 
                             if match_str and items:
-                                # Find best matching item by substring
-                                from storage import normalize_item_name
-                                best_idx = None
-                                best_score = 0
+                                # Find ALL matching items by substring
                                 for i, itm in enumerate(items):
                                     itm_name = (itm.get("name") or "").lower()
                                     itm_norm = normalize_item_name(itm_name)
-                                    # Check if match string is a substring of item name
                                     if match_str in itm_name or match_str in itm_norm:
-                                        # Prefer longer matches (more specific)
-                                        score = len(match_str) / max(len(itm_name), 1)
-                                        if score > best_score:
-                                            best_score = score
-                                            best_idx = i
-                                if best_idx is not None:
-                                    idx = best_idx
+                                        matched_indices.append(i)
 
                             # Fallback to AI-provided index
-                            if idx is None:
+                            if not matched_indices:
                                 idx = item_change.get("index")
                                 if idx is not None:
                                     try:
                                         idx = int(idx)
+                                        if 0 <= idx < len(items):
+                                            matched_indices = [idx]
                                     except (ValueError, TypeError):
-                                        idx = None
+                                        pass
 
                             # For single-item receipts with no match, default to 0
-                            if idx is None and len(items) == 1 and item_change.get("action") != "add":
-                                idx = 0
+                            if not matched_indices and len(items) == 1 and item_change.get("action") != "add":
+                                matched_indices = [0]
 
                             if item_change.get("action") == "add":
                                 new_item = {
@@ -3542,35 +3535,46 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                 }
                                 items.append(new_item)
                                 change_descriptions.append(f"Added: {new_item['name']}")
-                            elif item_change.get("action") == "remove" and idx is not None and 0 <= idx < len(items):
-                                removed = items.pop(idx)
-                                change_descriptions.append(f"Removed: {removed.get('name', '?')}")
-                            elif idx is not None and 0 <= idx < len(items):
-                                if "qty" in item_change:
-                                    items[idx]["qty"] = int(item_change["qty"])
-                                    change_descriptions.append(
-                                        f"{items[idx].get('name', '?')} qty → {item_change['qty']}")
-                                if "price" in item_change:
-                                    items[idx]["price"] = float(item_change["price"])
-                                    change_descriptions.append(
-                                        f"{items[idx].get('name', '?')} price → RM{float(item_change['price']):.2f}")
-                                if "name" in item_change:
-                                    old_name = items[idx].get("name", "?")
-                                    items[idx]["name"] = str(item_change["name"])
-                                    change_descriptions.append(f"{old_name} → {item_change['name']}")
-                                    # Save correction for future receipts
-                                    if old_name and old_name != "?" and str(item_change["name"]).strip():
-                                        store.save_receipt_correction(old_name, str(item_change["name"]))
-                                if "category" in item_change:
-                                    from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
-                                    new_cat = str(item_change["category"]).lower().strip()
-                                    if new_cat == "useables":
-                                        new_cat = "consumables"
-                                    if new_cat in ITEM_CATEGORIES:
-                                        items[idx]["category"] = new_cat
-                                        cat_label = ITEM_CATEGORIES[new_cat]
+                            elif item_change.get("action") == "remove":
+                                # Remove matched items (reverse order to keep indices valid)
+                                for idx in sorted(matched_indices, reverse=True):
+                                    if 0 <= idx < len(items):
+                                        removed = items.pop(idx)
+                                        change_descriptions.append(f"Removed: {removed.get('name', '?')}")
+                            elif matched_indices:
+                                # For name-only changes: apply to ALL matching items
+                                # For qty/price changes: apply to first match only
+                                is_name_only = "name" in item_change and "qty" not in item_change and "price" not in item_change
+                                targets = matched_indices if is_name_only else matched_indices[:1]
+
+                                for idx in targets:
+                                    if not (0 <= idx < len(items)):
+                                        continue
+                                    if "qty" in item_change:
+                                        items[idx]["qty"] = int(item_change["qty"])
                                         change_descriptions.append(
-                                            f"{items[idx].get('name', '?')} category → {cat_label}")
+                                            f"{items[idx].get('name', '?')} qty → {item_change['qty']}")
+                                    if "price" in item_change:
+                                        items[idx]["price"] = float(item_change["price"])
+                                        change_descriptions.append(
+                                            f"{items[idx].get('name', '?')} price → RM{float(item_change['price']):.2f}")
+                                    if "name" in item_change:
+                                        old_name = items[idx].get("name", "?")
+                                        items[idx]["name"] = str(item_change["name"])
+                                        change_descriptions.append(f"{old_name} → {item_change['name']}")
+                                        # Save correction for future receipts
+                                        if old_name and old_name != "?" and str(item_change["name"]).strip():
+                                            store.save_receipt_correction(old_name, str(item_change["name"]))
+                                    if "category" in item_change:
+                                        from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
+                                        new_cat = str(item_change["category"]).lower().strip()
+                                        if new_cat == "useables":
+                                            new_cat = "consumables"
+                                        if new_cat in ITEM_CATEGORIES:
+                                            items[idx]["category"] = new_cat
+                                            cat_label = ITEM_CATEGORIES[new_cat]
+                                            change_descriptions.append(
+                                                f"{items[idx].get('name', '?')} category → {cat_label}")
                         # Recalculate total from items after item-level changes
                         _fix_receipt_total_from_items(rd)
 
