@@ -1199,9 +1199,6 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ─── RECEIPT ───────────────────────────────────────
         if classification == "receipt":
             processing_msg = await update.message.reply_text("🧾 Processing receipt/invoice...")
-            # Reset tracking for new receipt conversation
-            ctx.chat_data["pending_receipt_msg_ids"] = []
-            _track_receipt_msg(ctx, processing_msg.message_id)
             receipt_data = await process_receipt(image_bytes, name, caption)
 
             if receipt_data:
@@ -1216,23 +1213,27 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          "receipt", chat_id, msg_id)
 
                 new_items = _detect_new_items_list(receipt_data.get("items", []))
-                ctx.chat_data["pending_new_items"] = new_items
                 confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
-
-                ctx.chat_data["pending_receipt"] = {
-                    "data": receipt_data,
-                    "image_bytes": image_bytes,
-                    "user": name,
-                    "caption": caption,
-                }
 
                 sent_msg = await update.message.reply_text(
                     confirm_msg,
                     reply_markup=_receipt_confirm_buttons(new_items),
                     parse_mode="Markdown",
                 )
-                ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
-                _track_receipt_msg(ctx, sent_msg.message_id)
+                # Store in multi-slot dict keyed by confirmation message ID
+                receipts = _get_pending_receipts(ctx)
+                # Limit to 5 pending receipts — expire oldest if needed
+                while len(receipts) >= 5:
+                    oldest_key = next(iter(receipts))
+                    receipts.pop(oldest_key)
+                receipts[sent_msg.message_id] = {
+                    "data": receipt_data,
+                    "image_bytes": image_bytes,
+                    "user": name,
+                    "caption": caption,
+                    "msg_ids": [processing_msg.message_id, sent_msg.message_id],
+                    "new_items": new_items,
+                }
             else:
                 await update.message.reply_text(
                     f"🧾 Couldn't read that receipt, {name}. "
@@ -1489,8 +1490,6 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # ─── RECEIPT VIDEO ─────────────────────────────
         if classification == "receipt":
             processing_msg = await msg.reply_text("🧾 Detected a receipt — extracting data...")
-            ctx.chat_data["pending_receipt_msg_ids"] = []
-            _track_receipt_msg(ctx, processing_msg.message_id)
             receipt_data = await process_receipt(video_bytes, name, caption, mime_type)
 
             if receipt_data:
@@ -1501,23 +1500,25 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          "receipt", chat_id, msg_id)
 
                 new_items = _detect_new_items_list(receipt_data.get("items", []))
-                ctx.chat_data["pending_new_items"] = new_items
                 confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
-
-                ctx.chat_data["pending_receipt"] = {
-                    "data": receipt_data,
-                    "image_bytes": video_bytes,
-                    "user": name,
-                    "caption": caption,
-                }
 
                 sent_msg = await msg.reply_text(
                     confirm_msg,
                     reply_markup=_receipt_confirm_buttons(new_items),
                     parse_mode="Markdown",
                 )
-                ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
-                _track_receipt_msg(ctx, sent_msg.message_id)
+                receipts = _get_pending_receipts(ctx)
+                while len(receipts) >= 5:
+                    oldest_key = next(iter(receipts))
+                    receipts.pop(oldest_key)
+                receipts[sent_msg.message_id] = {
+                    "data": receipt_data,
+                    "image_bytes": video_bytes,
+                    "user": name,
+                    "caption": caption,
+                    "msg_ids": [processing_msg.message_id, sent_msg.message_id],
+                    "new_items": new_items,
+                }
             else:
                 await msg.reply_text(
                     f"🧾 Couldn't read that receipt from the video, {name}. "
@@ -1586,22 +1587,81 @@ def _fix_receipt_total(receipt_data: dict):
         receipt_data['subtotal'] = total
 
 
-def _track_receipt_msg(ctx, msg_id: int):
-    """Track a bot message ID as part of the receipt conversation.
+def _track_receipt_msg(ctx, msg_id: int, receipt_key: int = None):
+    """Track a bot message ID as part of a receipt conversation.
     Users can reply to ANY of these and it counts as a receipt reply."""
+    if receipt_key is not None:
+        receipts = _get_pending_receipts(ctx)
+        if receipt_key in receipts:
+            ids = receipts[receipt_key].setdefault("msg_ids", [])
+            if msg_id not in ids:
+                ids.append(msg_id)
+            if len(ids) > 20:
+                receipts[receipt_key]["msg_ids"] = ids[-20:]
+            return
+    # Fallback: old-style tracking (shouldn't happen after migration)
     ids = ctx.chat_data.setdefault("pending_receipt_msg_ids", [])
     if msg_id not in ids:
         ids.append(msg_id)
-    # Keep list bounded
     if len(ids) > 20:
         ctx.chat_data["pending_receipt_msg_ids"] = ids[-20:]
 
 
-def _clear_receipt_tracking(ctx):
-    """Clear all receipt tracking state after confirmation or cancellation."""
+def _clear_receipt_tracking(ctx, receipt_key: int = None):
+    """Clear receipt tracking state after confirmation or cancellation."""
+    if receipt_key is not None:
+        receipts = ctx.chat_data.get("pending_receipts", {})
+        receipts.pop(receipt_key, None)
+        if not receipts:
+            ctx.chat_data.pop("pending_receipts", None)
+    # Always clean old-format keys
     ctx.chat_data.pop("pending_receipt", None)
     ctx.chat_data.pop("pending_receipt_msg_id", None)
     ctx.chat_data.pop("pending_receipt_msg_ids", None)
+    ctx.chat_data.pop("pending_receipt_changing", None)
+
+
+def _get_pending_receipts(ctx) -> dict:
+    """Return the pending_receipts dict, migrating old single-slot format if found."""
+    old = ctx.chat_data.get("pending_receipt")
+    if old and "pending_receipts" not in ctx.chat_data:
+        old_msg_id = ctx.chat_data.get("pending_receipt_msg_id")
+        if old_msg_id:
+            ctx.chat_data["pending_receipts"] = {
+                old_msg_id: {
+                    "data": old["data"],
+                    "image_bytes": old["image_bytes"],
+                    "user": old["user"],
+                    "caption": old.get("caption", ""),
+                    "msg_ids": list(ctx.chat_data.get("pending_receipt_msg_ids", [])),
+                    "new_items": list(ctx.chat_data.get("pending_new_items", [])),
+                }
+            }
+        ctx.chat_data.pop("pending_receipt", None)
+        ctx.chat_data.pop("pending_receipt_msg_id", None)
+        ctx.chat_data.pop("pending_receipt_msg_ids", None)
+        ctx.chat_data.pop("pending_new_items", None)
+    return ctx.chat_data.setdefault("pending_receipts", {})
+
+
+def _get_receipt_for_reply(ctx, reply_msg_id: int):
+    """Find which pending receipt a reply belongs to by scanning msg_ids.
+    Returns (receipt_key, receipt_dict) or (None, None)."""
+    receipts = _get_pending_receipts(ctx)
+    for key, rcpt in receipts.items():
+        if reply_msg_id in rcpt.get("msg_ids", []) or reply_msg_id == key:
+            return key, rcpt
+    return None, None
+
+
+def _get_latest_receipt(ctx):
+    """Return the most recently added pending receipt.
+    Returns (receipt_key, receipt_dict) or (None, None)."""
+    receipts = _get_pending_receipts(ctx)
+    if not receipts:
+        return None, None
+    key = list(receipts.keys())[-1]
+    return key, receipts[key]
 
 
 def _fix_receipt_total_from_items(receipt_data: dict):
@@ -1868,15 +1928,26 @@ async def cb_rcpnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return
 
-    new_items = ctx.chat_data.get("pending_new_items", [])
+    receipt_key = query.message.message_id
+    receipts = _get_pending_receipts(ctx)
+    pending_entry = receipts.get(receipt_key)
+    new_items = pending_entry.get("new_items", []) if pending_entry else ctx.chat_data.get("pending_new_items", [])
     if idx >= len(new_items):
         return
 
     new_items[idx]["choice"] = choice
-    ctx.chat_data["pending_new_items"] = new_items
+    if pending_entry:
+        pending_entry["new_items"] = new_items
+    else:
+        ctx.chat_data["pending_new_items"] = new_items
 
     # Re-render the confirmation message with updated buttons
-    pending = ctx.chat_data.get("pending_receipt")
+    pending = {
+        "data": pending_entry["data"],
+        "image_bytes": pending_entry["image_bytes"],
+        "user": pending_entry["user"],
+        "caption": pending_entry.get("caption", ""),
+    } if pending_entry else ctx.chat_data.get("pending_receipt")
     if pending:
         name = pending.get("user", "")
         confirm_msg = _build_receipt_confirm_msg(pending["data"], name, new_items=new_items)
@@ -1893,14 +1964,20 @@ async def cb_duplicate_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     choice = query.data.split(":", 1)[1]  # "save" or "skip"
-    pending = ctx.chat_data.get("pending_receipt")
+    receipt_key, pending_entry = _get_latest_receipt(ctx)
+    pending = {
+        "data": pending_entry["data"],
+        "image_bytes": pending_entry["image_bytes"],
+        "user": pending_entry["user"],
+        "caption": pending_entry.get("caption", ""),
+    } if pending_entry else ctx.chat_data.get("pending_receipt")
 
     if not pending:
         await query.edit_message_text("⚠️ No pending receipt to process.")
         return
 
     if choice == "skip":
-        _clear_receipt_tracking(ctx)
+        _clear_receipt_tracking(ctx, receipt_key=receipt_key)
         await query.edit_message_text("🚫 Receipt skipped — duplicate not saved.")
         return
 
@@ -1908,7 +1985,7 @@ async def cb_duplicate_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = user_name(update)
     # Route to the shared confirmation logic
     await query.edit_message_text("⏳ Saving receipt (confirmed not a duplicate)...")
-    await _confirm_receipt(pending, name, update, ctx, skip_duplicate_check=True)
+    await _confirm_receipt(pending, name, update, ctx, skip_duplicate_check=True, receipt_key=receipt_key)
 
 
 def _merge_receipt_items(items: list) -> list:
@@ -1939,7 +2016,8 @@ def _merge_receipt_items(items: list) -> list:
 
 async def _confirm_receipt(pending: dict, confirmed_by: str,
                            update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                           skip_duplicate_check: bool = False):
+                           skip_duplicate_check: bool = False,
+                           receipt_key: int = None):
     """Shared receipt confirmation logic — used by both button and reply."""
     receipt_data = pending["data"]
     image_bytes = pending["image_bytes"]
@@ -2113,7 +2191,9 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         results.append(f"⚠️ Partial save: {e}")
 
     # Apply pre-classified new item choices (from confirmation message buttons)
-    pre_classified = ctx.chat_data.get("pending_new_items", [])
+    pre_classified = pending.get("new_items", []) if pending else []
+    if not pre_classified:
+        pre_classified = ctx.chat_data.get("pending_new_items", [])
     if pre_classified:
         for ni in pre_classified:
             ni_name = ni.get("name", "")
@@ -2131,7 +2211,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         # Fallback for receipts that didn't go through the new flow
         await _detect_new_items(items, update, ctx)
 
-    _clear_receipt_tracking(ctx)
+    _clear_receipt_tracking(ctx, receipt_key=receipt_key)
 
     # Record receipt hash for duplicate detection
     try:
@@ -2161,7 +2241,19 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = query.data.split(":", 1)[1]
     name = user_name(update)
 
-    pending = ctx.chat_data.get("pending_receipt")
+    receipt_key = query.message.message_id
+    receipts = _get_pending_receipts(ctx)
+    pending_entry = receipts.get(receipt_key)
+    if pending_entry:
+        pending = {
+            "data": pending_entry["data"],
+            "image_bytes": pending_entry["image_bytes"],
+            "user": pending_entry["user"],
+            "caption": pending_entry.get("caption", ""),
+        }
+    else:
+        # Fallback: try old format
+        pending = ctx.chat_data.get("pending_receipt")
     if not pending:
         await query.edit_message_text("⚠️ No pending receipt to process.")
         return
@@ -2179,9 +2271,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         # Track this message so reply to it is also caught
-        ctx.chat_data["pending_receipt_msg_id"] = query.message.message_id
-        _track_receipt_msg(ctx, query.message.message_id)
-        ctx.chat_data["pending_receipt_changing"] = True
+        _track_receipt_msg(ctx, query.message.message_id, receipt_key=receipt_key)
         return
 
     if action == "chgcat":
@@ -2189,7 +2279,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "back":
-        new_items = ctx.chat_data.get("pending_new_items", [])
+        new_items = pending_entry.get("new_items", []) if pending_entry else ctx.chat_data.get("pending_new_items", [])
         confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"], new_items=new_items)
         await query.edit_message_text(
             confirm_msg,
@@ -2368,7 +2458,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await _detect_new_items(items, update, ctx)
 
-    _clear_receipt_tracking(ctx)
+    _clear_receipt_tracking(ctx, receipt_key=receipt_key)
 
     # Record receipt hash for duplicate detection
     try:
@@ -2395,7 +2485,15 @@ async def cb_receipt_chgcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show item picker for category change."""
     query = update.callback_query
     await query.answer()
-    pending = ctx.chat_data.get("pending_receipt")
+    receipt_key = query.message.message_id
+    receipts = _get_pending_receipts(ctx)
+    pending_entry = receipts.get(receipt_key)
+    pending = {
+        "data": pending_entry["data"],
+        "image_bytes": pending_entry["image_bytes"],
+        "user": pending_entry["user"],
+        "caption": pending_entry.get("caption", ""),
+    } if pending_entry else ctx.chat_data.get("pending_receipt")
     if not pending:
         await query.edit_message_text("⚠️ No pending receipt.")
         return
@@ -2425,7 +2523,15 @@ async def cb_catitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     idx = int(query.data.split(":", 1)[1])
-    pending = ctx.chat_data.get("pending_receipt")
+    receipt_key = query.message.message_id
+    receipts = _get_pending_receipts(ctx)
+    pending_entry = receipts.get(receipt_key)
+    pending = {
+        "data": pending_entry["data"],
+        "image_bytes": pending_entry["image_bytes"],
+        "user": pending_entry["user"],
+        "caption": pending_entry.get("caption", ""),
+    } if pending_entry else ctx.chat_data.get("pending_receipt")
     if not pending:
         await query.edit_message_text("⚠️ No pending receipt.")
         return
@@ -2459,7 +2565,15 @@ async def cb_setcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = query.data.split(":", 2)  # setcat:idx:category
     idx = int(parts[1])
     new_cat = parts[2]
-    pending = ctx.chat_data.get("pending_receipt")
+    receipt_key = query.message.message_id
+    receipts = _get_pending_receipts(ctx)
+    pending_entry = receipts.get(receipt_key)
+    pending = {
+        "data": pending_entry["data"],
+        "image_bytes": pending_entry["image_bytes"],
+        "user": pending_entry["user"],
+        "caption": pending_entry.get("caption", ""),
+    } if pending_entry else ctx.chat_data.get("pending_receipt")
     if not pending:
         await query.edit_message_text("⚠️ No pending receipt.")
         return
@@ -2471,7 +2585,7 @@ async def cb_setcat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     items[idx]["category"] = new_cat
     cat_label = ITEM_CATEGORIES.get(new_cat, new_cat)
     item_name = items[idx].get("name", "?")
-    new_items = ctx.chat_data.get("pending_new_items", [])
+    new_items = pending_entry.get("new_items", []) if pending_entry else ctx.chat_data.get("pending_new_items", [])
     confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"], new_items=new_items)
     await query.edit_message_text(
         f"✅ {item_name} → {cat_label}\n\n{confirm_msg}",
@@ -3269,26 +3383,59 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ─── Check for receipt confirmation / amendment ──
     # Catches: (a) reply to ANY bot message in the receipt conversation,
     #          OR (b) tagged bot while receipt is pending
-    _pending_rcpt_id = ctx.chat_data.get("pending_receipt_msg_id")
-    _rcpt_msg_ids = set(ctx.chat_data.get("pending_receipt_msg_ids", []))
-    if _pending_rcpt_id:
-        _rcpt_msg_ids.add(_pending_rcpt_id)
+    # Multi-receipt: find which receipt this reply/message belongs to
+    receipt_key = None
+    pending_entry = None
+    pending = None
+
     _reply_target = (
         update.message.reply_to_message.message_id
         if update.message.reply_to_message else None
     )
-    _is_reply_to_rcpt = (
-        _reply_target is not None
-        and bool(_rcpt_msg_ids)
-        and _reply_target in _rcpt_msg_ids
-    )
+
+    if _reply_target:
+        receipt_key, pending_entry = _get_receipt_for_reply(ctx, _reply_target)
+
+    _is_reply_to_rcpt = pending_entry is not None and _reply_target is not None
+
+    if pending_entry:
+        pending = {
+            "data": pending_entry["data"],
+            "image_bytes": pending_entry["image_bytes"],
+            "user": pending_entry["user"],
+            "caption": pending_entry.get("caption", ""),
+        }
+        _pending_rcpt_id = receipt_key
+    else:
+        # Fallback to old format
+        _pending_rcpt_id = ctx.chat_data.get("pending_receipt_msg_id")
+        _rcpt_msg_ids = set(ctx.chat_data.get("pending_receipt_msg_ids", []))
+        if _pending_rcpt_id:
+            _rcpt_msg_ids.add(_pending_rcpt_id)
+        if not _is_reply_to_rcpt:
+            _is_reply_to_rcpt = (
+                _reply_target is not None
+                and bool(_rcpt_msg_ids)
+                and _reply_target in _rcpt_msg_ids
+            )
+        pending = ctx.chat_data.get("pending_receipt")
+
     _is_tagged_with_pending = (
         _pending_rcpt_id
         and _bot_is_tagged(update, ctx)
-        and ctx.chat_data.get("pending_receipt")
+        and pending
     )
+    if not _is_reply_to_rcpt and _is_tagged_with_pending and not pending_entry:
+        # Tagged fallback with no reply: use latest pending receipt
+        receipt_key, pending_entry = _get_latest_receipt(ctx)
+        if pending_entry:
+            pending = {
+                "data": pending_entry["data"],
+                "image_bytes": pending_entry["image_bytes"],
+                "user": pending_entry["user"],
+                "caption": pending_entry.get("caption", ""),
+            }
     if _is_reply_to_rcpt or _is_tagged_with_pending:
-        pending = ctx.chat_data.get("pending_receipt")
         if not pending:
             await update.message.reply_text("⚠️ No pending receipt to process.")
             return
@@ -3313,7 +3460,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         action = ai_result.get("action", "unclear")
 
         if action == "confirm":
-            await _confirm_receipt(pending, name, update, ctx)
+            await _confirm_receipt(pending, name, update, ctx, receipt_key=receipt_key)
             return
 
         elif action == "change":
@@ -3384,15 +3531,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if change_descriptions:
                     # Re-detect new items with updated names
                     new_items = _detect_new_items_list(rd.get("items", []))
-                    ctx.chat_data["pending_new_items"] = new_items
+                    if pending_entry:
+                        pending_entry["new_items"] = new_items
+                        pending_entry["data"] = rd
+                    else:
+                        ctx.chat_data["pending_new_items"] = new_items
                     confirm_msg = _build_receipt_confirm_msg(rd, pending["user"], new_items=new_items)
                     sent_msg = await update.message.reply_text(
                         f"✅ Updated: {', '.join(change_descriptions)}\n\n{confirm_msg}",
                         reply_markup=_receipt_confirm_buttons(new_items),
                         parse_mode="Markdown",
                     )
-                    ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
-                    _track_receipt_msg(ctx, sent_msg.message_id)
+                    _track_receipt_msg(ctx, sent_msg.message_id, receipt_key=receipt_key)
                     return
 
         # action == "unclear" or no valid changes
@@ -3402,7 +3552,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• Say 'ok' or 'confirm' to save\n"
             "• Tap the buttons below the receipt",
         )
-        _track_receipt_msg(ctx, help_msg.message_id)
+        _track_receipt_msg(ctx, help_msg.message_id, receipt_key=receipt_key)
         return
 
     # ─── Check for sales confirmation / amendment (AI-powered) ──
@@ -3510,8 +3660,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 if classification == "receipt":
                     processing_msg = await update.message.reply_text("🧾 Processing receipt/invoice...")
-                    ctx.chat_data["pending_receipt_msg_ids"] = []
-                    _track_receipt_msg(ctx, processing_msg.message_id)
                     receipt_data = await process_receipt(image_bytes, name, combined_caption)
 
                     if receipt_data:
@@ -3523,23 +3671,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             receipt_data["paid_by"] = extra_info
 
                         new_items = _detect_new_items_list(receipt_data.get("items", []))
-                        ctx.chat_data["pending_new_items"] = new_items
                         confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items)
-
-                        ctx.chat_data["pending_receipt"] = {
-                            "data": receipt_data,
-                            "image_bytes": image_bytes,
-                            "user": name,
-                            "caption": combined_caption,
-                        }
 
                         sent_msg = await update.message.reply_text(
                             confirm_msg,
                             reply_markup=_receipt_confirm_buttons(new_items),
                             parse_mode="Markdown",
                         )
-                        ctx.chat_data["pending_receipt_msg_id"] = sent_msg.message_id
-                        _track_receipt_msg(ctx, sent_msg.message_id)
+                        receipts = _get_pending_receipts(ctx)
+                        while len(receipts) >= 5:
+                            oldest_key = next(iter(receipts))
+                            receipts.pop(oldest_key)
+                        receipts[sent_msg.message_id] = {
+                            "data": receipt_data,
+                            "image_bytes": image_bytes,
+                            "user": name,
+                            "caption": combined_caption,
+                            "msg_ids": [processing_msg.message_id, sent_msg.message_id],
+                            "new_items": new_items,
+                        }
                     else:
                         await update.message.reply_text(
                             f"🧾 Couldn't read that receipt, {name}. Try a clearer photo."
@@ -3624,7 +3774,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # Add any pending receipt/sales context if replying to bot's confirmation
         if replied.from_user and replied.from_user.id == ctx.bot.id:
-            pending_receipt = ctx.chat_data.get("pending_receipt")
+            _, _pending_rcpt_entry = _get_receipt_for_reply(ctx, replied.message_id)
+            if not _pending_rcpt_entry:
+                _, _pending_rcpt_entry = _get_latest_receipt(ctx)
+            pending_receipt = (
+                {"data": _pending_rcpt_entry["data"]} if _pending_rcpt_entry
+                else ctx.chat_data.get("pending_receipt")
+            )
             if pending_receipt and pending_receipt.get("data"):
                 rd = pending_receipt["data"]
                 items_desc = ", ".join(

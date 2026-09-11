@@ -37,7 +37,12 @@ logger = logging.getLogger(__name__)
 
 def _normalize_date(date_str: str) -> str:
     """Normalize any date format to dd/mm/yyyy (Malaysia standard).
-    Handles: YYYY-MM-DD, dd/mm/yy, dd/mm/yyyy, mm/dd/yy (with sanity check)."""
+    Handles: YYYY-MM-DD, dd/mm/yy, dd/mm/yyyy, mm/dd/yy (with sanity check).
+
+    The AI prompt asks for dd/mm/yyyy but sometimes returns ISO (YYYY-MM-DD).
+    When ISO is detected, we sanity-check by comparing with today's date —
+    if swapping month/day gives a date closer to today, we swap.
+    """
     date_str = str(date_str).strip()
     if not date_str:
         return ""
@@ -45,6 +50,15 @@ def _normalize_date(date_str: str) -> str:
     if "-" in date_str and date_str[:4].isdigit() and len(date_str) >= 10:
         try:
             dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+            # Sanity check: try swapped version (YYYY-DD-MM) if day <= 12
+            month_val = dt.month
+            day_val = dt.day
+            if day_val <= 12 and month_val != day_val:
+                dt_swapped = datetime(dt.year, day_val, month_val)
+                today = datetime.now()
+                # Pick whichever is closer to today
+                if abs((dt_swapped - today).days) < abs((dt - today).days):
+                    dt = dt_swapped
             return dt.strftime("%d/%m/%Y")
         except ValueError:
             pass
