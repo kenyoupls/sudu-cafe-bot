@@ -2527,12 +2527,14 @@ class LocalJsonStore:
             else:
                 ok_norms.add(min_norm)
 
-        # Build {norm: display_name} for low items (use the minimums display name)
-        low_display = {}
+        # Build list of (norm, display_name) for low items — list not dict,
+        # because multiple items can share the same normalized name
+        # (e.g. "Brown Boba (Jelly)" and "Brown Boba (Cook)" both → "brown boba")
+        low_display = []
         for min_name in STOCK_MINIMUMS:
             norm = normalize_item_name(min_name)
             if norm in low_norms:
-                low_display[norm] = min_name
+                low_display.append((norm, min_name))
 
         # Read existing items from sheet (or JSON cache if no sheets)
         existing_items = []
@@ -2555,11 +2557,13 @@ class LocalJsonStore:
                 continue  # restocked above minimum — remove
             final_items.append(item)
 
-        # Add low-stock items not already present
-        final_norms = {normalize_item_name(i) for i in final_items}
-        for norm, display in low_display.items():
-            if norm not in final_norms:
+        # Add low-stock items not already present (use original names to dedup,
+        # not normalized — so "Brown Boba (Jelly)" and "Brown Boba (Cook)" both appear)
+        final_names_lower = {i.strip().lower() for i in final_items}
+        for norm, display in low_display:
+            if display.strip().lower() not in final_names_lower:
                 final_items.append(display)
+                final_names_lower.add(display.strip().lower())
 
         logger.info(f"_rebuild_shopping_list: {len(low_norms)} low, {len(ok_norms)} ok, final list: {final_items}")
 
