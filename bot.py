@@ -3492,8 +3492,43 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     # ── Item-level changes (qty, price, name, add, remove) ──
                     elif field == "items" and isinstance(value, list):
                         for item_change in value:
-                            idx = item_change.get("index")
                             items = rd.get("items", [])
+
+                            # Resolve target item: prefer name matching over index
+                            idx = None
+                            match_str = item_change.get("match", "").strip().lower()
+
+                            if match_str and items:
+                                # Find best matching item by substring
+                                from storage import normalize_item_name
+                                best_idx = None
+                                best_score = 0
+                                for i, itm in enumerate(items):
+                                    itm_name = (itm.get("name") or "").lower()
+                                    itm_norm = normalize_item_name(itm_name)
+                                    # Check if match string is a substring of item name
+                                    if match_str in itm_name or match_str in itm_norm:
+                                        # Prefer longer matches (more specific)
+                                        score = len(match_str) / max(len(itm_name), 1)
+                                        if score > best_score:
+                                            best_score = score
+                                            best_idx = i
+                                if best_idx is not None:
+                                    idx = best_idx
+
+                            # Fallback to AI-provided index
+                            if idx is None:
+                                idx = item_change.get("index")
+                                if idx is not None:
+                                    try:
+                                        idx = int(idx)
+                                    except (ValueError, TypeError):
+                                        idx = None
+
+                            # For single-item receipts with no match, default to 0
+                            if idx is None and len(items) == 1 and item_change.get("action") != "add":
+                                idx = 0
+
                             if item_change.get("action") == "add":
                                 new_item = {
                                     "name": item_change.get("name", "New item"),

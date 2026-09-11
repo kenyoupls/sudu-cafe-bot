@@ -1714,31 +1714,37 @@ async def classify_receipt_reply(user_reply: str, receipt_summary: str) -> dict:
         '  Multiple: {"action": "change", "changes": {"paid_by": "Eric", "total": 9.19}}\n\n'
 
         "=== CHANGE items (qty, price, name, add, remove) ===\n"
-        "Use 0-based index matching the Items list order.\n"
-        "If user doesn't say which item and there's only 1 item, use index 0.\n"
-        "If user mentions an item by name, match it to the correct index.\n\n"
+        "IMPORTANT: For each item change, include a 'match' field with part of the ORIGINAL item name you're targeting.\n"
+        "This is how we find the right item. The 'index' field is optional — 'match' is what matters.\n\n"
 
         "UNDERSTAND NATURAL LANGUAGE — these are all real examples:\n"
-        '  "the item is 1 bag of ice" → name: "Bag of Ice", qty: 1\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "name": "Bag of Ice", "qty": 1}]}}\n'
-        '  "quantity is 12 bottles of 1L" → qty: 12, name should include "1L"\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "qty": 12, "name": "Whipping Cream 1L"}]}}\n'
-        '  "its actually 5 packs" → qty: 5\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "qty": 5}]}}\n'
-        '  "item is a bag of ice" → rename to "Bag of Ice"\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "name": "Bag of Ice"}]}}\n'
-        '  "its whipping cream not whip cream" → rename\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "name": "Whipping Cream"}]}}\n'
-        '  "price is 24 each" → unit price change\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "price": 24.00}]}}\n'
-        '  "remove the second item" → remove\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 1, "action": "remove"}]}}\n'
-        '  "add 2 cups of syrup at rm5 each" → add\n'
+        '  "the item is 1 bag of ice" (only 1 item on receipt)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "ICE", "name": "Bag of Ice", "qty": 1}]}}\n'
+        '  "quantity is 12 bottles of 1L" (only 1 item on receipt)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "WHIP", "qty": 12, "name": "Whipping Cream 1L"}]}}\n'
+        '  "value blea is bleach" (matching VALUE BLEA on the receipt)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "VALUE BLEA", "name": "Bleach"}]}}\n'
+        '  "ayam brand is coconut milk" (matching AYAM BRAND COCONUT H)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "AYAM BRAND", "name": "Coconut Milk"}]}}\n'
+        '  "price is 24 each" (only 1 item)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "", "price": 24.00}]}}\n'
+        '  "remove the horeca" (matching HORECA PUR)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "HORECA", "action": "remove"}]}}\n'
+        '  "ignore dasani" (matching DASANI MIN)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "DASANI", "action": "remove"}]}}\n'
+        '  "add 2 cups of syrup at rm5 each"\n'
         '    → {"action": "change", "changes": {"items": [{"action": "add", "name": "Syrup", "qty": 2, "price": 5.00}]}}\n'
-        '  "change first item to consumables" → category change\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "category": "consumables"}]}}\n'
-        '  "pistachio is equipment" → category change by item name\n'
-        '    → {"action": "change", "changes": {"items": [{"index": 0, "category": "equipment"}]}}\n\n'
+        '  "change first item to consumables"\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "", "index": 0, "category": "consumables"}]}}\n'
+        '  "pistachio is equipment" (matching PISTACHIO on receipt)\n'
+        '    → {"action": "change", "changes": {"items": [{"match": "PISTACHIO", "category": "equipment"}]}}\n'
+        '  Multiple corrections in one message:\n'
+        '  "value blea is bleach, ayam brand is coconut milk, ignore horeca"\n'
+        '    → {"action": "change", "changes": {"items": [\n'
+        '        {"match": "VALUE BLEA", "name": "Bleach"},\n'
+        '        {"match": "AYAM BRAND", "name": "Coconut Milk"},\n'
+        '        {"match": "HORECA", "action": "remove"}\n'
+        '      ]}}\n\n'
 
         "KEY RULES:\n"
         "- Extract numbers from natural text: '12 bottles of 1L' → qty=12, '1 bag' → qty=1\n"
