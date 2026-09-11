@@ -5061,6 +5061,11 @@ def main():
 
     app.post_init = post_init
 
+    # One-time cleanup: clear bad receipt corrections from buggy session
+    if store.data.get("receipt_corrections"):
+        logger.info(f"Clearing {len(store.data['receipt_corrections'])} old receipt corrections (one-time cleanup)")
+        store.clear_receipt_corrections()
+
     # Force refresh holiday cache on startup
     try:
         from google_integration import refresh_holiday_cache
