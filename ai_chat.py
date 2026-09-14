@@ -2880,8 +2880,21 @@ async def process_receipt(
         '  - "equipment" = machines, tools, furniture, appliances\n'
         '  - "marketing" = signage, ads, merch, flyers, promo materials\n\n'
 
-        "ITEM NAMES — Be specific: 'Low Fat Milk 1L' not just 'Milk'. Include brand/size if visible.\n"
-        "  NEVER truncate or abbreviate item names with '...' or similar. Write the FULL name exactly as it appears on the receipt.\n\n"
+        "ITEM NAMES — Think like a human, not a scanner:\n"
+        "  - Receipts often use SHORT CODES, ABBREVIATIONS, or BRAND NAMES instead of the actual product\n"
+        "  - YOUR JOB: figure out what the product ACTUALLY IS and write the real product name\n"
+        "  - Examples of what receipts print vs what you should write:\n"
+        '    "BLEA" or "BLC" → "Bleach"\n'
+        '    "DASANI 1.5L" → "Mineral Water 1.5L"\n'
+        '    "NUTRIFRES O/CORDIAL" → "Orange Cordial"\n'
+        '    "NUTRIFRES B/CURRANT" → "Blackcurrant Cordial"\n'
+        '    "A.BRAND SWT CRM" → "Ayam Brand Sweet Corn Cream"\n'
+        '    "F&N CND MLK" → "F&N Condensed Milk"\n'
+        '    "TTL CLNR" → "Toilet Cleaner"\n'
+        "  - READ THE FULL LINE on the receipt — brand + description + size — to determine the actual product\n"
+        "  - Include size/volume if visible (e.g. '1L', '500ml', '1.5L')\n"
+        "  - If you genuinely cannot figure out the product name, write the receipt text as-is\n"
+        "  - NEVER truncate with '...' or abbreviate the name you write\n\n"
 
         "PRICE — VERY IMPORTANT:\n"
         '  - "price" = the UNIT PRICE for ONE single item, NOT the line total\n'
