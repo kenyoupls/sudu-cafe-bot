@@ -3491,13 +3491,34 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     if not (0 <= idx < len(items)):
                                         continue
                                     if "qty" in item_change and "price" not in item_change:
-                                        # Qty-only correction: line_total stays the same, recalculate unit price
+                                        # Smart qty correction: use receipt total to decide intent
                                         new_qty = int(item_change["qty"])
-                                        items[idx]["qty"] = new_qty
-                                        old_line_total = items[idx].get("line_total", float(items[idx].get("price", 0) or 0))
-                                        if new_qty > 0:
-                                            items[idx]["price"] = round(old_line_total / new_qty, 4)
-                                        # line_total unchanged — the receipt amount for this item hasn't changed
+                                        old_price = float(items[idx].get("price", 0) or 0)
+                                        old_line_total = float(items[idx].get("line_total", old_price * int(items[idx].get("qty", 1) or 1)))
+                                        receipt_total = float(rd.get("total") or 0)
+
+                                        # Sum all items' current line totals
+                                        current_sum = sum(
+                                            float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
+                                            for it in items
+                                        )
+                                        # Option A: keep line total (price on receipt was line total)
+                                        sum_keep = current_sum
+                                        # Option B: keep unit price (price on receipt was per-unit)
+                                        sum_multiply = current_sum - old_line_total + (new_qty * old_price)
+
+                                        if receipt_total > 0 and abs(sum_keep - receipt_total) <= abs(sum_multiply - receipt_total):
+                                            # Keep line total — recalculate unit price
+                                            items[idx]["qty"] = new_qty
+                                            if new_qty > 0:
+                                                items[idx]["price"] = round(old_line_total / new_qty, 4)
+                                            # line_total stays the same
+                                        else:
+                                            # Keep unit price — recalculate line total
+                                            items[idx]["qty"] = new_qty
+                                            items[idx]["line_total"] = round(new_qty * old_price, 2)
+                                            # price stays the same
+
                                         change_descriptions.append(
                                             f"{items[idx].get('name', '?')} qty → {item_change['qty']}")
                                     elif "qty" in item_change and "price" in item_change:
