@@ -2098,22 +2098,23 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
             supplier_check, receipt_date_check, receipt_total_check, items_check
         )
         if existing:
-            buttons = [
-                [
-                    InlineKeyboardButton("✅ Yes, save it", callback_data="dupcheck:save"),
-                    InlineKeyboardButton("❌ No, skip", callback_data="dupcheck:skip"),
-                ]
-            ]
-            await update.effective_message.reply_text(
-                f"⚠️ *Possible duplicate receipt detected!*\n\n"
+            _rid = receipt_data.get("receipt_id", "")
+            _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
+            dup_msg = await update.effective_message.reply_text(
+                f"⚠️ *Possible duplicate receipt detected!*{_rid_line}\n\n"
                 f"A receipt from *{existing.get('supplier', supplier_check)}* on {existing.get('date', receipt_date_check)} "
                 f"for RM{existing.get('total', receipt_total_check):.2f} ({existing.get('item_count', len(items_check))} items) "
                 f"was already saved by {existing.get('recorded_by', '?')}.\n\n"
-                f"Is this a *new* purchase or the same one?",
-                reply_markup=InlineKeyboardMarkup(buttons),
+                f"_Reply 'yes' to save anyway, or 'skip' to discard._",
                 parse_mode="Markdown",
             )
-            return  # Wait for user to click button
+            # Mark receipt as waiting for duplicate decision
+            if receipt_key is not None:
+                receipts_dup = _get_pending_receipts(ctx)
+                if receipt_key in receipts_dup:
+                    receipts_dup[receipt_key]["duplicate_pending"] = True
+                    _track_receipt_msg(ctx, dup_msg.message_id, receipt_key=receipt_key)
+            return  # Wait for user reply
 
     status_msg = await update.effective_message.reply_text("⏳ Saving receipt, updating stock & records...")
 
@@ -2387,22 +2388,22 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         supplier_check, receipt_date_check, receipt_total_check, items_check
     )
     if existing:
-        buttons = [
-            [
-                InlineKeyboardButton("✅ Yes, save it", callback_data="dupcheck:save"),
-                InlineKeyboardButton("❌ No, skip", callback_data="dupcheck:skip"),
-            ]
-        ]
+        _rid = receipt_data.get("receipt_id", "")
+        _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
         await query.edit_message_text(
-            f"⚠️ *Possible duplicate receipt detected!*\n\n"
+            f"⚠️ *Possible duplicate receipt detected!*{_rid_line}\n\n"
             f"A receipt from *{existing.get('supplier', supplier_check)}* on {existing.get('date', receipt_date_check)} "
             f"for RM{existing.get('total', receipt_total_check):.2f} ({existing.get('item_count', len(items_check))} items) "
             f"was already saved by {existing.get('recorded_by', '?')}.\n\n"
-            f"Is this a *new* purchase or the same one?",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            f"_Reply 'yes' to save anyway, or 'skip' to discard._",
             parse_mode="Markdown",
         )
-        return  # Wait for user to click button
+        # Mark receipt as waiting for duplicate decision
+        if receipt_key is not None:
+            receipts_dup = _get_pending_receipts(ctx)
+            if receipt_key in receipts_dup:
+                receipts_dup[receipt_key]["duplicate_pending"] = True
+        return  # Wait for user reply
 
     await query.edit_message_text("⏳ Saving receipt, updating stock & records...")
 
@@ -3548,11 +3549,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         _is_confirmed = pending_entry.get("confirmed", False) if pending_entry else False
+        _is_duplicate_pending = pending_entry.get("duplicate_pending", False) if pending_entry else False
 
         # Strip bot tag so AI only sees the user's intent
         rcpt_text = text
         if ctx.bot.username:
             rcpt_text = rcpt_text.replace(f"@{ctx.bot.username}", "").strip()
+
+        # Handle duplicate receipt decision via text reply
+        if _is_duplicate_pending:
+            _dup_lower = rcpt_text.lower().strip()
+            if _dup_lower in ("yes", "save", "save it", "yes save", "ok", "confirm", "y"):
+                if pending_entry:
+                    pending_entry.pop("duplicate_pending", None)
+                await update.message.reply_text("⏳ Saving receipt (confirmed not a duplicate)...")
+                await _confirm_receipt(pending, name, update, ctx, skip_duplicate_check=True, receipt_key=receipt_key)
+                return
+            elif _dup_lower in ("no", "skip", "discard", "cancel", "n", "no skip"):
+                _clear_receipt_tracking(ctx, receipt_key=receipt_key)
+                await update.message.reply_text("🚫 Receipt skipped — duplicate not saved.")
+                return
+            # If unclear, fall through to AI classification
 
         # Check for new item classification via text (replaces buttons)
         _rcpt_text_lower = rcpt_text.lower().strip()
@@ -3706,13 +3723,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                             cat_label = ITEM_CATEGORIES[new_cat]
                                             change_descriptions.append(
                                                 f"{items[idx].get('name', '?')} category → {cat_label}")
-                        # Only recalculate total when items are added or removed
-                        # (qty/name/price corrections fix AI misreads — receipt total is ground truth)
-                        has_add_remove = any(
-                            ic.get("action") in ("add", "remove") for ic in value
-                        )
-                        if has_add_remove:
-                            _fix_receipt_total_from_items(rd)
+                        # Receipt total is ALWAYS ground truth (what was actually paid).
+                        # Never recalculate — tax/discount/rounding make item sums ≠ receipt total.
+                        # User can correct total manually ("total RM400").
 
                 if change_descriptions:
                     # Re-detect new items with updated names
