@@ -319,6 +319,13 @@ def log_expense_detail(
 
     # Use the pre-calculated amount (discount-adjusted) if provided
     total = amount if amount is not None else qty * unit_price
+    # Unit price: use passed value, or derive from total/qty
+    if unit_price and unit_price > 0:
+        display_unit_price = unit_price
+    elif total > 0 and qty > 0:
+        display_unit_price = total / qty
+    else:
+        display_unit_price = 0
 
     try:
         ws = ss.worksheet("Expenses Detail")
@@ -336,7 +343,7 @@ def log_expense_detail(
             expense_date,
             item_name,
             qty,
-            f"{total:.2f}",
+            f"{display_unit_price:.2f}",
             f"{total:.2f}",
             cat.capitalize(),
             supplier,
