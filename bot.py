@@ -2774,7 +2774,7 @@ def _find_ambiguous_stock_matches(item_name: str, store, user_text: str = "") ->
     return sorted(matches)
 
 
-async def _execute_actions(actions: list, name: str, update: Update):
+async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
     """Execute structured actions returned by the AI."""
     feedback = []
     # Get original user message for broader ambiguity matching
@@ -2796,6 +2796,16 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     if len(amb_matches) > 1:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
+                        # Save state for disambiguation reply recovery
+                        if ctx and hasattr(ctx, 'chat_data'):
+                            ctx.chat_data["pending_disambiguation"] = {
+                                "original_item": item,
+                                "qty": qty,
+                                "note": note,
+                                "matches": amb_matches,
+                                "action_type": "update_stock",
+                                "reporter": name,
+                            }
                         continue
                     sheet_ok = store.update_stock(item, qty, f"{name}: {note}" if note else name)
                     if sheet_ok:
@@ -2951,6 +2961,16 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     if len(amb_matches) > 1:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
+                        # Save state for disambiguation reply recovery
+                        if ctx and hasattr(ctx, 'chat_data'):
+                            ctx.chat_data["pending_disambiguation"] = {
+                                "original_item": item,
+                                "qty": new_qty,
+                                "note": note,
+                                "matches": amb_matches,
+                                "action_type": "correct_stock",
+                                "reporter": name,
+                            }
                         continue
                     try:
                         new_qty = int(new_qty)
@@ -3332,6 +3352,16 @@ async def _execute_actions(actions: list, name: str, update: Update):
                     if len(amb_matches) > 1:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + count.")
+                        # Save state for disambiguation reply recovery
+                        if ctx and hasattr(ctx, 'chat_data'):
+                            ctx.chat_data["pending_disambiguation"] = {
+                                "original_item": item,
+                                "qty": count,
+                                "note": "",
+                                "matches": amb_matches,
+                                "action_type": "stock_count",
+                                "reporter": name,
+                            }
                         continue
                     # Validate against expected levels
                     warning = validate_stock_count(item, count)
@@ -3931,6 +3961,50 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if tagged and ctx.bot.username:
         text = text.replace(f"@{ctx.bot.username}", "").strip()
 
+    # ─── Disambiguation reply check ────
+    # If user replies to a ❓ disambiguation message, resolve with saved qty
+    if (update.message.reply_to_message
+            and "pending_disambiguation" in ctx.chat_data):
+        replied = update.message.reply_to_message
+        if (replied.from_user and replied.from_user.id == ctx.bot.id
+                and "❓" in (replied.text or "")):
+            pending = ctx.chat_data.pop("pending_disambiguation")
+            user_pick = text.lower()
+
+            # Match user's word(s) against saved candidates
+            matched = None
+            for candidate in pending["matches"]:
+                if user_pick in candidate.lower():
+                    matched = candidate
+                    break
+
+            if matched:
+                qty = pending["qty"]
+                note = pending.get("note", "")
+                reporter = pending["reporter"]
+                action_type = pending["action_type"]
+
+                if action_type == "correct_stock":
+                    store.correct_stock_entry(matched, qty, f"{reporter}: {note}" if note else reporter)
+                    sheet_ok = True
+                else:
+                    sheet_ok = store.update_stock(matched, qty, f"{reporter}: {note}" if note else reporter)
+
+                status = "" if sheet_ok else " (⚠️ sheet busy, will auto-retry)"
+                await update.message.reply_text(f"📦 {matched} → {qty}{status}")
+
+                # Low stock check
+                low_items = store.check_low_stock([matched])
+                if low_items:
+                    li = low_items[0]
+                    unit = f" {li['unit']}" if li.get('unit') else ""
+                    await update.message.reply_text(
+                        f"⚠️ LOW STOCK: {li['item']} is at {li['qty']} (min: {li['min']}{unit})")
+                    await _auto_add_low_to_shopping(low_items, store, update.get_bot(), update.effective_chat.id)
+
+                return  # Done — skip AI processing
+            # else: no match, fall through to normal AI processing
+
     # ─── Extract reply context if replying to a message ────
     reply_context = None
     if update.message.reply_to_message:
@@ -4020,7 +4094,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     a for a in actions
                     if a.get("action", "") not in config.STAFF_BLOCKED_ACTIONS
                 ]
-            feedback = await _execute_actions(actions, name, update)
+            feedback = await _execute_actions(actions, name, update, ctx)
             # Auto-clear pending tasks that match executed actions
             try:
                 _auto_clear_matching_tasks(actions)
