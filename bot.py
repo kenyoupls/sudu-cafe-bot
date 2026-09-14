@@ -2710,6 +2710,35 @@ def _auto_clear_matching_tasks(actions: list):
         logger.info(f"Auto-cleared {len(cleared)} tasks: {cleared}")
 
 
+def _find_ambiguous_stock_matches(item_name: str, store) -> list:
+    """Check if item_name could match multiple stock items by word containment.
+    Returns list of matching stock item names. If len > 1, it's ambiguous."""
+    input_norm = normalize_item_name(item_name)
+    input_words = input_norm.split()
+    if not input_words:
+        return []
+
+    all_stock = store.get_stock()
+    # Also check stock_current for items that might only be there
+    stock_current = store.data.get("stock_current", {})
+    all_names = set(list(all_stock.keys()) + list(stock_current.keys()))
+
+    # First check: is item_name an EXACT normalized match to one stock item?
+    exact_matches = [name for name in all_names if normalize_item_name(name) == input_norm]
+    if len(exact_matches) == 1:
+        return exact_matches  # Exact match, no ambiguity
+
+    # Word containment: all input words must appear in the stock item name
+    matches = []
+    for stock_name in all_names:
+        stock_norm = normalize_item_name(stock_name)
+        stock_words = stock_norm.split()
+        if all(w in stock_words for w in input_words):
+            matches.append(stock_name)
+
+    return sorted(matches)
+
+
 async def _execute_actions(actions: list, name: str, update: Update):
     """Execute structured actions returned by the AI."""
     feedback = []
@@ -2725,8 +2754,17 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 qty = act.get("qty", "1")
                 note = act.get("note", "")
                 if item:
-                    store.update_stock(item, qty, f"{name}: {note}" if note else name)
-                    feedback.append(f"📦 {item} → {qty}")
+                    # Ambiguity check: does this item name match multiple stock items?
+                    amb_matches = _find_ambiguous_stock_matches(item, store)
+                    if len(amb_matches) > 1:
+                        match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
+                        feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
+                        continue
+                    sheet_ok = store.update_stock(item, qty, f"{name}: {note}" if note else name)
+                    if sheet_ok:
+                        feedback.append(f"📦 {item} → {qty}")
+                    else:
+                        feedback.append(f"📦 {item} → {qty} (⚠️ sheet busy, will auto-retry)")
                     # Check low stock
                     low_items = store.check_low_stock([item])
                     if low_items:
@@ -2803,10 +2841,28 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 items = act.get("items", [])
                 checked_by = act.get("checked_by", name)
                 stock_date = act.get("date", None)  # dd/mm/yy format from AI
-                # Add checked_by to each item for the bulk method
+                # Check each item for ambiguity
+                clean_items = []
+                ambiguous_items = []
                 for entry in items:
-                    entry["checked_by"] = f"Count by {checked_by}"
-                store.update_stock_bulk(items, stock_date)
+                    entry_item = entry.get("item", "")
+                    if entry_item:
+                        amb_matches = _find_ambiguous_stock_matches(entry_item, store)
+                        if len(amb_matches) > 1:
+                            ambiguous_items.append((entry_item, amb_matches))
+                        else:
+                            entry["checked_by"] = f"Count by {checked_by}"
+                            clean_items.append(entry)
+                    else:
+                        clean_items.append(entry)
+                if clean_items:
+                    store.update_stock_bulk(clean_items, stock_date)
+                # Replace items with clean_items for the rest of the handler
+                items = clean_items
+                if ambiguous_items:
+                    for amb_item, amb_matches in ambiguous_items:
+                        match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
+                        feedback.append(f"❓ \"{amb_item}\" matches multiple items:\n{match_list}\nWhich one?")
                 count = len([e for e in items if e.get("item")])
                 date_label = stock_date if stock_date else "today"
                 if count:
@@ -2853,12 +2909,21 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 new_qty = act.get("qty", 0)
                 note = act.get("note", "")
                 if item:
+                    # Ambiguity check
+                    amb_matches = _find_ambiguous_stock_matches(item, store)
+                    if len(amb_matches) > 1:
+                        match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
+                        feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
+                        continue
                     try:
                         new_qty = int(new_qty)
                     except (ValueError, TypeError):
                         new_qty = 0
-                    store.correct_stock_entry(item, new_qty, f"{name}: {note}" if note else name)
-                    feedback.append(f"✏️ Corrected: {item} → {new_qty}")
+                    sheet_ok = store.correct_stock_entry(item, new_qty, f"{name}: {note}" if note else name)
+                    if sheet_ok:
+                        feedback.append(f"✏️ Corrected: {item} → {new_qty}")
+                    else:
+                        feedback.append(f"✏️ Corrected: {item} → {new_qty} (⚠️ sheet busy, will auto-retry)")
 
             elif action_type == "undo_receipt":
                 supplier = act.get("supplier", "")
@@ -3225,6 +3290,12 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 item = act.get("item", "")
                 count = act.get("count", "")
                 if item and count:
+                    # Ambiguity check
+                    amb_matches = _find_ambiguous_stock_matches(item, store)
+                    if len(amb_matches) > 1:
+                        match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
+                        feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + count.")
+                        continue
                     # Validate against expected levels
                     warning = validate_stock_count(item, count)
                     store.update_stock(item, count, f"Count by {name}")

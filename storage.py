@@ -594,11 +594,11 @@ class SheetsSync:
     def write_stock_item(self, item: str, qty: str, date_str: str):
         """Write a single stock item to the Sheet (update or add row/col)."""
         import time as _time
-        max_retries = 2
+        max_retries = 4
         for attempt in range(max_retries + 1):
             ws = self._get_ws("Stock")
             if not ws:
-                return
+                return False
             try:
                 existing = ws.get_all_values()
                 logger.info(f"[write_stock_item] attempt={attempt}, item={item!r}, qty={qty!r}, date_str={date_str!r}")
@@ -607,7 +607,7 @@ class SheetsSync:
                 if not existing or not existing[0]:
                     ws.update("A1", [["Item", "Current Stock", date_str], [item, "", qty]])
                     ws.format("A1:C1", {"textFormat": {"bold": True}})
-                    return
+                    return True
 
                 header = existing[0]
 
@@ -660,17 +660,17 @@ class SheetsSync:
                     logger.info(f"[write_stock_item] Appended new row for {item}")
 
                 ws.format("A1:Z1", {"textFormat": {"bold": True}})
-                return  # success — exit the retry loop
+                return True  # success — exit the retry loop
 
             except Exception as e:
                 is_rate_limit = "429" in str(e) or "Quota exceeded" in str(e)
                 if is_rate_limit and attempt < max_retries:
-                    wait = 3 * (attempt + 1)  # 3s first retry, 6s second
+                    wait = 3 * (2 ** attempt)  # 3s, 6s, 12s, 24s
                     logger.warning(f"[write_stock_item] Rate limited (attempt {attempt}), retrying in {wait}s...")
                     _time.sleep(wait)
                     continue
                 logger.error(f"[write_stock_item] FAILED for item={item!r}, qty={qty!r}, date={date_str!r}: {e}", exc_info=True)
-                return
+                return False
 
     def remove_stock_item(self, item: str):
         """Remove a stock item row from the Sheet."""
@@ -1287,6 +1287,7 @@ class LocalJsonStore:
         self._sync_timer = None       # Debounce timer
         self._sync_lock = threading.Lock()
         self._refresh_timer = None    # Periodic Sheet → JSON refresh
+        self._pending_stock_writes = []
 
         # Initialize Sheets sync
         if HAS_GSPREAD:
@@ -1311,6 +1312,23 @@ class LocalJsonStore:
         if not self._sheets:
             return
         try:
+            # Drain pending stock writes before refreshing (so sheet has our latest values)
+            if hasattr(self, '_pending_stock_writes') and self._pending_stock_writes:
+                pending = self._pending_stock_writes[:]
+                self._pending_stock_writes = []
+                for pw in pending:
+                    try:
+                        ok = self._sheets.write_stock_item(pw["item"], pw["qty"], pw["date"])
+                        if not ok:
+                            self._pending_stock_writes.append(pw)
+                            logger.warning(f"Pending stock write still failing: {pw['item']}={pw['qty']}")
+                        else:
+                            logger.info(f"Pending stock write succeeded: {pw['item']}={pw['qty']}")
+                    except Exception as e:
+                        self._pending_stock_writes.append(pw)
+                        logger.error(f"Pending stock write retry failed: {pw['item']}: {e}")
+                _time.sleep(1)  # Brief pause after retries before reading
+
             # Stock
             stock, history, stock_current = self._sheets.read_stock_from_sheet()
             if stock is not None:
@@ -1573,11 +1591,15 @@ class LocalJsonStore:
         today = _now().strftime("%d/%m/%y")
 
         # 1. Write to Sheet FIRST (source of truth)
+        sheet_ok = True
         if self._sheets:
             try:
-                self._sheets.write_stock_item(item, qty, today)
+                sheet_ok = self._sheets.write_stock_item(item, qty, today)
+                if not sheet_ok:
+                    sheet_ok = False
             except Exception as e:
                 logger.error(f"Direct sheet write failed (stock): {e}")
+                sheet_ok = False
 
         # 2. Update local JSON cache
         self.data["stock"][item] = {
@@ -1602,6 +1624,11 @@ class LocalJsonStore:
         self._sync_current_stock_to_sheet(item)
         self._save_local_only()
         self._rebuild_shopping_list()
+
+        if not sheet_ok:
+            self._pending_stock_writes.append({"item": item, "qty": qty, "date": today})
+            logger.warning(f"Queued pending stock write: {item}={qty} (sheet write failed)")
+        return sheet_ok
 
     def remove_stock(self, item: str) -> bool:
         """Remove a stock item from Sheet + JSON cache. Returns True if found."""
@@ -2040,69 +2067,81 @@ class LocalJsonStore:
         """Update the Current Stock (column B) values on the Stock sheet.
         If item is given, only that item's row is updated; otherwise all items.
         Uses batch_update for efficiency."""
+        import time as _time
         if not self._sheets:
-            return
+            return False
         ws = self._sheets._get_ws("Stock")
         if not ws:
-            return
-        try:
-            existing = ws.get_all_values()
-            if not existing or not existing[0]:
-                return
+            return False
 
-            header = existing[0]
-
-            # Ensure "Current Stock" is column B; insert it if missing
-            if len(header) < 2 or header[1] != "Current Stock":
-                ws.insert_cols([[""]], col=2)
-                ws.update_acell("B1", "Current Stock")
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
                 existing = ws.get_all_values()
-                header = existing[0] if existing else []
+                if not existing or not existing[0]:
+                    return False
 
-            stock_current = self.data.get("stock_current", {})
+                header = existing[0]
 
-            if item is not None:
-                items_to_sync = {item: stock_current.get(item, 0)}
-            else:
-                items_to_sync = stock_current
+                # Ensure "Current Stock" is column B; insert it if missing
+                if len(header) < 2 or header[1] != "Current Stock":
+                    ws.insert_cols([[""]], col=2)
+                    ws.update_acell("B1", "Current Stock")
+                    existing = ws.get_all_values()
+                    header = existing[0] if existing else []
 
-            # Build row lookup
-            row_lookup = {}
-            for i, row in enumerate(existing[1:], 1):
-                if row and row[0].strip():
-                    norm = normalize_item_name(row[0])
-                    if norm not in row_lookup:
-                        row_lookup[norm] = i
+                stock_current = self.data.get("stock_current", {})
 
-            # Build batch updates for column B
-            cell_updates = {}
-            for it, qty in items_to_sync.items():
-                norm = normalize_item_name(it)
-                row_idx = row_lookup.get(norm)
+                if item is not None:
+                    items_to_sync = {item: stock_current.get(item, 0)}
+                else:
+                    items_to_sync = stock_current
 
-                # Substring fallback if exact match fails
-                if row_idx is None and len(norm) >= 4:
-                    for existing_norm, idx in row_lookup.items():
-                        if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
-                            row_idx = idx
-                            break
+                # Build row lookup
+                row_lookup = {}
+                for i, row in enumerate(existing[1:], 1):
+                    if row and row[0].strip():
+                        norm = normalize_item_name(row[0])
+                        if norm not in row_lookup:
+                            row_lookup[norm] = i
 
-                if row_idx is not None:
-                    cell_updates[(row_idx + 1, 2)] = qty
-                # Sheet is master list — don't append items not already on it
+                # Build batch updates for column B
+                cell_updates = {}
+                for it, qty in items_to_sync.items():
+                    norm = normalize_item_name(it)
+                    row_idx = row_lookup.get(norm)
 
-            # Apply batch update
-            if cell_updates:
-                batch = []
-                for (row, col), val in cell_updates.items():
-                    cell_label = gspread.utils.rowcol_to_a1(row, col)
-                    batch.append({"range": cell_label, "values": [[val]]})
-                ws.batch_update(batch, value_input_option="RAW")
+                    # Substring fallback if exact match fails
+                    if row_idx is None and len(norm) >= 4:
+                        for existing_norm, idx in row_lookup.items():
+                            if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
+                                row_idx = idx
+                                break
 
-            ws.format("A1:Z1", {"textFormat": {"bold": True}})
+                    if row_idx is not None:
+                        cell_updates[(row_idx + 1, 2)] = qty
+                    # Sheet is master list — don't append items not already on it
 
-        except Exception as e:
-            logger.error(f"Sheet sync error (current stock): {e}")
+                # Apply batch update
+                if cell_updates:
+                    batch = []
+                    for (row, col), val in cell_updates.items():
+                        cell_label = gspread.utils.rowcol_to_a1(row, col)
+                        batch.append({"range": cell_label, "values": [[val]]})
+                    ws.batch_update(batch, value_input_option="RAW")
+
+                ws.format("A1:Z1", {"textFormat": {"bold": True}})
+                return True
+
+            except Exception as e:
+                is_rate_limit = "429" in str(e) or "Quota exceeded" in str(e)
+                if is_rate_limit and attempt < max_retries:
+                    wait = 3 * (attempt + 1)
+                    logger.warning(f"[_sync_current_stock_to_sheet] Rate limited (attempt {attempt}), retrying in {wait}s...")
+                    _time.sleep(wait)
+                    continue
+                logger.error(f"Sheet sync error (current stock): {e}")
+                return False
 
     def correct_stock_entry(self, item: str, new_qty: int, corrected_by: str):
         """Overwrite an item's current stock and today's history entry."""
@@ -2130,15 +2169,24 @@ class LocalJsonStore:
             "updated_at": _fmt_ts(),
         }
 
+        sheet_ok = True
         if self._sheets:
             try:
-                self._sheets.write_stock_item(item, str(new_qty), today_sheet)
+                sheet_ok = self._sheets.write_stock_item(item, str(new_qty), today_sheet)
+                if not sheet_ok:
+                    sheet_ok = False
             except Exception as e:
                 logger.error(f"Direct sheet write failed (correct_stock_entry): {e}")
+                sheet_ok = False
         self._sync_current_stock_to_sheet(item)
 
         self._save_local_only()
         self._rebuild_shopping_list()
+
+        if not sheet_ok:
+            self._pending_stock_writes.append({"item": item, "qty": str(new_qty), "date": today_sheet})
+            logger.warning(f"Queued pending stock write: {item}={new_qty} (sheet write failed)")
+        return sheet_ok
 
     def undo_last_stock_update(self, item: str) -> bool:
         """Undo the most recent stock_history entry for an item.
@@ -2281,7 +2329,7 @@ class LocalJsonStore:
                 continue
 
             qty_num = float(nums[0])
-            if qty_num < min_info["min"]:
+            if qty_num <= min_info["min"]:
                 low_items.append({
                     "item": item_name,
                     "qty": qty_str,
@@ -2313,7 +2361,7 @@ class LocalJsonStore:
             for min_name, min_data in STOCK_MINIMUMS.items():
                 if normalize_item_name(min_name) == item_norm:
                     try:
-                        if int(qty) < min_data.get("min", 0):
+                        if int(qty) <= min_data.get("min", 0):
                             result.append((item_name, {"qty": str(qty)}))
                             seen_names.add(item_key)
                     except (ValueError, TypeError):
@@ -2584,7 +2632,7 @@ class LocalJsonStore:
                 except (ValueError, TypeError):
                     current_qty = 0
 
-            if current_qty < min_qty:
+            if current_qty <= min_qty:
                 low_norms.add(min_norm)
                 logger.info(f"_rebuild_shopping_list: LOW — {min_name}: {current_qty} < {min_qty}")
             else:

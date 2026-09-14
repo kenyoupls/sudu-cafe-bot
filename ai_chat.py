@@ -928,6 +928,16 @@ IMPORTANT:
 - If no actions needed, just reply normally with NO actions block
 - You know WHO sent each message — reference them by name naturally
 
+AMBIGUOUS ITEM NAMES — CRITICAL:
+Before triggering update_stock or correct_stock, check the CURRENT STOCK list for items that share similar words with what the user said. If TWO OR MORE stock items contain the words the user used, you MUST ask which one — even if one seems like a "closer" match. DO NOT assume.
+Examples:
+- "takeaway cup 4" → matches Takeaway Plastic Cup, Takeaway Plastic Cup Cover, Takeaway Hot Tea Cup, Takeaway Hot Tea Cup Cover → ASK which one
+- "brown boba 12" → matches Brown Boba (Cook), Brown Boba (Jelly) → ASK which one
+- "nata de coco 5" → matches Mango Nata de Coco, Lychee Nata de Coco → ASK which one
+- "straw 10" → matches Thick Straw, Thin Straw → ASK which one
+- "milo powder 5" → only matches Milo Powder → OK to update directly
+List ALL matching items so they can pick. Only trigger the action AFTER they clarify.
+
 CORRECTION DETECTION:
 When staff says something is wrong about a previous entry, detect the intent:
 - "That's wrong, it should be 6" → correct_stock
@@ -1066,6 +1076,8 @@ You can include multiple actions in one array. Always give your natural chat rep
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers.
 
 RECIPES: When someone asks how to make something, ask what batch size FIRST (e.g. "What size — 1L, 2L, 3L?"). Don't dump all sizes. If a question has multiple possible answers (which size? which month? which item?), ask which one — don't dump all of them.
+
+AMBIGUOUS ITEM NAMES: If the user says a partial name that could match 2+ stock items (e.g. "takeaway cup" matches 4 items, "brown boba" matches 2), ASK which one and list the options. Don't guess or assume.
 
 You have access to recent chat history and reply context. Use them to follow conversations naturally — don't re-ask things already discussed. CRITICAL: When a user REPLIES to a message, their follow-up is about the SAME TOPIC as that message. Scope your answer to that topic. Example: if the last messages were about bleach and user asks 'what's the current stock count?' — they mean bleach, not everything. If the conversation was about an event and they ask 'when is it?' — they mean that event. Never dump everything when the context narrows the question to something specific."""
 
