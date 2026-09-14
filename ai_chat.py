@@ -928,15 +928,7 @@ IMPORTANT:
 - If no actions needed, just reply normally with NO actions block
 - You know WHO sent each message — reference them by name naturally
 
-AMBIGUOUS ITEM NAMES — CRITICAL:
-Before triggering update_stock or correct_stock, check the CURRENT STOCK list for items that share similar words with what the user said. If TWO OR MORE stock items contain the words the user used, you MUST ask which one — even if one seems like a "closer" match. DO NOT assume.
-Examples:
-- "takeaway cup 4" → matches Takeaway Plastic Cup, Takeaway Plastic Cup Cover, Takeaway Hot Tea Cup, Takeaway Hot Tea Cup Cover → ASK which one
-- "brown boba 12" → matches Brown Boba (Cook), Brown Boba (Jelly) → ASK which one
-- "nata de coco 5" → matches Mango Nata de Coco, Lychee Nata de Coco → ASK which one
-- "straw 10" → matches Thick Straw, Thin Straw → ASK which one
-- "milo powder 5" → only matches Milo Powder → OK to update directly
-List ALL matching items so they can pick. Only trigger the action AFTER they clarify. When they clarify, use the quantity from the ORIGINAL message — don't ask for it again.
+STOCK ITEM NAMES: Use the item name the user gives you. If it's a short or partial name (e.g. "takeaway cup"), still trigger the action with that name — the system will handle matching.
 
 CORRECTION DETECTION:
 When staff says something is wrong about a previous entry, detect the intent:
@@ -1126,13 +1118,7 @@ Reply: "Sugar habis! Added as urgent. Siapa boleh beli hari ni?"
 [{{"action":"update_stock","item":"Sugar","qty":"OUT"}},{{"action":"add_shopping","item":"Sugar","urgency":"urgent"}}]
 ```
 
-AMBIGUOUS ITEM NAMES — CRITICAL: If the user says a partial name that could match 2+ stock items, you MUST ask which one — even if one seems like a "closer" match. DO NOT assume.
-Examples:
-- "takeaway cup 4" → matches Takeaway Plastic Cup, Cup Cover, Hot Tea Cup, Hot Tea Cup Cover → ASK
-- "brown boba 12" → matches Brown Boba (Cook), Brown Boba (Jelly) → ASK
-- "straw 10" → matches Thick Straw, Thin Straw → ASK
-- "nata de coco 5" → matches Mango Nata de Coco, Lychee Nata de Coco → ASK
-Only trigger the action AFTER they clarify. When they clarify, use the quantity from the ORIGINAL message — don't ask for it again.
+STOCK ITEM NAMES: Use the item name the user gives you. If it's a short or partial name (e.g. "takeaway cup"), still trigger the action with that name — the system will handle matching.
 
 You have access to recent chat history and reply context. Use them to follow conversations naturally — don't re-ask things already discussed. CRITICAL: When a user REPLIES to a message, their follow-up is about the SAME TOPIC as that message. Scope your answer to that topic. Example: if the last messages were about bleach and user asks 'what's the current stock count?' — they mean bleach, not everything. If the conversation was about an event and they ask 'when is it?' — they mean that event. Never dump everything when the context narrows the question to something specific."""
 
