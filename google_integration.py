@@ -619,8 +619,16 @@ def update_expense_by_receipt_id(receipt_id: str, items: list, receipt_data: dic
 
             if len(items_merged) == 1 and receipt_total > 0:
                 item_amount = receipt_total
+            elif "line_total" in item:
+                item_amount = float(item["line_total"])
             else:
                 item_amount = qty_int * (float(price) if price else 0)
+
+            # Derive unit price from item_amount
+            if qty_int > 0 and item_amount > 0:
+                display_unit_price = round(item_amount / qty_int, 4)
+            else:
+                display_unit_price = float(price) if price else 0
 
             # Safety: always normalize date right before writing
             safe_date = _normalize_date(expense_date)
@@ -628,7 +636,7 @@ def update_expense_by_receipt_id(receipt_id: str, items: list, receipt_data: dic
                 "'" + safe_date,  # apostrophe prefix forces Sheets to keep as text
                 item_name,
                 qty_int,
-                f"{float(price) if price else 0:.2f}",
+                f"{display_unit_price:.2f}",
                 f"{item_amount:.2f}",
                 cat.capitalize(),
                 supplier,

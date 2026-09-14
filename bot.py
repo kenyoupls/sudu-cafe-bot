@@ -1203,6 +1203,11 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if receipt_data:
                 _fix_receipt_total(receipt_data)
+                # Store line_total per item — ground truth for each item's cost
+                for _item in receipt_data.get("items", []):
+                    _q = float(_item.get("qty", 1) or 1)
+                    _p = float(_item.get("price", 0) or 0)
+                    _item["line_total"] = round(_q * _p, 2)
                 _fix_receipt_paid_by(receipt_data, name)
                 receipt_data["receipt_id"] = _generate_receipt_id()
                 # Auto-apply saved item name corrections
@@ -1496,6 +1501,11 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             if receipt_data:
                 _fix_receipt_total(receipt_data)
+                # Store line_total per item — ground truth for each item's cost
+                for _item in receipt_data.get("items", []):
+                    _q = float(_item.get("qty", 1) or 1)
+                    _p = float(_item.get("price", 0) or 0)
+                    _item["line_total"] = round(_q * _p, 2)
                 _fix_receipt_paid_by(receipt_data, name)
                 receipt_data["receipt_id"] = _generate_receipt_id()
                 # Auto-apply saved item name corrections
@@ -1743,6 +1753,10 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None, co
     for item in receipt_data.get("items", []):
         _item_price = float(item.get('price') or 0)
         _item_qty = item.get('qty', '?')
+        # If line_total exists and qty > 1, derive the real unit price
+        _item_qty_num = int(float(_item_qty)) if str(_item_qty).replace('.','').isdigit() else 1
+        if "line_total" in item and _item_qty_num > 0:
+            _item_price = round(float(item["line_total"]) / _item_qty_num, 2)
         _item_cat = item.get('category', DEFAULT_CATEGORY)
         _cat_label = ITEM_CATEGORIES.get(_item_cat, ITEM_CATEGORIES.get(DEFAULT_CATEGORY, ""))
         items_text += (
@@ -2135,12 +2149,19 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                 qty_int = 1
 
             if item_name:
-                # For single-item receipts: log the receipt total directly
-                # For multi-item: log qty * unit_price per item
+                # Use line_total if available (preserves correct amount after qty corrections)
                 if len(items) == 1 and receipt_total > 0:
                     item_amount = receipt_total
+                elif "line_total" in item:
+                    item_amount = float(item["line_total"])
                 else:
                     item_amount = qty_int * (float(price) if price else 0)
+
+                # Derive unit price from item_amount for accurate per-unit display
+                if qty_int > 0 and item_amount > 0:
+                    display_unit_price = round(item_amount / qty_int, 4)
+                else:
+                    display_unit_price = float(price) if price else 0
 
                 try:
                     logged_detail = log_expense_detail(
@@ -2148,7 +2169,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                         supplier=supplier,
                         item_name=item_name,
                         qty=qty_int,
-                        unit_price=float(price) if price else 0,
+                        unit_price=display_unit_price,
                         amount=item_amount,
                         category=category or "ingredients",
                         paid_by=paid_by,
@@ -3449,6 +3470,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     "qty": int(item_change.get("qty", 1)),
                                     "price": float(item_change.get("price", 0)),
                                     "category": item_change.get("category", "ingredients"),
+                                    "line_total": round(int(item_change.get("qty", 1)) * float(item_change.get("price", 0)), 2),
                                 }
                                 items.append(new_item)
                                 change_descriptions.append(f"Added: {new_item['name']}")
@@ -3467,14 +3489,35 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                 for idx in targets:
                                     if not (0 <= idx < len(items)):
                                         continue
-                                    if "qty" in item_change:
-                                        items[idx]["qty"] = int(item_change["qty"])
+                                    if "qty" in item_change and "price" not in item_change:
+                                        # Qty-only correction: line_total stays the same, recalculate unit price
+                                        new_qty = int(item_change["qty"])
+                                        items[idx]["qty"] = new_qty
+                                        old_line_total = items[idx].get("line_total", float(items[idx].get("price", 0) or 0))
+                                        if new_qty > 0:
+                                            items[idx]["price"] = round(old_line_total / new_qty, 4)
+                                        # line_total unchanged — the receipt amount for this item hasn't changed
                                         change_descriptions.append(
                                             f"{items[idx].get('name', '?')} qty → {item_change['qty']}")
-                                    if "price" in item_change:
-                                        items[idx]["price"] = float(item_change["price"])
+                                    elif "qty" in item_change and "price" in item_change:
+                                        # Both corrected: user is giving real unit price + real qty
+                                        new_qty = int(item_change["qty"])
+                                        new_price = float(item_change["price"])
+                                        items[idx]["qty"] = new_qty
+                                        items[idx]["price"] = new_price
+                                        items[idx]["line_total"] = round(new_qty * new_price, 2)
                                         change_descriptions.append(
-                                            f"{items[idx].get('name', '?')} price → RM{float(item_change['price']):.2f}")
+                                            f"{items[idx].get('name', '?')} qty → {item_change['qty']}")
+                                        change_descriptions.append(
+                                            f"{items[idx].get('name', '?')} price → RM{new_price:.2f}")
+                                    elif "price" in item_change:
+                                        # Price-only correction: user is giving real unit price
+                                        new_price = float(item_change["price"])
+                                        items[idx]["price"] = new_price
+                                        current_qty = int(items[idx].get("qty", 1) or 1)
+                                        items[idx]["line_total"] = round(current_qty * new_price, 2)
+                                        change_descriptions.append(
+                                            f"{items[idx].get('name', '?')} price → RM{new_price:.2f}")
                                     if "name" in item_change:
                                         old_name = items[idx].get("name", "?")
                                         items[idx]["name"] = str(item_change["name"])
@@ -3641,6 +3684,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                     if receipt_data:
                         _fix_receipt_total(receipt_data)
+                        # Store line_total per item — ground truth for each item's cost
+                        for _item in receipt_data.get("items", []):
+                            _q = float(_item.get("qty", 1) or 1)
+                            _p = float(_item.get("price", 0) or 0)
+                            _item["line_total"] = round(_q * _p, 2)
                         _fix_receipt_paid_by(receipt_data, name)
                         receipt_data["receipt_id"] = _generate_receipt_id()
                         # Auto-apply saved item name corrections
