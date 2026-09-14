@@ -2712,7 +2712,11 @@ def _auto_clear_matching_tasks(actions: list):
 
 def _find_ambiguous_stock_matches(item_name: str, store) -> list:
     """Check if item_name could match multiple stock items by word containment.
-    Returns list of matching stock item names. If len > 1, it's ambiguous."""
+    Returns list of matching stock item names. If len > 1, it's ambiguous.
+
+    Example: 'Takeaway Plastic Cup' matches both 'Takeaway Plastic Cup' AND
+    'Takeaway Plastic Cup Cover' because all input words appear in both.
+    Only returns 1 match when the name is truly unique."""
     input_norm = normalize_item_name(item_name)
     input_words = input_norm.split()
     if not input_words:
@@ -2723,11 +2727,6 @@ def _find_ambiguous_stock_matches(item_name: str, store) -> list:
     stock_current = store.data.get("stock_current", {})
     all_names = set(list(all_stock.keys()) + list(stock_current.keys()))
 
-    # First check: is item_name an EXACT normalized match to one stock item?
-    exact_matches = [name for name in all_names if normalize_item_name(name) == input_norm]
-    if len(exact_matches) == 1:
-        return exact_matches  # Exact match, no ambiguity
-
     # Word containment: all input words must appear in the stock item name
     matches = []
     for stock_name in all_names:
@@ -2736,6 +2735,15 @@ def _find_ambiguous_stock_matches(item_name: str, store) -> list:
         if all(w in stock_words for w in input_words):
             matches.append(stock_name)
 
+    # If exactly one match, or no matches, return as-is
+    if len(matches) <= 1:
+        return matches if matches else [item_name]
+
+    # Multiple matches found — but if the input is an EXACT match to one
+    # of them AND no other item contains it as a subset, it's not ambiguous.
+    # e.g. "Milo Powder" exact-matches "Milo Powder" and nothing else contains
+    # all those words → not ambiguous. But "Takeaway Plastic Cup" exact-matches
+    # one item while "Takeaway Plastic Cup Cover" also matches → ambiguous.
     return sorted(matches)
 
 
