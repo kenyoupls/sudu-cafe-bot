@@ -2735,20 +2735,36 @@ def _find_ambiguous_stock_matches(item_name: str, store, user_text: str = "") ->
                 found.append(stock_name)
         return found
 
-    # Check 1: match against the AI-resolved item name
+    import re
+    input_norm = normalize_item_name(item_name)
+    exact = [n for n in all_names if normalize_item_name(n) == input_norm]
+
+    # Detect if this is a clarification reply (no @mention, short text)
+    # vs a first message (has @mention or is longer)
+    is_clarification = False
+    if user_text:
+        has_mention = bool(re.search(r'@\S+', user_text))
+        clean_text = re.sub(r'@\S+', '', user_text)
+        clean_text = re.sub(r'\b\d+\b', '', clean_text).strip()
+        if not has_mention and clean_text and len(clean_text.split()) <= 3:
+            is_clarification = True
+
+    # If AI sent an exact stock name AND user is clarifying (short reply, no @mention)
+    # → trust the AI's resolution, don't re-check
+    if len(exact) == 1 and is_clarification:
+        return exact
+
+    # Otherwise, check for word-level ambiguity on the AI's resolved name
     matches = _word_matches(item_name)
 
-    # Check 2: also match against the original user message words
-    # Strip numbers (quantities) from user text to get just the item words
+    # Also check the original user message words for broader matches
+    # e.g. user says "takeaway cup 25", AI resolves to "Takeaway Plastic Cup"
+    # but "Takeaway Hot Tea Cup" also matches "takeaway cup"
     if user_text:
-        import re
-        # Remove bot mentions, numbers, and common filler words
-        clean_text = re.sub(r'@\S+', '', user_text)  # remove @mentions
-        clean_text = re.sub(r'\b\d+\b', '', clean_text)  # remove numbers
-        clean_text = clean_text.strip()
+        clean_text = re.sub(r'@\S+', '', user_text)
+        clean_text = re.sub(r'\b\d+\b', '', clean_text).strip()
         if clean_text:
             user_matches = _word_matches(clean_text)
-            # Use the broader match set (more matches = more ambiguity to resolve)
             if len(user_matches) > len(matches):
                 matches = user_matches
 
