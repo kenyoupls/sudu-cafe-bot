@@ -4584,9 +4584,9 @@ async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
     if not stale:
         return
 
-    # Generate and send chase-up message
+    # Generate and send chase-up message — pass staff roster so AI knows who's owner vs staff
     items_only = [item for _, item in stale]
-    message = await generate_chaseup_message(items_only)
+    message = await generate_chaseup_message(items_only, staff_info=store.get_staff())
     if message:
         await ctx.bot.send_message(
             config.OWNER_GROUP_ID,

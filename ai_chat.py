@@ -2432,23 +2432,42 @@ async def extract_action_items_ai(text: str, user_name: str) -> list:
         return extract_action_items(text, user_name)
 
 
-async def generate_chaseup_message(pending_items: list) -> str:
+async def generate_chaseup_message(pending_items: list, staff_info: dict = None) -> str:
     """Generate a natural chase-up reminder for pending action items."""
     if not pending_items:
         return ""
 
     items_text = "\n".join(
-        f"- {i.get('task', '?')} (assigned: {i.get('assigned_to', '?')}, "
+        f"- Task {idx+1}: {i.get('task', '?')} (assigned: {i.get('assigned_to', '?')}, "
+        f"posted by: {i.get('mentioned_by', '?')}, "
         f"since: {i.get('created_at', '?')[:16]}, chased {i.get('chase_count', 0)}x)"
-        for i in pending_items
+        for idx, i in enumerate(pending_items)
+    )
+
+    # Build team roster so AI knows who is owner vs staff
+    team_text = ""
+    if staff_info:
+        team_lines = []
+        for name, info in staff_info.items():
+            role = info.get("role", "staff")
+            team_lines.append(f"- {name} ({role})")
+        team_text = f"\n\nTeam roster:\n" + "\n".join(team_lines)
+
+    tagging_rules = (
+        "TAGGING RULES (strict):\n"
+        "- Finance, admin, confirmation, expenses, PnL tasks → tag the OWNERS by name\n"
+        "- Work tasks (cleaning, stock, prep, receipts) → tag the ASSIGNED STAFF by name\n"
+        "- NEVER use @everyone, @all, or @here — always tag the specific person\n"
+        "- If assigned_to is unknown, tag the person who posted it (mentioned_by)"
     )
 
     # ── Primary: Groq ──
     try:
         prompt = (
             f"Generate a SHORT, friendly chase-up message for these pending café tasks:\n\n"
-            f"{items_text}\n\n"
-            f"Keep it casual, Malaysian style. Tag who's responsible. "
+            f"{items_text}{team_text}\n\n"
+            f"{tagging_rules}\n\n"
+            f"Keep it casual, Malaysian style. "
             f"End with: reply /taskdone <number> when settled. Max 5 lines."
         )
         result = await _groq_text(prompt, system=_GROQ_SYSTEM_PROMPT, temperature=0.7, max_tokens=200)
@@ -2461,12 +2480,12 @@ async def generate_chaseup_message(pending_items: list) -> str:
     client = get_client()
 
     if client is None:
-        # Fallback: simple template
+        # Fallback: simple template — tag assigned person by name
         lines = ["⏰ *Pending tasks — need follow up:*\n"]
         for idx, item in enumerate(pending_items):
-            who = item.get("assigned_to", "?")
+            who = item.get("assigned_to") or item.get("mentioned_by") or "?"
             task = item.get("task", "?")
-            lines.append(f"{idx+1}. {task} → {who}")
+            lines.append(f"{idx+1}. {task} → *{who}*")
         lines.append("\nDone? Reply: /taskdone <number>")
         return "\n".join(lines)
 
@@ -2474,8 +2493,9 @@ async def generate_chaseup_message(pending_items: list) -> str:
         prompt = (
             f"You're the café manager bot. Generate a SHORT, friendly chase-up message "
             f"(like a shift lead checking in) for these pending tasks:\n\n"
-            f"{items_text}\n\n"
-            f"Keep it casual and Malaysian style. Tag who's responsible. "
+            f"{items_text}{team_text}\n\n"
+            f"{tagging_rules}\n\n"
+            f"Keep it casual and Malaysian style. "
             f"End with: reply /taskdone <number> when settled.\n"
             f"Max 5 lines."
         )
