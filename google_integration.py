@@ -340,7 +340,7 @@ def log_expense_detail(
         expense_date = _normalize_date(expense_date)
         _maybe_insert_month_separator(ws, expense_date, 9)
         row_data = [
-            expense_date,
+            "'" + expense_date,  # apostrophe prefix forces Sheets to keep as text, not reformat
             item_name,
             qty,
             f"{display_unit_price:.2f}",
@@ -625,7 +625,7 @@ def update_expense_by_receipt_id(receipt_id: str, items: list, receipt_data: dic
             # Safety: always normalize date right before writing
             safe_date = _normalize_date(expense_date)
             row_data = [
-                safe_date,
+                "'" + safe_date,  # apostrophe prefix forces Sheets to keep as text
                 item_name,
                 qty_int,
                 f"{float(price) if price else 0:.2f}",
