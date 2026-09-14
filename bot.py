@@ -1759,10 +1759,11 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None, co
             _item_price = round(float(item["line_total"]) / _item_qty_num, 2)
         _item_cat = item.get('category', DEFAULT_CATEGORY)
         _cat_label = ITEM_CATEGORIES.get(_item_cat, ITEM_CATEGORIES.get(DEFAULT_CATEGORY, ""))
+        _item_line_total = float(item.get("line_total", _item_price * _item_qty_num))
         items_text += (
             f"\n  \U0001f4e6 {item.get('name', '?')} "
             f"x{_item_qty} "
-            f"@ RM{_item_price:.2f}"
+            f"@ RM{_item_price:.2f} = RM{_item_line_total:.2f}"
             f"\n     \U0001f3f7️ {_item_cat.title()}"
         )
 
