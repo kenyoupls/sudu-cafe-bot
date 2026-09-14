@@ -2144,6 +2144,22 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         # Use receipt's final total — the amount actually paid
         receipt_total = float(receipt_data.get("total") or 0)
 
+        # Sanity check: if item line_totals don't sum to receipt total, proportionally adjust
+        if receipt_total > 0 and len(items) > 1:
+            _item_sum = sum(
+                float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
+                for it in items if clean_item_name(it.get("name", ""))
+            )
+            if _item_sum > 0 and abs(_item_sum - receipt_total) > 1.0:
+                _ratio = receipt_total / _item_sum
+                for it in items:
+                    _old_lt = float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
+                    it["line_total"] = round(_old_lt * _ratio, 2)
+                    _q = int(it.get("qty", 1) or 1)
+                    if _q > 0:
+                        it["price"] = round(it["line_total"] / _q, 4)
+                logger.info(f"Sanity fix: item sum {_item_sum:.2f} → scaled to receipt total {receipt_total:.2f}")
+
         import re as _re
         for item in items:
             item_name = clean_item_name(item.get("name", ""))

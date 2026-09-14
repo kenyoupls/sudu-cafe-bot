@@ -598,6 +598,23 @@ def update_expense_by_receipt_id(receipt_id: str, items: list, receipt_data: dic
         import re as _re
 
         items_merged = _merge_items_for_sheet(items)
+
+        # Sanity check: if item line_totals don't sum to receipt total, proportionally adjust
+        if receipt_total > 0 and len(items_merged) > 1:
+            _item_sum = sum(
+                float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
+                for it in items_merged if clean_item_name(it.get("name", ""))
+            )
+            if _item_sum > 0 and abs(_item_sum - receipt_total) > 1.0:
+                _ratio = receipt_total / _item_sum
+                for it in items_merged:
+                    _old_lt = float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
+                    it["line_total"] = round(_old_lt * _ratio, 2)
+                    _q = int(it.get("qty", 1) or 1)
+                    if _q > 0:
+                        it["price"] = round(it["line_total"] / _q, 4)
+                logger.info(f"Sanity fix: item sum {_item_sum:.2f} → scaled to receipt total {receipt_total:.2f}")
+
         count = 0
         for item in items_merged:
             item_name = clean_item_name(item.get("name", ""))
