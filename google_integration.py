@@ -682,6 +682,13 @@ def _merge_items_for_sheet(items: list) -> list:
                     merged[key]["price"] = new_price
             except (ValueError, TypeError):
                 pass
+            # Sum line_totals when merging
+            try:
+                existing_lt = float(merged[key].get("line_total", 0) or 0)
+                new_lt = float(item.get("line_total", float(item.get("price", 0) or 0) * int(item.get("qty", 1) or 1)))
+                merged[key]["line_total"] = round(existing_lt + new_lt, 2)
+            except (ValueError, TypeError):
+                pass
         else:
             merged[key] = dict(item)
     return list(merged.values())
