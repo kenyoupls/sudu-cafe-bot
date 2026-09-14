@@ -1673,6 +1673,23 @@ def _get_receipt_for_reply(ctx, reply_msg_id: int):
     return None, None
 
 
+def _get_receipt_by_rid_from_text(ctx, message_text: str):
+    """Extract receipt ID from a message's text and find the matching pending receipt.
+    Returns (receipt_key, receipt_dict) or (None, None)."""
+    if not message_text:
+        return None, None
+    import re
+    match = re.search(r'(R-\d{6}-\d{4}-[A-Z]{3})', message_text)
+    if not match:
+        return None, None
+    rid = match.group(1)
+    receipts = _get_pending_receipts(ctx)
+    for key, rcpt in receipts.items():
+        if rcpt.get("data", {}).get("receipt_id") == rid:
+            return key, rcpt
+    return None, None
+
+
 def _get_latest_receipt(ctx):
     """Return the most recently added pending receipt.
     Returns (receipt_key, receipt_dict) or (None, None)."""
@@ -1737,8 +1754,10 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None, co
 
     paid_by = receipt_data.get("paid_by", "") or name
 
+    _rid = receipt_data.get("receipt_id", "")
+    _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
     confirm_msg = (
-        f"\U0001f9fe *Receipt Scanned*\n\n"
+        f"\U0001f9fe *Receipt Scanned*{_rid_line}\n\n"
         f"\U0001f4c5 Date: {receipt_data.get('date', 'Unknown')}\n"
         f"\U0001f3ea Shop: {receipt_data.get('supplier', 'Unknown')}\n"
         f"\U0001f4b3 Paid by: {paid_by}\n"
@@ -2056,6 +2075,14 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                            skip_duplicate_check: bool = False,
                            receipt_key: int = None):
     """Shared receipt confirmation logic — used by both button and reply."""
+    # Guard: don't re-save an already confirmed receipt
+    if receipt_key is not None:
+        _receipts_check = _get_pending_receipts(ctx)
+        if receipt_key in _receipts_check and _receipts_check[receipt_key].get("confirmed"):
+            await update.effective_message.reply_text(
+                "✅ This receipt was already saved. You can still reply with corrections!"
+            )
+            return
     receipt_data = pending["data"]
     image_bytes = pending["image_bytes"]
     receipt_user = pending["user"]
@@ -2276,8 +2303,10 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         logger.error(f"Receipt hash recording error: {e}")
 
     summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
+    _rid = receipt_data.get("receipt_id", "")
+    _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
     await status_msg.edit_text(
-        f"✅ *Receipt Confirmed*\n\n{summary}\n\n"
+        f"✅ *Receipt Confirmed*{_rid_line}\n\n{summary}\n\n"
         f"Submitted by {receipt_user}\n"
         f"Confirmed by {confirmed_by}",
         parse_mode="Markdown",
@@ -2294,6 +2323,11 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     receipt_key = query.message.message_id
     receipts = _get_pending_receipts(ctx)
     pending_entry = receipts.get(receipt_key)
+    if not pending_entry:
+        # Fallback: extract receipt ID from message text
+        receipt_key_rid, pending_entry = _get_receipt_by_rid_from_text(ctx, query.message.text or "")
+        if pending_entry:
+            receipt_key = receipt_key_rid
     if pending_entry:
         pending = {
             "data": pending_entry["data"],
@@ -2536,8 +2570,10 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Receipt hash recording error: {e}")
 
     summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
+    _rid = receipt_data.get("receipt_id", "")
+    _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
     await query.edit_message_text(
-        f"✅ *Receipt Confirmed*\n\n{summary}\n\n"
+        f"✅ *Receipt Confirmed*{_rid_line}\n\n{summary}\n\n"
         f"Submitted by {receipt_user}\n"
         f"Confirmed by {name}",
         parse_mode="Markdown",
@@ -3457,7 +3493,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     if _reply_target:
-        receipt_key, pending_entry = _get_receipt_for_reply(ctx, _reply_target)
+        # Primary: extract receipt ID from the replied-to message text
+        _replied_text = (
+            update.message.reply_to_message.text or
+            update.message.reply_to_message.caption or ""
+        ) if update.message.reply_to_message else ""
+        receipt_key, pending_entry = _get_receipt_by_rid_from_text(ctx, _replied_text)
+        # Fallback: msg_ids chain
+        if pending_entry is None:
+            receipt_key, pending_entry = _get_receipt_for_reply(ctx, _reply_target)
 
     _is_reply_to_rcpt = pending_entry is not None and _reply_target is not None
 
