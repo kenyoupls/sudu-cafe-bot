@@ -2014,36 +2014,6 @@ async def cb_rcpnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def cb_duplicate_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle duplicate receipt confirmation — user says Yes (save anyway) or No (skip)."""
-    query = update.callback_query
-    await query.answer()
-
-    choice = query.data.split(":", 1)[1]  # "save" or "skip"
-    receipt_key, pending_entry = _get_latest_receipt(ctx)
-    pending = {
-        "data": pending_entry["data"],
-        "image_bytes": pending_entry["image_bytes"],
-        "user": pending_entry["user"],
-        "caption": pending_entry.get("caption", ""),
-    } if pending_entry else ctx.chat_data.get("pending_receipt")
-
-    if not pending:
-        await query.edit_message_text("⚠️ No pending receipt to process.")
-        return
-
-    if choice == "skip":
-        _clear_receipt_tracking(ctx, receipt_key=receipt_key)
-        await query.edit_message_text("🚫 Receipt skipped — duplicate not saved.")
-        return
-
-    # choice == "save" — proceed with normal confirmation
-    name = user_name(update)
-    # Route to the shared confirmation logic
-    await query.edit_message_text("⏳ Saving receipt (confirmed not a duplicate)...")
-    await _confirm_receipt(pending, name, update, ctx, skip_duplicate_check=True, receipt_key=receipt_key)
-
-
 def _merge_receipt_items(items: list) -> list:
     """Merge duplicate items on same receipt into one entry with summed qty."""
     merged = {}
@@ -2373,211 +2343,9 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # action == "confirm" — use shared logic
-    receipt_data = pending["data"]
-    image_bytes = pending["image_bytes"]
-    receipt_user = pending["user"]
-
-    # Check for duplicate receipt
-    supplier_check = receipt_data.get("supplier", "Unknown")
-    receipt_total_check = float(receipt_data.get("total") or 0)
-    receipt_date_check = receipt_data.get("date", now_sg().strftime("%d/%m/%Y"))
-    items_check = receipt_data.get("items", [])
-
-    existing = store.check_duplicate_receipt(
-        supplier_check, receipt_date_check, receipt_total_check, items_check
-    )
-    if existing:
-        _rid = receipt_data.get("receipt_id", "")
-        _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
-        await query.edit_message_text(
-            f"⚠️ *Possible duplicate receipt detected!*{_rid_line}\n\n"
-            f"A receipt from *{existing.get('supplier', supplier_check)}* on {existing.get('date', receipt_date_check)} "
-            f"for RM{existing.get('total', receipt_total_check):.2f} ({existing.get('item_count', len(items_check))} items) "
-            f"was already saved by {existing.get('recorded_by', '?')}.\n\n"
-            f"_Reply 'yes' to save anyway, or 'skip' to discard._",
-            parse_mode="Markdown",
-        )
-        # Mark receipt as waiting for duplicate decision
-        if receipt_key is not None:
-            receipts_dup = _get_pending_receipts(ctx)
-            if receipt_key in receipts_dup:
-                receipts_dup[receipt_key]["duplicate_pending"] = True
-        return  # Wait for user reply
-
-    await query.edit_message_text("⏳ Saving receipt, updating stock & records...")
-
-    results = []
-
-    try:
-        from google_integration import (
-            log_expense_detail, upload_receipt_to_drive,
-            update_monthly_expenses,
-        )
-
-        supplier = receipt_data.get("supplier", "Unknown")
-        receipt_date = receipt_data.get("date", now_sg().date().isoformat())
-        filename = f"{receipt_date}_receipt_{supplier.replace(' ', '_')}.jpg"
-
-        drive_link = upload_receipt_to_drive(
-            image_bytes, filename, "image/jpeg",
-            description=f"Receipt from {supplier}, RM{receipt_data.get('total', 0):.2f}",
-        )
-        if drive_link:
-            results.append(f"📁 Saved to Drive")
-
-        # Update stock + log expense details from receipt items
-        items = receipt_data.get("items", [])
-        items = _merge_receipt_items(items)
-        paid_by = receipt_data.get("paid_by", "") or receipt_user
-        receipt_data["paid_by"] = paid_by
-        from google_integration import _normalize_date
-        expense_date = _normalize_date(receipt_data.get("date", now_sg().strftime("%d/%m/%Y")))
-        detail_count = 0
-
-        # Use receipt's final total — the amount actually paid
-        receipt_total = float(receipt_data.get("total") or 0)
-
-        import re as _re
-        for item in items:
-            item_name = clean_item_name(item.get("name", ""))
-            qty = item.get("qty", 0)
-            price = item.get("price", 0)
-            category = item.get("category", "ingredients")
-            try:
-                qty_nums = _re.findall(r'[\d.]+', str(qty))
-                qty_int = int(float(qty_nums[0])) if qty_nums else 1
-            except (ValueError, IndexError):
-                qty_int = 1
-
-            if item_name:
-                # For single-item receipts: log the receipt total directly
-                # For multi-item: log qty * unit_price per item
-                if len(items) == 1 and receipt_total > 0:
-                    item_amount = receipt_total
-                else:
-                    item_amount = qty_int * (float(price) if price else 0)
-
-                try:
-                    logged_detail = log_expense_detail(
-                        expense_date=expense_date,
-                        supplier=supplier,
-                        item_name=item_name,
-                        qty=qty_int,
-                        amount=item_amount,
-                        category=category or "ingredients",
-                        paid_by=paid_by,
-                        receipt_link=drive_link or "",
-                        recorded_by=receipt_user,
-                        receipt_id=receipt_data.get("receipt_id", ""),
-                    )
-                    if logged_detail:
-                        detail_count += 1
-                    else:
-                        logger.error(f"log_expense_detail returned False for {item_name}")
-                except Exception as e:
-                    logger.error(f"Expense detail error for {item_name}: {e}")
-
-                # Only update stock for items already being tracked.
-                # New items are handled by _detect_new_items (Regular vs One-off).
-                existing_stock = store.data.get("stock_current", {})
-                is_known = any(
-                    normalize_item_name(k) == normalize_item_name(item_name)
-                    for k in existing_stock
-                )
-                if is_known:
-                    store.add_receipt_to_stock(item_name, qty_int)
-
-        if items:
-            results.append(f"📦 {len(items)} items updated in stock")
-
-        # Auto-add low stock items to shopping list
-        try:
-            low_items = store.check_low_stock([item.get("name", "") for item in items if item.get("name")])
-            if low_items:
-                await _auto_add_low_to_shopping(low_items, store, ctx.bot, update.effective_chat.id)
-        except Exception as e:
-            logger.error(f"Low stock auto-add error: {e}")
-
-        # Auto-clear matching shopping list items
-        try:
-            shopping = store.get_shopping_list()
-            cleared_items = []
-            for receipt_item in items:
-                r_name = receipt_item.get("name", "").lower()
-                if not r_name:
-                    continue
-                r_norm = normalize_item_name(r_name)
-                for idx, shop_item in enumerate(shopping):
-                    if shop_item.get("bought"):
-                        continue
-                    s_norm = normalize_item_name(shop_item.get("item", ""))
-                    # Match if either contains the other, or normalized names match
-                    if (r_norm in s_norm or s_norm in r_norm or r_norm == s_norm):
-                        store.mark_bought(idx)
-                        cleared_items.append(shop_item["item"])
-                        break
-            if cleared_items:
-                results.append(f"🛒 Auto-cleared from shopping: {', '.join(cleared_items)}")
-        except Exception as e:
-            logger.error(f"Auto-clear shopping error: {e}")
-
-        if detail_count:
-            results.append(f"📋 {detail_count} items logged to Expenses (paid by {paid_by})")
-
-        # Update monthly expense aggregation + monthly summary
-        try:
-            update_monthly_expenses()
-        except Exception as e:
-            logger.error(f"Monthly expense aggregation error: {e}")
-        try:
-            from google_integration import generate_monthly_summary
-            generate_monthly_summary()
-        except Exception as e:
-            logger.error(f"Monthly summary update error: {e}")
-
-    except ImportError:
-        results.append("⚠️ Google integration not configured")
-    except Exception as e:
-        logger.error(f"Receipt save error: {e}")
-        results.append(f"⚠️ Partial save: {e}")
-
-    await _detect_new_items(items, update, ctx)
-
-    # Mark as confirmed but keep in memory for post-confirm corrections
-    if receipt_key is not None:
-        receipts = _get_pending_receipts(ctx)
-        if receipt_key in receipts:
-            receipts[receipt_key]["confirmed"] = True
-            receipts[receipt_key]["confirmed_at"] = now_sg().isoformat()
-            # Track the confirmation message too
-            if query.message:
-                ids = receipts[receipt_key].setdefault("msg_ids", [])
-                if query.message.message_id not in ids:
-                    ids.append(query.message.message_id)
-    else:
-        _clear_receipt_tracking(ctx, receipt_key=receipt_key)
-
-    # Record receipt hash for duplicate detection
-    try:
-        store.record_receipt_hash(
-            supplier=receipt_data.get("supplier", "Unknown"),
-            receipt_date=receipt_data.get("date", now_sg().strftime("%d/%m/%Y")),
-            total=float(receipt_data.get("total") or 0),
-            items=receipt_data.get("items", []),
-            recorded_by=name,
-        )
-    except Exception as e:
-        logger.error(f"Receipt hash recording error: {e}")
-
-    summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
-    _rid = receipt_data.get("receipt_id", "")
-    _rid_line = f"\n🆔 `{_rid}`" if _rid else ""
+    # Buttons removed — confirm via text reply now
     await query.edit_message_text(
-        f"✅ *Receipt Confirmed*{_rid_line}\n\n{summary}\n\n"
-        f"Submitted by {receipt_user}\n"
-        f"Confirmed by {name}",
-        parse_mode="Markdown",
+        "ℹ️ Please reply to the receipt message with 'ok' or 'confirm' to save it."
     )
 
 
@@ -5076,7 +4844,6 @@ def main():
 
     # Receipt confirm/change callback (allowed everywhere — staff can submit receipts)
     app.add_handler(CallbackQueryHandler(g(cb_receipt), pattern=r"^receipt:"))
-    app.add_handler(CallbackQueryHandler(g(cb_receipt_chgcat), pattern=r"^receipt:chgcat$"))
     app.add_handler(CallbackQueryHandler(g(cb_catitem), pattern=r"^catitem:\d+$"))
     app.add_handler(CallbackQueryHandler(g(cb_setcat), pattern=r"^setcat:\d+:"))
 
@@ -5087,7 +4854,6 @@ def main():
     app.add_handler(CallbackQueryHandler(g(cb_newitem), pattern=r"^newitem:"))
     app.add_handler(CallbackQueryHandler(g(cb_rcpnew), pattern=r"^rcpnew:"))
     app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern=r"^noop$"))
-    app.add_handler(CallbackQueryHandler(g(cb_duplicate_check), pattern=r"^dupcheck:"))
 
     # Voice note handler
     app.add_handler(MessageHandler(filters.VOICE, g(handle_voice_note)))
