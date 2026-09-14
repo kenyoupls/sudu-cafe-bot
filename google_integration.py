@@ -295,6 +295,7 @@ def log_expense_detail(
     receipt_link: str = "",
     recorded_by: str = "",
     notes: str = "",
+    receipt_id: str = "",
 ) -> bool:
     """Log a single expense item to the Expenses Detail sheet.
 
@@ -321,6 +322,13 @@ def log_expense_detail(
 
     try:
         ws = ss.worksheet("Expenses Detail")
+        # Ensure Receipt ID header exists in column J
+        try:
+            headers = ws.row_values(1)
+            if len(headers) < 10 or headers[9] != "Receipt ID":
+                ws.update_cell(1, 10, "Receipt ID")
+        except Exception:
+            pass
         _maybe_insert_month_separator(ws, expense_date, 9)
         row_data = [
             expense_date,
@@ -332,6 +340,7 @@ def log_expense_detail(
             supplier,
             paid_by,
             _fmt_ts(),
+            receipt_id,
         ]
         ws.append_row(row_data, value_input_option="USER_ENTERED", table_range="A1")
         return True
@@ -528,6 +537,135 @@ def delete_expense_rows(supplier: str, expense_date: str) -> int:
     except Exception as e:
         logger.error(f"delete_expense_rows error: {e}")
         return 0
+
+
+def update_expense_by_receipt_id(receipt_id: str, items: list, receipt_data: dict) -> int:
+    """Update expense rows matching a receipt ID with corrected item data.
+    Deletes old rows with this receipt_id and re-inserts corrected ones.
+    Returns count of rows updated."""
+    ss = _get_spreadsheet()
+    if ss is None:
+        return 0
+
+    try:
+        ws = ss.worksheet("Expenses Detail")
+        all_rows = ws.get_all_values()
+        if not all_rows or len(all_rows) < 2:
+            return 0
+
+        header = all_rows[0]
+        # Find Receipt ID column (column J, index 9)
+        rid_col = None
+        for i, h in enumerate(header):
+            if 'receipt' in h.lower() and 'id' in h.lower():
+                rid_col = i
+                break
+        if rid_col is None:
+            # Try column J (index 9) as fallback
+            if len(header) > 9:
+                rid_col = 9
+            else:
+                logger.error("Could not find Receipt ID column")
+                return 0
+
+        # Find rows to delete (from bottom up)
+        rows_to_delete = []
+        for row_idx, row in enumerate(all_rows[1:], 2):
+            if len(row) > rid_col and row[rid_col].strip() == receipt_id:
+                rows_to_delete.append(row_idx)
+
+        # Delete old rows (bottom up)
+        for row_idx in sorted(rows_to_delete, reverse=True):
+            ws.delete_rows(row_idx)
+
+        # Re-insert corrected items
+        from storage import clean_item_name
+        supplier = receipt_data.get("supplier", "Unknown")
+        paid_by = receipt_data.get("paid_by", "")
+        expense_date = _normalize_date(receipt_data.get("date", ""))
+        receipt_total = float(receipt_data.get("total") or 0)
+
+        from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
+        import re as _re
+
+        items_merged = _merge_items_for_sheet(items)
+        count = 0
+        for item in items_merged:
+            item_name = clean_item_name(item.get("name", ""))
+            if not item_name:
+                continue
+            qty = item.get("qty", 1)
+            price = item.get("price", 0)
+            cat = (item.get("category", DEFAULT_CATEGORY) or DEFAULT_CATEGORY).lower().strip()
+            if cat == "useables":
+                cat = "consumables"
+            if cat not in ITEM_CATEGORIES:
+                cat = DEFAULT_CATEGORY
+
+            try:
+                qty_nums = _re.findall(r'[\d.]+', str(qty))
+                qty_int = int(float(qty_nums[0])) if qty_nums else 1
+            except (ValueError, IndexError):
+                qty_int = 1
+
+            if len(items_merged) == 1 and receipt_total > 0:
+                item_amount = receipt_total
+            else:
+                item_amount = qty_int * (float(price) if price else 0)
+
+            row_data = [
+                expense_date,
+                item_name,
+                qty_int,
+                f"{float(price) if price else 0:.2f}",
+                f"{item_amount:.2f}",
+                cat.capitalize(),
+                supplier,
+                paid_by,
+                _fmt_ts(),
+                receipt_id,
+            ]
+            ws.append_row(row_data, value_input_option="USER_ENTERED", table_range="A1")
+            count += 1
+
+        # Re-aggregate monthly
+        try:
+            update_monthly_expenses()
+        except Exception as e:
+            logger.error(f"Monthly re-aggregation after receipt update: {e}")
+
+        logger.info(f"Updated {count} rows for receipt {receipt_id} (deleted {len(rows_to_delete)} old rows)")
+        return count
+
+    except Exception as e:
+        logger.error(f"Failed to update expense by receipt ID: {e}")
+        return 0
+
+
+def _merge_items_for_sheet(items: list) -> list:
+    """Merge duplicate items for sheet writing (same as _merge_receipt_items in bot.py)."""
+    from storage import normalize_item_name
+    merged = {}
+    for item in items:
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+        key = normalize_item_name(name)
+        if key in merged:
+            try:
+                merged[key]["qty"] = int(merged[key].get("qty", 1)) + int(item.get("qty", 1))
+            except (ValueError, TypeError):
+                merged[key]["qty"] = int(merged[key].get("qty", 1)) + 1
+            try:
+                existing_price = float(merged[key].get("price", 0) or 0)
+                new_price = float(item.get("price", 0) or 0)
+                if new_price > existing_price:
+                    merged[key]["price"] = new_price
+            except (ValueError, TypeError):
+                pass
+        else:
+            merged[key] = dict(item)
+    return list(merged.values())
 
 
 def get_expenses_detail(month: str = None) -> list:

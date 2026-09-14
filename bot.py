@@ -1204,6 +1204,7 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if receipt_data:
                 _fix_receipt_total(receipt_data)
                 _fix_receipt_paid_by(receipt_data, name)
+                receipt_data["receipt_id"] = _generate_receipt_id()
                 # Auto-apply saved item name corrections
                 _corrections_applied = store.apply_receipt_corrections(receipt_data.get("items", []))
                 _r_total = float(receipt_data.get('total') or 0)
@@ -1219,7 +1220,6 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
                 sent_msg = await update.message.reply_text(
                     confirm_msg,
-                    reply_markup=_receipt_confirm_buttons(new_items),
                     parse_mode="Markdown",
                 )
                 # Store in multi-slot dict keyed by confirmation message ID
@@ -1497,6 +1497,7 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if receipt_data:
                 _fix_receipt_total(receipt_data)
                 _fix_receipt_paid_by(receipt_data, name)
+                receipt_data["receipt_id"] = _generate_receipt_id()
                 # Auto-apply saved item name corrections
                 _corrections = store.apply_receipt_corrections(receipt_data.get("items", []))
                 remember(name, f"[Receipt Video: {receipt_data.get('supplier', '?')} "
@@ -1504,11 +1505,10 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                          "receipt", chat_id, msg_id)
 
                 new_items = _detect_new_items_list(receipt_data.get("items", []))
-                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections_applied)
+                confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections)
 
                 sent_msg = await msg.reply_text(
                     confirm_msg,
-                    reply_markup=_receipt_confirm_buttons(new_items),
                     parse_mode="Markdown",
                 )
                 receipts = _get_pending_receipts(ctx)
@@ -1645,7 +1645,22 @@ def _get_pending_receipts(ctx) -> dict:
         ctx.chat_data.pop("pending_receipt_msg_id", None)
         ctx.chat_data.pop("pending_receipt_msg_ids", None)
         ctx.chat_data.pop("pending_new_items", None)
-    return ctx.chat_data.setdefault("pending_receipts", {})
+    # Auto-expire confirmed receipts older than 2 hours
+    result = ctx.chat_data.setdefault("pending_receipts", {})
+    expired = []
+    for key, rcpt in result.items():
+        if rcpt.get("confirmed"):
+            confirm_ts = rcpt.get("confirmed_at")
+            if confirm_ts:
+                try:
+                    from datetime import datetime, timedelta
+                    if now_sg() - datetime.fromisoformat(confirm_ts) > timedelta(hours=2):
+                        expired.append(key)
+                except Exception:
+                    pass
+    for key in expired:
+        result.pop(key, None)
+    return result
 
 
 def _get_receipt_for_reply(ctx, reply_msg_id: int):
@@ -1666,6 +1681,14 @@ def _get_latest_receipt(ctx):
         return None, None
     key = list(receipts.keys())[-1]
     return key, receipts[key]
+
+
+def _generate_receipt_id() -> str:
+    """Generate a unique receipt ID: R-DDMMYY-HHMM-XXX (XXX = random 3 uppercase letters)."""
+    import random, string
+    ts = now_sg()
+    suffix = ''.join(random.choices(string.ascii_uppercase, k=3))
+    return f"R-{ts.strftime('%d%m%y')}-{ts.strftime('%H%M')}-{suffix}"
 
 
 def _fix_receipt_total_from_items(receipt_data: dict):
@@ -1725,14 +1748,20 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None, co
         confirm_msg += f"\U0001f3f7️ Discount: -RM{_r_discount:.2f}\n"
     confirm_msg += f"\U0001f4b0 *Total: RM{_r_total:.2f}*"
     if new_items:
-        confirm_msg += "\n\n\U0001f195 *New items — classify before confirming:*"
+        confirm_msg += "\n\n\U0001f195 *New items detected:*"
         for ni in new_items:
-            confirm_msg += f"\n  • {ni['name']}"
+            choice = ni.get("choice", "")
+            if choice == "regular":
+                confirm_msg += f"\n  ✅ {ni['name']}: Regular stock"
+            elif choice == "oneoff":
+                confirm_msg += f"\n  ✅ {ni['name']}: One-off"
+            else:
+                confirm_msg += f"\n  • {ni['name']} — reply 'regular' or 'oneoff'"
     if corrections:
         confirm_msg += "\n\n🔄 *Auto-corrected from memory:*"
         for old_n, new_n in corrections:
             confirm_msg += f"\n  • {old_n} → {new_n}"
-    confirm_msg += "\n\n_Reply 'yes' to confirm, or tell me what to change (e.g. 'paid by Eric')._"
+    confirm_msg += "\n\n_Reply to this message:_\n_• 'ok' or 'confirm' to save_\n_• Or tell me what to change (e.g. 'paid by Eric', 'bleach qty 5')_"
     return confirm_msg
 
 
@@ -2126,6 +2155,7 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
                         paid_by=paid_by,
                         receipt_link=drive_link or "",
                         recorded_by=receipt_user,
+                        receipt_id=receipt_data.get("receipt_id", ""),
                     )
                     if logged_detail:
                         detail_count += 1
@@ -2219,7 +2249,19 @@ async def _confirm_receipt(pending: dict, confirmed_by: str,
         # Fallback for receipts that didn't go through the new flow
         await _detect_new_items(items, update, ctx)
 
-    _clear_receipt_tracking(ctx, receipt_key=receipt_key)
+    # Mark as confirmed but keep in memory for post-confirm corrections
+    if receipt_key is not None:
+        receipts = _get_pending_receipts(ctx)
+        if receipt_key in receipts:
+            receipts[receipt_key]["confirmed"] = True
+            receipts[receipt_key]["confirmed_at"] = now_sg().isoformat()
+            # Track the confirmation message too
+            if status_msg:
+                ids = receipts[receipt_key].setdefault("msg_ids", [])
+                if status_msg.message_id not in ids:
+                    ids.append(status_msg.message_id)
+    else:
+        _clear_receipt_tracking(ctx, receipt_key=receipt_key)
 
     # Record receipt hash for duplicate detection
     try:
@@ -2392,6 +2434,7 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         paid_by=paid_by,
                         receipt_link=drive_link or "",
                         recorded_by=receipt_user,
+                        receipt_id=receipt_data.get("receipt_id", ""),
                     )
                     if logged_detail:
                         detail_count += 1
@@ -2466,7 +2509,19 @@ async def cb_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await _detect_new_items(items, update, ctx)
 
-    _clear_receipt_tracking(ctx, receipt_key=receipt_key)
+    # Mark as confirmed but keep in memory for post-confirm corrections
+    if receipt_key is not None:
+        receipts = _get_pending_receipts(ctx)
+        if receipt_key in receipts:
+            receipts[receipt_key]["confirmed"] = True
+            receipts[receipt_key]["confirmed_at"] = now_sg().isoformat()
+            # Track the confirmation message too
+            if query.message:
+                ids = receipts[receipt_key].setdefault("msg_ids", [])
+                if query.message.message_id not in ids:
+                    ids.append(query.message.message_id)
+    else:
+        _clear_receipt_tracking(ctx, receipt_key=receipt_key)
 
     # Record receipt hash for duplicate detection
     try:
@@ -3448,10 +3503,39 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ No pending receipt to process.")
             return
 
+        _is_confirmed = pending_entry.get("confirmed", False) if pending_entry else False
+
         # Strip bot tag so AI only sees the user's intent
         rcpt_text = text
         if ctx.bot.username:
             rcpt_text = rcpt_text.replace(f"@{ctx.bot.username}", "").strip()
+
+        # Check for new item classification via text (replaces buttons)
+        _rcpt_text_lower = rcpt_text.lower().strip()
+        _new_items = pending_entry.get("new_items", []) if pending_entry else []
+        _unclassified = [ni for ni in _new_items if not ni.get("choice")]
+        if _unclassified and _rcpt_text_lower in ("regular", "oneoff", "one-off", "one off"):
+            _choice = "regular" if _rcpt_text_lower == "regular" else "oneoff"
+            _unclassified[0]["choice"] = _choice
+            _item_name = _unclassified[0]["name"]
+            if pending_entry:
+                pending_entry["new_items"] = _new_items
+            # Re-render receipt message
+            new_items = _new_items
+            confirm_msg = _build_receipt_confirm_msg(pending["data"], pending["user"], new_items=new_items)
+            _remaining = [ni for ni in _new_items if not ni.get("choice")]
+            if _remaining:
+                sent_msg = await update.message.reply_text(
+                    f"✅ {_item_name} → {_choice}\n\n{confirm_msg}",
+                    parse_mode="Markdown",
+                )
+            else:
+                sent_msg = await update.message.reply_text(
+                    f"✅ {_item_name} → {_choice}\n\nAll items classified!\n\n{confirm_msg}",
+                    parse_mode="Markdown",
+                )
+            _track_receipt_msg(ctx, sent_msg.message_id, receipt_key=receipt_key)
+            return
 
         # Build a short summary for the AI to understand context
         rd = pending["data"]
@@ -3468,6 +3552,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         action = ai_result.get("action", "unclear")
 
         if action == "confirm":
+            if _is_confirmed:
+                await update.message.reply_text("✅ This receipt was already saved. You can still reply with corrections!")
+                return
             await _confirm_receipt(pending, name, update, ctx, receipt_key=receipt_key)
             return
 
@@ -3591,10 +3678,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         pending_entry["data"] = rd
                     else:
                         ctx.chat_data["pending_new_items"] = new_items
+
+                    # If receipt was already confirmed, update the Google Sheet too
+                    if _is_confirmed and rd.get("receipt_id"):
+                        try:
+                            from google_integration import update_expense_by_receipt_id
+                            update_expense_by_receipt_id(rd["receipt_id"], rd.get("items", []), rd)
+                        except Exception as e:
+                            logger.error(f"Post-confirm sheet update error: {e}")
+
                     confirm_msg = _build_receipt_confirm_msg(rd, pending["user"], new_items=new_items)
+                    _status = "📝 *Post-confirm update* — sheet updated too!" if _is_confirmed else ""
                     sent_msg = await update.message.reply_text(
-                        f"✅ Updated: {', '.join(change_descriptions)}\n\n{confirm_msg}",
-                        reply_markup=_receipt_confirm_buttons(new_items),
+                        f"✅ Updated: {', '.join(change_descriptions)}\n{_status}\n\n{confirm_msg}",
                         parse_mode="Markdown",
                     )
                     _track_receipt_msg(ctx, sent_msg.message_id, receipt_key=receipt_key)
@@ -3720,6 +3816,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if receipt_data:
                         _fix_receipt_total(receipt_data)
                         _fix_receipt_paid_by(receipt_data, name)
+                        receipt_data["receipt_id"] = _generate_receipt_id()
                         # Auto-apply saved item name corrections
                         _corrections = store.apply_receipt_corrections(receipt_data.get("items", []))
 
@@ -3728,11 +3825,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                             receipt_data["paid_by"] = extra_info
 
                         new_items = _detect_new_items_list(receipt_data.get("items", []))
-                        confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections_applied)
+                        confirm_msg = _build_receipt_confirm_msg(receipt_data, name, new_items=new_items, corrections=_corrections)
 
                         sent_msg = await update.message.reply_text(
                             confirm_msg,
-                            reply_markup=_receipt_confirm_buttons(new_items),
                             parse_mode="Markdown",
                         )
                         receipts = _get_pending_receipts(ctx)
