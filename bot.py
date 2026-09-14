@@ -2710,46 +2710,59 @@ def _auto_clear_matching_tasks(actions: list):
         logger.info(f"Auto-cleared {len(cleared)} tasks: {cleared}")
 
 
-def _find_ambiguous_stock_matches(item_name: str, store) -> list:
+def _find_ambiguous_stock_matches(item_name: str, store, user_text: str = "") -> list:
     """Check if item_name could match multiple stock items by word containment.
     Returns list of matching stock item names. If len > 1, it's ambiguous.
 
-    Example: 'Takeaway Plastic Cup' matches both 'Takeaway Plastic Cup' AND
-    'Takeaway Plastic Cup Cover' because all input words appear in both.
-    Only returns 1 match when the name is truly unique."""
-    input_norm = normalize_item_name(item_name)
-    input_words = input_norm.split()
-    if not input_words:
-        return []
-
+    Also checks user_text (the original message) for a broader match — the AI
+    often resolves 'takeaway cup' to 'Takeaway Plastic Cup', losing the original
+    intent. By also checking the user's raw words, we catch all 4 takeaway items."""
     all_stock = store.get_stock()
-    # Also check stock_current for items that might only be there
     stock_current = store.data.get("stock_current", {})
     all_names = set(list(all_stock.keys()) + list(stock_current.keys()))
 
-    # Word containment: all input words must appear in the stock item name
-    matches = []
-    for stock_name in all_names:
-        stock_norm = normalize_item_name(stock_name)
-        stock_words = stock_norm.split()
-        if all(w in stock_words for w in input_words):
-            matches.append(stock_name)
+    def _word_matches(query: str) -> list:
+        """Find stock items where ALL query words appear in the stock name."""
+        query_norm = normalize_item_name(query)
+        query_words = query_norm.split()
+        if not query_words:
+            return []
+        found = []
+        for stock_name in all_names:
+            stock_norm = normalize_item_name(stock_name)
+            stock_words = stock_norm.split()
+            if all(w in stock_words for w in query_words):
+                found.append(stock_name)
+        return found
 
-    # If exactly one match, or no matches, return as-is
+    # Check 1: match against the AI-resolved item name
+    matches = _word_matches(item_name)
+
+    # Check 2: also match against the original user message words
+    # Strip numbers (quantities) from user text to get just the item words
+    if user_text:
+        import re
+        # Remove bot mentions, numbers, and common filler words
+        clean_text = re.sub(r'@\S+', '', user_text)  # remove @mentions
+        clean_text = re.sub(r'\b\d+\b', '', clean_text)  # remove numbers
+        clean_text = clean_text.strip()
+        if clean_text:
+            user_matches = _word_matches(clean_text)
+            # Use the broader match set (more matches = more ambiguity to resolve)
+            if len(user_matches) > len(matches):
+                matches = user_matches
+
     if len(matches) <= 1:
         return matches if matches else [item_name]
 
-    # Multiple matches found — but if the input is an EXACT match to one
-    # of them AND no other item contains it as a subset, it's not ambiguous.
-    # e.g. "Milo Powder" exact-matches "Milo Powder" and nothing else contains
-    # all those words → not ambiguous. But "Takeaway Plastic Cup" exact-matches
-    # one item while "Takeaway Plastic Cup Cover" also matches → ambiguous.
     return sorted(matches)
 
 
 async def _execute_actions(actions: list, name: str, update: Update):
     """Execute structured actions returned by the AI."""
     feedback = []
+    # Get original user message for broader ambiguity matching
+    user_text = (update.message.text or "") if update.message else ""
 
     for act in actions:
         if not isinstance(act, dict):
@@ -2763,7 +2776,7 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 note = act.get("note", "")
                 if item:
                     # Ambiguity check: does this item name match multiple stock items?
-                    amb_matches = _find_ambiguous_stock_matches(item, store)
+                    amb_matches = _find_ambiguous_stock_matches(item, store, user_text)
                     if len(amb_matches) > 1:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
@@ -2855,7 +2868,7 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 for entry in items:
                     entry_item = entry.get("item", "")
                     if entry_item:
-                        amb_matches = _find_ambiguous_stock_matches(entry_item, store)
+                        amb_matches = _find_ambiguous_stock_matches(entry_item, store, user_text)
                         if len(amb_matches) > 1:
                             ambiguous_items.append((entry_item, amb_matches))
                         else:
@@ -2918,7 +2931,7 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 note = act.get("note", "")
                 if item:
                     # Ambiguity check
-                    amb_matches = _find_ambiguous_stock_matches(item, store)
+                    amb_matches = _find_ambiguous_stock_matches(item, store, user_text)
                     if len(amb_matches) > 1:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
@@ -3299,7 +3312,7 @@ async def _execute_actions(actions: list, name: str, update: Update):
                 count = act.get("count", "")
                 if item and count:
                     # Ambiguity check
-                    amb_matches = _find_ambiguous_stock_matches(item, store)
+                    amb_matches = _find_ambiguous_stock_matches(item, store, user_text)
                     if len(amb_matches) > 1:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + count.")
