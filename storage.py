@@ -4,6 +4,7 @@ Uses local JSON for fast reads, syncs to Google Sheets for visibility & backup.
 """
 import json
 import os
+import shutil
 import logging
 import threading
 import time as _time
@@ -521,13 +522,6 @@ class SheetsSync:
                     }
 
             logger.info(f"Read {len(stock)} stock items, {len(stock_current)} stock_current items from Sheet")
-            # Debug: log items that have stock_current values
-            sc_sample = {k: v for k, v in list(stock_current.items())[:30]}
-            logger.info(f"stock_current sample: {sc_sample}")
-            # Debug: check specifically for Puffed Rice and Sin Sing Coffee
-            for name_check in ["Puffed Rice", "Sin Sing Coffee"]:
-                found = any(name_check.lower() in k.lower() for k in stock_current)
-                logger.info(f"DEBUG: '{name_check}' in stock_current: {found}")
             return stock, history, stock_current
 
         except Exception as e:
@@ -601,8 +595,8 @@ class SheetsSync:
                 return False
             try:
                 existing = ws.get_all_values()
-                logger.info(f"[write_stock_item] attempt={attempt}, item={item!r}, qty={qty!r}, date_str={date_str!r}")
-                logger.info(f"[write_stock_item] header={existing[0] if existing else 'EMPTY'}")
+                logger.debug(f"[write_stock_item] attempt={attempt}, item={item!r}, qty={qty!r}, date_str={date_str!r}")
+                logger.debug(f"[write_stock_item] header={existing[0] if existing else 'EMPTY'}")
 
                 if not existing or not existing[0]:
                     ws.update("A1", [["Item", "Current Stock", date_str], [item, "", qty]])
@@ -621,14 +615,14 @@ class SheetsSync:
                 # Find or create date column (date columns start at column C / index 2)
                 if date_str in header[2:]:
                     col_idx = header.index(date_str, 2)
-                    logger.info(f"[write_stock_item] Found existing date column at col_idx={col_idx}")
+                    logger.debug(f"[write_stock_item] Found existing date column at col_idx={col_idx}")
                 else:
                     col_idx = 2
                     ws.insert_cols([[""]], col=3)
                     ws.update_acell("C1", date_str)
                     existing = ws.get_all_values()
                     header = existing[0] if existing else []
-                    logger.info(f"[write_stock_item] Created new date column, col_idx={col_idx}, new header={header}")
+                    logger.debug(f"[write_stock_item] Created new date column, col_idx={col_idx}, new header={header}")
 
                 # Find item row (by normalized name)
                 norm = normalize_item_name(item)
@@ -646,18 +640,18 @@ class SheetsSync:
                                 row_idx = i
                                 break
 
-                logger.info(f"[write_stock_item] norm={norm!r}, row_idx={row_idx}")
+                logger.debug(f"[write_stock_item] norm={norm!r}, row_idx={row_idx}")
 
                 if row_idx is not None:
                     cell = gspread.utils.rowcol_to_a1(row_idx + 1, col_idx + 1)
                     ws.update_acell(cell, qty)
-                    logger.info(f"[write_stock_item] Updated cell {cell} with {qty}")
+                    logger.debug(f"[write_stock_item] Updated cell {cell} with {qty}")
                 else:
                     new_row = [""] * len(header)
                     new_row[0] = item
                     new_row[col_idx] = qty
                     ws.append_row(new_row)
-                    logger.info(f"[write_stock_item] Appended new row for {item}")
+                    logger.debug(f"[write_stock_item] Appended new row for {item}")
 
                 ws.format("A1:Z1", {"textFormat": {"bold": True}})
                 return True  # success — exit the retry loop
@@ -1288,6 +1282,7 @@ class LocalJsonStore:
         self._sync_lock = threading.Lock()
         self._refresh_timer = None    # Periodic Sheet → JSON refresh
         self._pending_stock_writes = []
+        self._pending_stock_writes = list(self.data.get("pending_stock_writes", []))
 
         # Initialize Sheets sync
         if HAS_GSPREAD:
@@ -1327,6 +1322,7 @@ class LocalJsonStore:
                     except Exception as e:
                         self._pending_stock_writes.append(pw)
                         logger.error(f"Pending stock write retry failed: {pw['item']}: {e}")
+                self.data["pending_stock_writes"] = self._pending_stock_writes
                 _time.sleep(1)  # Brief pause after retries before reading
 
             # Stock
@@ -1393,10 +1389,26 @@ class LocalJsonStore:
         except Exception as e:
             logger.error(f"Quick stock refresh error: {e}")
 
+    def _atomic_write_json(self):
+        """Write self.data to self.file atomically: dump to a .tmp file, back up
+        the existing file (at most once per 60s), then os.replace() into place."""
+        if self.file.exists():
+            now = _time.time()
+            last_bak = getattr(self, "_last_bak", 0)
+            if now - last_bak >= 60:
+                try:
+                    shutil.copyfile(self.file, str(self.file) + ".bak")
+                    self._last_bak = now
+                except OSError as e:
+                    logger.error(f"Failed to write .bak backup: {e}")
+        tmp_path = str(self.file) + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(self.data, f, indent=2, default=str)
+        os.replace(tmp_path, self.file)
+
     def _save_local_only(self):
         """Save to JSON file WITHOUT triggering sync to Sheets."""
-        with open(self.file, "w") as f:
-            json.dump(self.data, f, indent=2, default=str)
+        self._atomic_write_json()
 
     def _start_periodic_refresh(self):
         """Refresh from Sheet every 10 minutes to pick up manual edits."""
@@ -1418,8 +1430,21 @@ class LocalJsonStore:
 
     def _load(self) -> dict:
         if self.file.exists():
-            with open(self.file, "r") as f:
-                data = json.load(f)
+            try:
+                with open(self.file, "r") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.error(f"cafe_data.json corrupt — restoring from .bak: {e}")
+                bak_path = Path(str(self.file) + ".bak")
+                if bak_path.exists():
+                    try:
+                        with open(bak_path, "r") as f:
+                            data = json.load(f)
+                    except (json.JSONDecodeError, OSError) as e2:
+                        logger.error(f"cafe_data.json.bak also corrupt/unreadable: {e2}")
+                        return self._default_data()
+                else:
+                    return self._default_data()
             self._cleanup_ok_values(data)
             return data
         return self._default_data()
@@ -1447,8 +1472,7 @@ class LocalJsonStore:
                 del history[date_str]
 
     def _save(self, changed: str = "all"):
-        with open(self.file, "w") as f:
-            json.dump(self.data, f, indent=2, default=str)
+        self._atomic_write_json()
         # Sync to Sheets in background thread (non-blocking)
         if self._sheets:
             self._sync_to_sheets_bg(changed)
@@ -1541,6 +1565,15 @@ class LocalJsonStore:
         """Find an existing stock item that matches by normalized name or alias.
         Returns the existing key if found, otherwise the new_name."""
         new_norm = normalize_item_name(new_name)
+        # Exact (case-insensitive) match wins before any normalisation,
+        # so size variants like "X 1L" vs "X 500ml" never cross-resolve.
+        new_lower = new_name.strip().lower()
+        for existing in self.data.get("stock", {}):
+            if existing.strip().lower() == new_lower:
+                return existing
+        for existing in self.data.get("stock_current", {}):
+            if existing.strip().lower() == new_lower:
+                return existing
         # Check direct normalized match first
         for existing in self.data.get("stock", {}):
             if normalize_item_name(existing) == new_norm:
@@ -1576,6 +1609,21 @@ class LocalJsonStore:
                 if len(existing_norm) >= 4 and (new_norm in existing_norm or existing_norm in new_norm):
                     return existing
         return new_name
+
+    def _queue_stock_write(self, item, qty, date):
+        """Queue a failed sheet write for retry. Replaces any older queued write for the same item so a stale value can never overwrite a newer one."""
+        self._pending_stock_writes = [pw for pw in self._pending_stock_writes if pw.get("item") != item]
+        self._pending_stock_writes.append({"item": item, "qty": qty, "date": date})
+        self.data["pending_stock_writes"] = self._pending_stock_writes
+        self._save_local_only()
+
+    def _drop_queued_write(self, item):
+        """A direct write for this item just succeeded — drop any stale queued retry."""
+        before = len(self._pending_stock_writes)
+        self._pending_stock_writes = [pw for pw in self._pending_stock_writes if pw.get("item") != item]
+        if len(self._pending_stock_writes) != before:
+            self.data["pending_stock_writes"] = self._pending_stock_writes
+            self._save_local_only()
 
     def update_stock(self, item: str, qty: str, updated_by: str):
         # Sanitize word-based qty values to numbers
@@ -1626,8 +1674,10 @@ class LocalJsonStore:
         self._rebuild_shopping_list()
 
         if not sheet_ok:
-            self._pending_stock_writes.append({"item": item, "qty": qty, "date": today})
+            self._queue_stock_write(item, qty, today)
             logger.warning(f"Queued pending stock write: {item}={qty} (sheet write failed)")
+        else:
+            self._drop_queued_write(item)
         return sheet_ok
 
     def remove_stock(self, item: str) -> bool:
@@ -1826,6 +1876,8 @@ class LocalJsonStore:
             self.data["stock_history"][stock_date] = {}
 
         # --- Sheet batch update ---
+        sheet_ok = True
+        sanitised = []
         if self._sheets:
             try:
                 ws = self._sheets._get_ws("Stock")
@@ -1900,6 +1952,7 @@ class LocalJsonStore:
                                 pass  # Keep original string (e.g. "—") if not convertible
                         if not item_name:
                             continue
+                        sanitised.append((item_name, qty))
                         row_idx = _find_row(item_name)
                         if row_idx is not None:
                             # Date column
@@ -1934,6 +1987,16 @@ class LocalJsonStore:
                     ws.format("A1:Z1", {"textFormat": {"bold": True}})
             except Exception as e:
                 logger.error(f"Sheet batch write failed (stock bulk): {e}")
+                sheet_ok = False
+                if sanitised:
+                    for item_name, qty in sanitised:
+                        if item_name:
+                            self._queue_stock_write(item_name, qty, stock_date)
+                else:
+                    for entry in items:
+                        item_name = entry.get("item", "")
+                        if item_name:
+                            self._queue_stock_write(item_name, entry.get("qty"), stock_date)
 
         # --- Update JSON cache ---
         for entry in items:
@@ -1956,6 +2019,8 @@ class LocalJsonStore:
 
         self._save_local_only()
         self._rebuild_shopping_list()
+
+        return sheet_ok
 
     def add_receipt_to_stock(self, item: str, qty: int, receipt_date: str = None):
         """Add received quantity to running current stock (from a receipt),
@@ -2184,8 +2249,10 @@ class LocalJsonStore:
         self._rebuild_shopping_list()
 
         if not sheet_ok:
-            self._pending_stock_writes.append({"item": item, "qty": str(new_qty), "date": today_sheet})
+            self._queue_stock_write(item, str(new_qty), today_sheet)
             logger.warning(f"Queued pending stock write: {item}={new_qty} (sheet write failed)")
+        else:
+            self._drop_queued_write(item)
         return sheet_ok
 
     def undo_last_stock_update(self, item: str) -> bool:
@@ -2290,14 +2357,13 @@ class LocalJsonStore:
 
         low_items = []
         stock = self.data.get("stock", {})
+        stock_current = self.data.get("stock_current", {})
 
         items_to_check = items_updated if items_updated else stock.keys()
 
         for item_name in items_to_check:
-            info = stock.get(item_name, {})
-            qty_str = str(info.get("qty", "")).strip()
-
-            # Find matching minimum (fuzzy match via normalize_item_name)
+            # Find matching minimum first (fuzzy match via normalize_item_name),
+            # so an item not counted yet but present in minimums is still checked.
             min_info = None
             item_norm = normalize_item_name(item_name)
             for min_name, min_data in STOCK_MINIMUMS.items():
@@ -2314,6 +2380,16 @@ class LocalJsonStore:
 
             if not min_info:
                 continue
+
+            if item_name in stock:
+                info = stock.get(item_name, {})
+                qty_str = str(info.get("qty", "")).strip()
+            elif item_name in stock_current:
+                qty_str = str(stock_current.get(item_name, "")).strip()
+            else:
+                # Not counted anywhere but present in minimums — treat as 0,
+                # same rule as get_low_stock (empty Column B = 0).
+                qty_str = "0"
 
             # Extract numeric value from qty
             nums = re.findall(r'[\d.]+', qty_str)
