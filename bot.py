@@ -14,6 +14,7 @@ import json
 import logging
 import random
 import html
+import re
 from datetime import datetime, timedelta, date, time as dtime
 from zoneinfo import ZoneInfo
 from textwrap import dedent
@@ -2774,9 +2775,35 @@ def _find_ambiguous_stock_matches(item_name: str, store, user_text: str = "") ->
     return sorted(matches)
 
 
+def _narrow_candidates(fragment: str, candidates: list) -> list:
+    """Narrow a candidate list by a user's reply fragment.
+    Number → pick that index. Otherwise keep candidates containing ALL words of the fragment."""
+    frag = fragment.strip()
+    if not frag:
+        return candidates
+    if frag.isdigit():
+        idx = int(frag) - 1
+        return [candidates[idx]] if 0 <= idx < len(candidates) else candidates
+    words = normalize_item_name(frag).split()
+    if not words:
+        return candidates
+    kept = [c for c in candidates if all(w in normalize_item_name(c).split() for w in words)]
+    if not kept:
+        return candidates
+    # "plastic cup" → prefer "Takeaway Plastic Cup" over "Takeaway Plastic Cup Cover":
+    # drop a candidate only if another kept candidate's words are a strict subset
+    # of it (i.e. it's the same item plus extra words). Genuinely different items
+    # (Hot Tea Cup Cover vs Plastic Cup Cover for "cover") are all kept → re-ask.
+    wsets = {c: set(normalize_item_name(c).split()) for c in kept}
+    minimal = [c for c in kept
+               if not any(wsets[o] < wsets[c] for o in kept if o != c)]
+    return minimal if minimal else kept
+
+
 async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
     """Execute structured actions returned by the AI."""
     feedback = []
+    pending_items = []
     # Get original user message for broader ambiguity matching
     user_text = (update.message.text or "") if update.message else ""
 
@@ -2797,23 +2824,22 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
                         # Save state for disambiguation reply recovery
-                        if ctx and hasattr(ctx, 'chat_data'):
-                            ctx.chat_data["pending_disambiguation"] = {
-                                "original_item": item,
-                                "qty": qty,
-                                "note": note,
-                                "matches": amb_matches,
-                                "action_type": "update_stock",
-                                "reporter": name,
-                            }
+                        pending_items.append({
+                            "original": item,
+                            "qty": qty,
+                            "note": note,
+                            "matches": amb_matches,
+                            "action_type": "update_stock",
+                        })
                         continue
                     sheet_ok = store.update_stock(item, qty, f"{name}: {note}" if note else name)
+                    canonical = store._find_existing_stock_name(item)
                     if sheet_ok:
-                        feedback.append(f"📦 {item} → {qty}")
+                        feedback.append(f"📦 {canonical} → {qty}")
                     else:
-                        feedback.append(f"📦 {item} → {qty} (⚠️ sheet busy, will auto-retry)")
+                        feedback.append(f"📦 {canonical} → {qty} (⚠️ sheet busy, will auto-retry)")
                     # Check low stock
-                    low_items = store.check_low_stock([item])
+                    low_items = store.check_low_stock([canonical])
                     if low_items:
                         li = low_items[0]
                         unit = f" {li['unit']}" if li.get('unit') else ""
@@ -2896,24 +2922,36 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                     if entry_item:
                         amb_matches = _find_ambiguous_stock_matches(entry_item, store, user_text)
                         if len(amb_matches) > 1:
-                            ambiguous_items.append((entry_item, amb_matches))
+                            ambiguous_items.append((entry_item, amb_matches, entry.get("qty", "")))
                         else:
                             entry["checked_by"] = f"Count by {checked_by}"
                             clean_items.append(entry)
                     else:
                         clean_items.append(entry)
+                sheet_ok = True
                 if clean_items:
-                    store.update_stock_bulk(clean_items, stock_date)
+                    sheet_ok = store.update_stock_bulk(clean_items, stock_date)
                 # Replace items with clean_items for the rest of the handler
                 items = clean_items
                 if ambiguous_items:
-                    for amb_item, amb_matches in ambiguous_items:
+                    for amb_item, amb_matches, amb_qty in ambiguous_items:
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{amb_item}\" matches multiple items:\n{match_list}\nWhich one?")
+                        pending_items.append({
+                            "original": amb_item,
+                            "qty": amb_qty,
+                            "note": "",
+                            "matches": amb_matches,
+                            "action_type": "bulk_stock",
+                        })
+                    feedback.append("Reply with the name or number for each (e.g. \"plastic, thick\").")
                 count = len([e for e in items if e.get("item")])
                 date_label = stock_date if stock_date else "today"
                 if count:
-                    feedback.append(f"📦 Updated {count} stock items ({date_label}) to Google Sheet!")
+                    line = f"📦 Updated {count} stock items ({date_label}) to Google Sheet!"
+                    if sheet_ok is False:
+                        line += " (⚠️ sheet busy, will auto-retry)"
+                    feedback.append(line)
 
                 # Check for low stock against SOP minimums
                 item_names = [e.get("item", "") for e in items if e.get("item")]
@@ -2962,25 +3000,24 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + qty.")
                         # Save state for disambiguation reply recovery
-                        if ctx and hasattr(ctx, 'chat_data'):
-                            ctx.chat_data["pending_disambiguation"] = {
-                                "original_item": item,
-                                "qty": new_qty,
-                                "note": note,
-                                "matches": amb_matches,
-                                "action_type": "correct_stock",
-                                "reporter": name,
-                            }
+                        pending_items.append({
+                            "original": item,
+                            "qty": new_qty,
+                            "note": note,
+                            "matches": amb_matches,
+                            "action_type": "correct_stock",
+                        })
                         continue
                     try:
                         new_qty = int(new_qty)
                     except (ValueError, TypeError):
                         new_qty = 0
                     sheet_ok = store.correct_stock_entry(item, new_qty, f"{name}: {note}" if note else name)
+                    canonical = store._find_existing_stock_name(item)
                     if sheet_ok:
-                        feedback.append(f"✏️ Corrected: {item} → {new_qty}")
+                        feedback.append(f"✏️ Corrected: {canonical} → {new_qty}")
                     else:
-                        feedback.append(f"✏️ Corrected: {item} → {new_qty} (⚠️ sheet busy, will auto-retry)")
+                        feedback.append(f"✏️ Corrected: {canonical} → {new_qty} (⚠️ sheet busy, will auto-retry)")
 
             elif action_type == "undo_receipt":
                 supplier = act.get("supplier", "")
@@ -3353,20 +3390,22 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                         match_list = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(amb_matches))
                         feedback.append(f"❓ \"{item}\" matches multiple items:\n{match_list}\nWhich one? Reply with the full name + count.")
                         # Save state for disambiguation reply recovery
-                        if ctx and hasattr(ctx, 'chat_data'):
-                            ctx.chat_data["pending_disambiguation"] = {
-                                "original_item": item,
-                                "qty": count,
-                                "note": "",
-                                "matches": amb_matches,
-                                "action_type": "stock_count",
-                                "reporter": name,
-                            }
+                        pending_items.append({
+                            "original": item,
+                            "qty": count,
+                            "note": "",
+                            "matches": amb_matches,
+                            "action_type": "stock_count",
+                        })
                         continue
                     # Validate against expected levels
                     warning = validate_stock_count(item, count)
-                    store.update_stock(item, count, f"Count by {name}")
-                    feedback.append(f"📦 Counted: {item} = {count}")
+                    sheet_ok = store.update_stock(item, count, f"Count by {name}")
+                    canonical = store._find_existing_stock_name(item)
+                    if sheet_ok:
+                        feedback.append(f"📦 Counted: {canonical} = {count}")
+                    else:
+                        feedback.append(f"📦 Counted: {canonical} = {count} (⚠️ sheet busy, will auto-retry)")
                     if warning:
                         feedback.append(warning)
 
@@ -3408,6 +3447,9 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
 
         except Exception as e:
             logger.error(f"Action execution error ({action_type}): {e}")
+
+    if pending_items and ctx is not None and hasattr(ctx, "chat_data"):
+        ctx.chat_data["pending_disambiguation"] = {"msg_id": None, "reporter": name, "items": pending_items}
 
     return feedback
 
@@ -3962,48 +4004,60 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = text.replace(f"@{ctx.bot.username}", "").strip()
 
     # ─── Disambiguation reply check ────
-    # If user replies to a ❓ disambiguation message, resolve with saved qty
-    if (update.message.reply_to_message
-            and "pending_disambiguation" in ctx.chat_data):
-        replied = update.message.reply_to_message
-        if (replied.from_user and replied.from_user.id == ctx.bot.id
-                and "❓" in (replied.text or "")):
-            pending = ctx.chat_data.pop("pending_disambiguation")
-            user_pick = text.lower()
-
-            # Match user's word(s) against saved candidates
-            matched = None
-            for candidate in pending["matches"]:
-                if user_pick in candidate.lower():
-                    matched = candidate
+    # User replied to our ❓ message: narrow/resolve each pending item.
+    pend = ctx.chat_data.get("pending_disambiguation")
+    if (pend and update.message.reply_to_message
+            and update.message.reply_to_message.message_id == pend.get("msg_id")):
+        fragments = [f for f in re.split(r"[,;\n]+", text) if f.strip()] or [text]
+        resolved, still_pending, progressed = [], [], False
+        items_pending = pend.get("items", [])
+        # "plastic, thick" / "2, 1" for two pending items → pair positionally
+        positional = len(fragments) == len(items_pending) > 1
+        for idx, entry in enumerate(items_pending):
+            cands = list(entry["matches"])
+            for frag in ([fragments[idx]] if positional else fragments):
+                narrowed = _narrow_candidates(frag, cands)
+                if len(narrowed) < len(cands):
+                    cands = narrowed
+                    progressed = True
+                if len(cands) == 1:
                     break
+            if len(cands) == 1:
+                resolved.append((entry, cands[0]))
+            else:
+                still_pending.append({**entry, "matches": cands})
 
-            if matched:
-                qty = pending["qty"]
-                note = pending.get("note", "")
-                reporter = pending["reporter"]
-                action_type = pending["action_type"]
-
-                if action_type == "correct_stock":
-                    store.correct_stock_entry(matched, qty, f"{reporter}: {note}" if note else reporter)
-                    sheet_ok = True
+        if progressed:
+            lines = []
+            low_all = []
+            reporter = pend.get("reporter", name)
+            for entry, chosen in resolved:
+                qty = entry["qty"]; note = entry.get("note", "")
+                by = f"{reporter}: {note}" if note else reporter
+                if entry["action_type"] == "correct_stock":
+                    ok = store.correct_stock_entry(chosen, qty, by)
                 else:
-                    sheet_ok = store.update_stock(matched, qty, f"{reporter}: {note}" if note else reporter)
-
-                status = "" if sheet_ok else " (⚠️ sheet busy, will auto-retry)"
-                await update.message.reply_text(f"📦 {matched} → {qty}{status}")
-
-                # Low stock check
-                low_items = store.check_low_stock([matched])
-                if low_items:
-                    li = low_items[0]
-                    unit = f" {li['unit']}" if li.get('unit') else ""
-                    await update.message.reply_text(
-                        f"⚠️ LOW STOCK: {li['item']} is at {li['qty']} (min: {li['min']}{unit})")
-                    await _auto_add_low_to_shopping(low_items, store, update.get_bot(), update.effective_chat.id)
-
-                return  # Done — skip AI processing
-            # else: no match, fall through to normal AI processing
+                    ok = store.update_stock(chosen, qty, by)
+                canonical = store._find_existing_stock_name(chosen)
+                lines.append(f"📦 {canonical} → {qty}" + ("" if ok else " (⚠️ sheet busy, will auto-retry)"))
+                low_all.extend(store.check_low_stock([canonical]) or [])
+            for li in low_all:
+                unit = f" {li['unit']}" if li.get('unit') else ""
+                lines.append(f"⚠️ LOW STOCK: {li['item']} is at {li['qty']} (min: {li['min']}{unit})")
+            if still_pending:
+                for entry in still_pending:
+                    ml = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(entry["matches"]))
+                    lines.append(f"❓ \"{entry['original']}\" — which one?\n{ml}")
+                lines.append("Reply with the name or number.")
+            sent = await update.message.reply_text("\n".join(lines))
+            if still_pending:
+                ctx.chat_data["pending_disambiguation"] = {"msg_id": sent.message_id, "reporter": reporter, "items": still_pending}
+            else:
+                ctx.chat_data.pop("pending_disambiguation", None)
+            if low_all:
+                await _auto_add_low_to_shopping(low_all, store, update.get_bot(), update.effective_chat.id)
+            return
+        # Nothing matched — probably unrelated; let the AI handle it, keep state.
 
     # ─── Extract reply context if replying to a message ────
     reply_context = None
@@ -4101,9 +4155,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Auto-clear tasks error: {e}")
             if feedback:
-                await update.message.reply_text(
+                sent = await update.message.reply_text(
                     "\n".join(feedback),
                 )
+                pend = ctx.chat_data.get("pending_disambiguation")
+                if pend and pend.get("msg_id") is None and sent:
+                    pend["msg_id"] = sent.message_id
 
             # Safety net: if AI triggered read_tab without a write action,
             # force refresh and re-answer so user doesn't get left hanging
