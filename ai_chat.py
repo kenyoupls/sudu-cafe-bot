@@ -950,7 +950,7 @@ MANAGER MINDSET RULES:
 - If staff seems stressed or overwhelmed, acknowledge it: "Tough day. Let's sort out [priority] first, the rest can wait."
 - When you don't have enough info to decide, ask ONE specific question — don't ask 5 things at once.
 - RECIPES: When someone asks how to make something, ask what batch size FIRST (e.g. "What size — 1L, 2L, 3L?"). Don't dump all batch sizes at once. Give only the one they asked for.
-- GENERAL RULE: If a question has multiple possible answers (which size? which month? which item?), ask which one first — don't dump all of them.
+- GENERAL RULE: If a question has multiple possible answers (which size? which month?), ask which one first — don't dump all of them. Exception: stock item names — never ask "which item?", just pass through what they said (see STOCK ITEM NAMES).
 
 You will be given: current café data (including older chat summaries and recent messages), and the new message.
 
@@ -1084,7 +1084,7 @@ You can include multiple actions in one array. Always give your natural chat rep
 
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers.
 
-RECIPES: When someone asks how to make something, ask what batch size FIRST (e.g. "What size — 1L, 2L, 3L?"). Don't dump all sizes. If a question has multiple possible answers (which size? which month? which item?), ask which one — don't dump all of them.
+RECIPES: When someone asks how to make something, ask what batch size FIRST (e.g. "What size — 1L, 2L, 3L?"). Don't dump all sizes. If a question has multiple possible answers (which size? which month?), ask which one — don't dump all of them. Exception: stock item names — never ask "which item?", just pass through what they said (see STOCK ITEM NAMES).
 
 CORRECTION DETECTION: When staff says something is wrong about a previous entry:
 - "That's wrong, it should be 6" / "Salah tu, bukan 12" → correct_stock
@@ -1122,7 +1122,7 @@ STOCK ITEM NAMES: Use the item name the user gives you. If it's a short or parti
 
 You have access to recent chat history and reply context. Use them to follow conversations naturally — don't re-ask things already discussed. CRITICAL: When a user REPLIES to a message, their follow-up is about the SAME TOPIC as that message. Scope your answer to that topic. Example: if the last messages were about bleach and user asks 'what's the current stock count?' — they mean bleach, not everything. If the conversation was about an event and they ask 'when is it?' — they mean that event. Never dump everything when the context narrows the question to something specific."""
 
-_GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit). Refuse politely."
+_GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit, who paid, monthly summaries). Refuse politely: \"Financial info is only available in the owner group. Check with the boss.\" Do NOT trigger any of these actions: show_expenses, show_whopaid, show_sales, show_pnl, show_staff, monthly_summary."
 
 _GROQ_SYSTEM_PROMPT = _GROQ_BASE_PROMPT
 _GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + _GROQ_STAFF_SUFFIX
@@ -1552,8 +1552,8 @@ def _parse_actions(raw_text: str) -> tuple:
     """
     import re
 
-    # Try 1: Standard ```actions\n[...]\n```
-    pattern = r'```actions?\s*\n(.*?)\n\s*```'
+    # Try 1: Fenced block — ```actions, ```json, or a bare ``` fence — anywhere in the text
+    pattern = r'```(?:actions?|json)?[ \t]*\n(\s*[\[\{].*?[\]\}])\s*\n?\s*```'
     match = re.search(pattern, raw_text, re.DOTALL)
 
     # Try 2: Single backtick `actions [...]`
@@ -1567,26 +1567,32 @@ def _parse_actions(raw_text: str) -> tuple:
         match = re.search(pattern3, raw_text, re.DOTALL)
 
     if not match:
-        return raw_text.strip(), []
+        # No actions block at all. Never leak a half-written fence to the user.
+        clean = re.sub(r'```(?:actions?|json)?.*?(```|$)', '', raw_text, flags=re.DOTALL).strip()
+        return (clean or raw_text.strip()), [], False
 
     actions_json = match.group(1).strip()
-    chat_reply = raw_text[:match.start()].strip()
+    # Keep text BEFORE and AFTER the block so a closing remark isn't lost
+    chat_reply = (raw_text[:match.start()] + " " + raw_text[match.end():]).strip()
 
-    # Clean up any leftover markdown from chat_reply
-    chat_reply = re.sub(r'```actions?\s*$', '', chat_reply).strip()
-    chat_reply = re.sub(r'`actions?\s*$', '', chat_reply).strip()
+    # Clean up any leftover markdown fences from chat_reply
+    chat_reply = re.sub(r'```(?:actions?|json)?', '', chat_reply)
+    chat_reply = re.sub(r'`actions?\s*$', '', chat_reply)
+    chat_reply = re.sub(r'[ \t]+\n', '\n', chat_reply).strip()
 
+    parse_failed = False
     try:
         actions = json.loads(actions_json)
         if isinstance(actions, dict):
             actions = [actions]
         if not isinstance(actions, list):
             actions = []
-    except json.JSONDecodeError:
-        logger.warning(f"Failed to parse actions JSON: {actions_json[:200]}")
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse actions JSON ({e}): {actions_json[:200]}")
         actions = []
+        parse_failed = True
 
-    return chat_reply, actions
+    return chat_reply, actions, parse_failed
 
 
 async def process_message(user_message: str, user_name: str, reply_context: str = None,
@@ -1605,7 +1611,11 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
                                chat_id=chat_id, is_staff_group=is_staff_group)
         raw = await _groq_text(prompt, system=groq_sys, temperature=0.7, max_tokens=2000)
         if raw:
-            chat_reply, actions = _parse_actions(raw)
+            chat_reply, actions, parse_failed = _parse_actions(raw)
+            if parse_failed:
+                # Groq wrote an actions block we couldn't read. Its chat reply
+                # probably says "done" — don't send that; let Gemini redo it.
+                raise ValueError("Groq actions JSON malformed — falling back to Gemini")
             if chat_reply:
                 remember_bot_response(chat_reply, chat_id=chat_id)
             return chat_reply, actions
@@ -1636,7 +1646,13 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
         if not raw:
             return None, []
 
-        chat_reply, actions = _parse_actions(raw)
+        chat_reply, actions, parse_failed = _parse_actions(raw)
+        if parse_failed:
+            # Both models produced unreadable actions — be honest instead of
+            # confirming something that didn't happen.
+            logger.error("Gemini actions JSON also malformed — sending honest fallback")
+            chat_reply = "Sorry, I couldn't process that action properly. Please try again."
+            actions = []
 
         # Store bot response in memory (without the actions block)
         if chat_reply:
