@@ -1626,16 +1626,30 @@ class LocalJsonStore:
             self._save_local_only()
 
     def update_stock(self, item: str, qty: str, updated_by: str):
+        # Deduplicate first so we can inspect current qty for the canonical name
+        item = self._find_existing_stock_name(item)
         # Sanitize word-based qty values to numbers
         qty_upper = str(qty).strip().upper()
         if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
             qty = "0"
         elif qty_upper in ("OK", "YES", "ADA"):
+            # "OK" = "we still have some, no change". Guard against overwriting
+            # a healthy count with 1 (the AI sometimes sends "OK" when it forgot
+            # the real qty — e.g. after a disambiguation reply).
+            current = self.data.get("stock_current", {}).get(item)
+            try:
+                current_n = int(current) if current is not None else None
+            except (ValueError, TypeError):
+                current_n = None
+            if current_n and current_n > 1:
+                logger.warning(
+                    f"update_stock: qty='OK' for {item} but current={current_n} — "
+                    f"skipping to preserve count (by {updated_by})"
+                )
+                return True  # nothing to do; not a failure
             qty = "1"
         elif qty_upper == "LOW":
             qty = "0"
-        # Deduplicate: use existing name if it matches
-        item = self._find_existing_stock_name(item)
         today = _now().strftime("%d/%m/%y")
 
         # 1. Write to Sheet FIRST (source of truth)
@@ -1942,6 +1956,20 @@ class LocalJsonStore:
                         if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
                             qty = 0
                         elif qty_upper in ("OK", "YES", "ADA"):
+                            # bulk = physical count. "OK" shouldn't clobber a
+                            # healthy count with 1 — skip the write for this row.
+                            canonical = self._find_existing_stock_name(item_name)
+                            current = self.data.get("stock_current", {}).get(canonical)
+                            try:
+                                current_n = int(current) if current is not None else None
+                            except (ValueError, TypeError):
+                                current_n = None
+                            if current_n and current_n > 1:
+                                logger.warning(
+                                    f"update_stock_bulk: qty='OK' for {canonical} but "
+                                    f"current={current_n} — skipping row"
+                                )
+                                continue
                             qty = 1
                         elif qty_upper == "LOW":
                             qty = 0

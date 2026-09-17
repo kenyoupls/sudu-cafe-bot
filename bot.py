@@ -2800,6 +2800,99 @@ def _narrow_candidates(fragment: str, candidates: list) -> list:
     return minimal if minimal else kept
 
 
+# Question starters — if the message opens with one of these it's a question,
+# not a stock update, so the pre-emptive check must skip it.
+_QUESTION_STARTERS = (
+    "how", "what", "where", "when", "who", "why", "which",
+    "is ", "are ", "do ", "does ", "did ", "can ", "could ", "should ", "would ",
+    "berapa", "apa", "kenapa", "bila", "siapa", "mana", "macam mana",
+)
+_UNIT_WORDS_RE = re.compile(
+    r'\b(?:pack|packs|packet|packets|kg|g|ml|l|pcs|pc|bag|bags|beg|box|boxes|'
+    r'carton|cartons|bottle|bottles|btl|unit|units|piece|pieces|tin|tins|'
+    r'roll|rolls|tub|tubs|jar|jars|can|cans)\b',
+    re.IGNORECASE,
+)
+_LEADING_VERBS_RE = re.compile(
+    r'^\s*(?:update|set|count|stock|is|at|got|ada|got|kena|dah|now|current|left|remaining)\b\s*',
+    re.IGNORECASE,
+)
+
+
+def _extract_stock_update_intent(text: str) -> list:
+    """Parse a short message into candidate {item, qty} stock updates.
+    Returns [] when the message clearly ISN'T a stock update (question, no number, etc.)."""
+    if not text or not text.strip():
+        return []
+    t = text.strip()
+    # Questions are never stock updates
+    if "?" in t:
+        return []
+    t_low = t.lower()
+    for starter in _QUESTION_STARTERS:
+        if t_low.startswith(starter):
+            return []
+    # Must contain at least one number somewhere
+    if not re.search(r"\d", t):
+        return []
+
+    out = []
+    fragments = [f.strip() for f in re.split(r"[,;\n]+", t) if f.strip()] or [t]
+    for frag in fragments:
+        # First integer in the fragment = qty
+        num_match = re.search(r"\b(\d+(?:\.\d+)?)\b", frag)
+        if not num_match:
+            continue
+        qty = num_match.group(1)
+        # Strip all numbers + units + leading verbs → item candidate
+        item = re.sub(r"\b\d+(?:\.\d+)?\b", " ", frag)
+        item = _UNIT_WORDS_RE.sub(" ", item)
+        item = _LEADING_VERBS_RE.sub("", item)
+        # Trim connectives at the ends
+        item = re.sub(r"^\s*(?:to|is|=|:)\s+", "", item, flags=re.IGNORECASE)
+        item = re.sub(r"\s+(?:to|is|=|:)\s*$", "", item, flags=re.IGNORECASE)
+        item = re.sub(r"\s+", " ", item).strip(" .-:=")
+        if not item:
+            continue
+        out.append({"item": item, "qty": qty})
+    return out
+
+
+def _preempt_stock_ambiguity(text: str):
+    """If the message reads like a stock update AND every parsed item is
+    ambiguous, return (feedback_lines, pending_items). Otherwise (None, None).
+    Only fires when EVERY fragment is ambiguous — mixed bulk falls through
+    so the AI's action still handles the clean items."""
+    intents = _extract_stock_update_intent(text)
+    if not intents:
+        return None, None
+    pending_items = []
+    for it in intents:
+        matches = _find_ambiguous_stock_matches(it["item"], store, "")
+        if len(matches) > 1:
+            pending_items.append({
+                "original": it["item"],
+                "qty": it["qty"],
+                "note": "",
+                "matches": matches,
+                "action_type": "update_stock",
+            })
+    # Only pre-empt when EVERY parsed fragment is ambiguous. If some are clean
+    # (mixed bulk), let the AI handle it — the action-level check will still
+    # catch the ambiguous ones and the clean ones will be written.
+    if not pending_items or len(pending_items) != len(intents):
+        return None, None
+    lines = []
+    for entry in pending_items:
+        ml = "\n".join(f"  {i+1}. {m}" for i, m in enumerate(entry["matches"]))
+        lines.append(f"❓ \"{entry['original']}\" matches multiple items:\n{ml}")
+    if len(pending_items) > 1:
+        lines.append("Reply with the name or number for each (e.g. \"plastic, thick\").")
+    else:
+        lines.append("Which one? Reply with the name or number.")
+    return lines, pending_items
+
+
 async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
     """Execute structured actions returned by the AI."""
     feedback = []
@@ -4058,6 +4151,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await _auto_add_low_to_shopping(low_all, store, update.get_bot(), update.effective_chat.id)
             return
         # Nothing matched — probably unrelated; let the AI handle it, keep state.
+
+    # ─── Pre-emptive stock ambiguity check ────
+    # If the message reads like "<item> <number>" AND the item is ambiguous,
+    # ask directly (bypass AI). Stops the AI from asking "which one?" in plain
+    # chat and forgetting the qty on the reply. Skipped if replying to something,
+    # since receipt/sales/disambiguation reply flows handle their own patterns.
+    if not update.message.reply_to_message:
+        pre_lines, pre_pending = _preempt_stock_ambiguity(text)
+        if pre_pending:
+            sent = await update.message.reply_text("\n".join(pre_lines))
+            ctx.chat_data["pending_disambiguation"] = {
+                "msg_id": sent.message_id,
+                "reporter": name,
+                "items": pre_pending,
+            }
+            return
 
     # ─── Extract reply context if replying to a message ────
     reply_context = None
