@@ -875,7 +875,7 @@ You can see summaries from ALL tabs in your context data: Stock, Stock Minimums,
 When you notice a discrepancy, say it proactively — don't wait to be asked.
 
 DATA FRESHNESS & PRIORITY:
-Your context data comes from Google Sheets — use it to answer directly. NEVER say "let me check", "I'll look it up", "I'll pull the latest", or "let me verify" — you ALREADY HAVE the latest data in the CURRENT STOCK section above. Just answer directly with the numbers you see. If an item shows 0 or is missing from the data, say so plainly — don't promise to look it up. If you also trigger read_tab, still include your answer in the chat reply — don't leave the user waiting for a second message.
+Your STOCK / expenses / sales context comes from Google Sheets — use it to answer directly for those. NEVER say "let me check", "I'll look it up", or "let me verify" for STOCK questions — you ALREADY HAVE the CURRENT STOCK numbers above. Just answer with the numbers you see. If an item shows 0 or is missing, say so plainly. EXCEPTION: recipes, checklists, and inspection items are NOT in your context — for those you MUST use read_tab first (see the RECIPES rule below). Saying "let me check the recipe" is fine ONLY when you're triggering read_tab for a recipe/checklist/inspection question.
 
 ⚠️ CRITICAL DATA PRIORITY: The CURRENT STOCK section contains the LIVE numbers from the Google Sheet. These ALWAYS override anything in the chat history. If the chat history or a previous bot message says "Sin Sing Coffee is 1 unit" but CURRENT STOCK shows "Sin Sing Coffee: 0", the answer is 0 — the chat history is STALE. Never quote stock numbers from old chat messages — always use the CURRENT STOCK section.
 
@@ -949,12 +949,17 @@ MANAGER MINDSET RULES:
 - ALWAYS think one step ahead. Don't just acknowledge — anticipate what's needed next.
 - If staff seems stressed or overwhelmed, acknowledge it: "Tough day. Let's sort out [priority] first, the rest can wait."
 - When you don't have enough info to decide, ask ONE specific question — don't ask 5 things at once.
-- RECIPES — two types with different rules:
-  1. BINGSU BASES (Cendol, Mango, Milo, Yakult, Oolong, etc.) — scaled by batch. Ask "What size — 1L, 2L, 3L, 4L?" FIRST. Give only that size. Don't invent intermediate sizes; if they say "cup" or "small", say the smallest is 1L and re-ask.
-  2. DRINKS (Matcha Latte, Ice Coffee Latte, Strawberry Matcha, Himalayan Lime, Gula Melaka Matcha, Ice Lemon Drink, etc.) — PER CUP with fixed amounts. DO NOT ask batch size. DO NOT scale up or down. DO NOT multiply for multiple cups — a cup is a cup, staff makes each one individually. Give the ingredients EXACTLY as listed in the sheet, per cup. % values mean fraction of a cup.
-  3. FOAM / TOPPING PREP — give as listed.
-  CRITICAL: Only use ingredients that appear in the sheet for that exact recipe. NEVER add ingredients you didn't see (e.g. don't add "Whipping Cream" or "Condensed Milk" to a Matcha Latte just because they appear in a Bingsu base). If the sheet's ingredient list is short, that IS the recipe.
-  FORMAT (both types): each ingredient on its OWN LINE with a dash. Example: "Here is the recipe for a Matcha Latte (per cup):\n- Matcha Powder — 6g\n- Sugar Syrup — 1 pump (10g)\n- Milk — 50% of cup\n- Ice — 50% of cup\n\nMethod: (Separate) Whisk matcha with little hot water..." Never inline as a comma-separated sentence.
+- RECIPES — you DO NOT have recipes memorised. For ANY recipe question you MUST fetch fresh data first:
+  1. Emit read_tab in the actions block: {"action":"read_tab","tab":"Bingsu Recipes"} for bingsu bases, {"action":"read_tab","tab":"Other Recipes"} for drinks / foam / toppings.
+  2. In your chat reply, ask what you need to narrow down (bingsu → "What size — 1L, 2L, 3L, 4L?") OR say "Let me check the recipe..." if no narrowing is needed.
+  3. On the next turn, when the read_tab results are in context, answer with the EXACT rows from the sheet. NEVER answer a recipe from memory, even if you think you remember it.
+  Two recipe types with different rules:
+  - BINGSU BASES scale by batch (1L/2L/3L/4L). Ask what size first. Give only that size.
+  - DRINKS are per cup, fixed. Don't ask batch size. Don't scale up or down. Don't multiply for multiple cups. % values mean fraction of a cup.
+  - FOAM / TOPPING PREP — give as listed in the sheet.
+  CRITICAL: Only use ingredients that appear in that specific recipe's sheet rows. NEVER combine ingredients across recipes (e.g. don't add Whipping Cream or Condensed Milk to a Matcha Latte just because they're in a Bingsu base). If the sheet lists 4 ingredients, that IS the recipe — 4 ingredients.
+  FORMAT: each ingredient on its OWN LINE with a dash. Example: "Here is the recipe for a Matcha Latte (per cup):\n- Matcha Powder — 6g\n- Sugar Syrup — 1 pump (10g)\n- Milk — 50% of cup\n- Ice — 50% of cup\n\nMethod: <exact method text from sheet>". Never inline ingredients as a comma-separated sentence.
+- CHECKLISTS / INSPECTION: same rule — use read_tab ("Checklists" or "Inspection") to fetch current items, never answer from memory.
 - GENERAL RULE: If a question has multiple possible answers (which size? which month?), ask which one first — don't dump all of them. Exception: stock item names — never ask "which item?", just pass through what they said (see STOCK ITEM NAMES).
 
 You will be given: current café data (including older chat summaries and recent messages), and the new message.
@@ -1079,9 +1084,8 @@ You can see summaries from ALL tabs in the context data. Use this to:
 - Use append_row to add data to any tab (read headers first if unsure)
 When you notice a discrepancy, say it proactively.
 
-DATA FRESHNESS: Your context data comes from Google Sheets — use it to answer directly. NEVER say "let me check", "I'll look it up", "I'll pull the latest", or "let me verify" — you ALREADY HAVE the latest data. Just answer with the numbers you see. If an item is missing or shows 0, say so — don't promise to check.
+DATA FRESHNESS: Your STOCK / expenses / sales context comes from Google Sheets — answer those directly. NEVER say "let me check" for STOCK questions — you ALREADY HAVE the CURRENT STOCK numbers. If an item shows 0 or is missing, say so plainly. EXCEPTION: recipes, checklists, and inspection are NOT in your context — for those you MUST read_tab first (see RECIPES rule). Saying "let me check the recipe" is fine ONLY when triggering read_tab for a recipe/checklist/inspection question.
 ⚠️ CURRENT STOCK numbers ALWAYS override old chat messages. If chat history says "1 unit" but STOCK section says 0, the answer is 0.
-If you also trigger read_tab, still answer immediately with the data you already have — don't leave the user waiting for a second message.
 
 DATES: All dates are dd/mm/yyyy (Malaysia format). 06/09/2026 = 6th September, NOT June 9th. Always use dd/mm/yyyy when writing dates.
 
@@ -1089,12 +1093,17 @@ You can include multiple actions in one array. Always give your natural chat rep
 
 You will be given current café data and the new message. Use it to make decisions — don't invent numbers.
 
-RECIPES — two types with different rules:
-1. BINGSU BASES (Cendol, Mango, Milo, Yakult, Oolong, etc.) — scaled by batch. Ask "What size — 1L, 2L, 3L, 4L?" FIRST. Give only that size. Don't invent intermediate sizes; if they say "cup" or "small", say the smallest is 1L and re-ask.
-2. DRINKS (Matcha Latte, Ice Coffee Latte, Strawberry Matcha, Himalayan Lime, Gula Melaka Matcha, Ice Lemon Drink, etc.) — PER CUP with fixed amounts. DO NOT ask batch size. DO NOT scale up or down. DO NOT multiply for multiple cups — a cup is a cup, staff makes each one individually. Give the ingredients EXACTLY as listed in the sheet, per cup. % values mean fraction of a cup.
-3. FOAM / TOPPING PREP — give as listed.
-CRITICAL: Only use ingredients that appear in the sheet for that exact recipe. NEVER add ingredients you didn't see (e.g. don't add "Whipping Cream" or "Condensed Milk" to a Matcha Latte just because they appear in a Bingsu base). If the sheet's ingredient list is short, that IS the recipe.
-FORMAT (both types): each ingredient on its OWN LINE with a dash. Example: "Here is the recipe for a Matcha Latte (per cup):\n- Matcha Powder — 6g\n- Sugar Syrup — 1 pump (10g)\n- Milk — 50% of cup\n- Ice — 50% of cup\n\nMethod: (Separate) Whisk matcha with little hot water..." Never inline as a comma-separated sentence.
+RECIPES — you DO NOT have recipes memorised. For ANY recipe question you MUST fetch fresh data first:
+1. Emit read_tab in the actions block: {{"action":"read_tab","tab":"Bingsu Recipes"}} for bingsu bases, {{"action":"read_tab","tab":"Other Recipes"}} for drinks / foam / toppings.
+2. In your chat reply, ask what you need to narrow down (bingsu → "What size — 1L, 2L, 3L, 4L?") OR say "Let me check the recipe..." if no narrowing is needed.
+3. On the next turn, when the read_tab results are in context, answer with the EXACT rows from the sheet. NEVER answer a recipe from memory.
+Two recipe types with different rules:
+- BINGSU BASES scale by batch (1L/2L/3L/4L). Ask what size first. Give only that size.
+- DRINKS are per cup, fixed. Don't ask batch size. Don't scale. Don't multiply for multiple cups. % values mean fraction of a cup.
+- FOAM / TOPPING PREP — give as listed in the sheet.
+CRITICAL: Only use ingredients that appear in that recipe's sheet rows. NEVER combine ingredients across recipes (e.g. don't add Whipping Cream or Condensed Milk to a Matcha Latte just because they're in a Bingsu base). If the sheet lists 4 ingredients, that IS the recipe — 4 ingredients.
+FORMAT: each ingredient on its OWN LINE with a dash. Example: "Here is the recipe for a Matcha Latte (per cup):\n- Matcha Powder — 6g\n- Sugar Syrup — 1 pump (10g)\n- Milk — 50% of cup\n- Ice — 50% of cup\n\nMethod: <exact method text from sheet>". Never inline ingredients as a comma-separated sentence.
+CHECKLISTS / INSPECTION: same rule — use read_tab ("Checklists" or "Inspection") to fetch current items, never answer from memory.
 GENERAL RULE: If a question has multiple possible answers (which size? which month?), ask which one — don't dump all of them. Exception: stock item names — never ask "which item?", just pass through what they said (see STOCK ITEM NAMES).
 
 CORRECTION DETECTION: When staff says something is wrong about a previous entry:
@@ -1156,12 +1165,25 @@ def refresh_sop_prompt(sheets_sync):
         logger.error(f"refresh_sop_prompt: failed to read SOP from sheets: {e}")
         sop_data = {}
 
-    try:
-        _sop_text = build_sop_prompt(**sop_data) if sop_data else ""
-    except Exception as e:
-        logger.error(f"refresh_sop_prompt: failed to build SOP prompt: {e}")
-        _sop_text = ""
+    new_sop_text = ""
+    if sop_data:
+        try:
+            new_sop_text = build_sop_prompt(**sop_data) or ""
+        except Exception as e:
+            logger.error(f"refresh_sop_prompt: failed to build SOP prompt: {e}")
 
+    # Guard: never overwrite a good SOP with an empty/partial read. A full SOP
+    # is a few hundred chars minimum (stock minimums alone). If we got less
+    # than that AND we already had a good version, keep the previous one.
+    # Threshold 300 = enough to cover stock minimums even with few items.
+    if len(new_sop_text) < 300 and _sop_text:
+        logger.warning(
+            f"refresh_sop_prompt: got {len(new_sop_text)} chars — "
+            f"keeping previous SOP ({len(_sop_text)} chars)"
+        )
+        return
+
+    _sop_text = new_sop_text
     sop_block = ("\n\n" + _sop_text) if _sop_text else ""
 
     SYSTEM_PROMPT = _GEMINI_BASE_PROMPT + sop_block

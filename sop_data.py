@@ -1,82 +1,40 @@
 """
-Sudu Café — SOP prompt builder.
+Sudu Café — SOP prompt builder (slim edition).
 
 All SOP data (recipes, minimums, checklists, inspection) lives in Google Sheets
-and is the ONLY source of truth. This module contains only the formatter that
-turns whatever the sheet returned into a text block for the AI system prompt.
+and is the ONLY source of truth.
+
+This module produces a SLIM SOP block for the AI system prompt: only stock
+minimums are injected (small, needed on every message for low-stock checks).
+Everything else — recipes, checklists, inspection — is fetched on demand by
+the AI via the `read_tab` action, so answers come from a fresh live read
+instead of a stale/confusing injected copy.
 """
 
 # ═══════════════════════════════════════════════════════════
-#  BUILD SOP TEXT FOR AI SYSTEM PROMPT
+#  BUILD SOP TEXT FOR AI SYSTEM PROMPT (SLIM)
 # ═══════════════════════════════════════════════════════════
 
 def build_sop_prompt(bingsu_recipes=None, foam_recipes=None, topping_recipes=None,
                      drinks_recipes=None, stock_minimums=None, ops_checklists=None,
                      inspection_checklist=None) -> str:
-    """Build the full SOP knowledge block for the AI system prompt.
-
-    All SOP data now lives in Google Sheets (private, editable) rather than
-    hardcoded here. Callers should fetch the current data via
-    SheetsSync.read_sop_from_sheets() and pass it in as keyword arguments.
-    If nothing is passed, returns an empty string — no SOP data means no
-    SOP block gets added to the system prompt."""
-    if not any([bingsu_recipes, foam_recipes, topping_recipes, drinks_recipes,
-                stock_minimums, ops_checklists, inspection_checklist]):
-        return ""
+    """Build a slim SOP block. Only stock minimums are injected. Recipes,
+    checklists, and inspection items are pointed to via a read_tab directory
+    so the AI fetches them live when asked (see the RECIPES / CHECKLISTS
+    rule in the system prompt)."""
+    # Ignore the recipe / checklist / inspection kwargs — kept in signature
+    # so the caller (refresh_sop_prompt) doesn't need changing.
+    _ = (bingsu_recipes, foam_recipes, topping_recipes, drinks_recipes,
+         ops_checklists, inspection_checklist)
 
     lines = []
     lines.append("=" * 50)
-    lines.append("SUDU CAFE SOP — YOU KNOW ALL OF THIS")
+    lines.append("SUDU CAFE — LIVE DATA (from Google Sheet)")
     lines.append("=" * 50)
 
-    # ─── Bingsu Recipes ───
-    if bingsu_recipes:
-        lines.append("\nBINGSU BASE RECIPES:")
-        for flavor, sizes in bingsu_recipes.items():
-            lines.append(f"\n  {flavor} Bingsu Base:")
-            for size, ingredients in sizes.items():
-                ing_str = ", ".join(f"{k}: {v}" for k, v in ingredients.items())
-                lines.append(f"    {size}: {ing_str}")
-
-    # ─── Foam Recipes ───
-    if foam_recipes:
-        lines.append("\nFOAM RECIPES:")
-        for name, data in foam_recipes.items():
-            ing_str = ", ".join(f"{k}: {v}" for k, v in data.get("ingredients", {}).items())
-            lines.append(f"  {name}: {ing_str}")
-            lines.append(f"    Method: {data.get('method', '')}")
-
-    # ─── Topping Prep ───
-    if topping_recipes:
-        lines.append("\nTOPPING PREP RECIPES:")
-        for name, data in topping_recipes.items():
-            lines.append(f"\n  {name}:")
-            if "ingredients" in data:
-                lines.append(f"    Ingredients: {data['ingredients']}")
-            for i, step in enumerate(data.get("method", []), 1):
-                lines.append(f"    {i}. {step}")
-
-    # ─── Drinks ───
-    if drinks_recipes:
-        lines.append("\nDRINKS RECIPES:")
-        for category, drinks in drinks_recipes.items():
-            lines.append(f"\n  [{category}]")
-            for drink_name, data in drinks.items():
-                ing_str = ", ".join(f"{k}: {v}" for k, v in data.get("ingredients", {}).items())
-                lines.append(f"  {drink_name}: {ing_str}")
-                lines.append(f"    Method: {data.get('method', '')}")
-
-    # ─── Operations ───
-    if ops_checklists:
-        lines.append("\n\nOPERATIONS CHECKLISTS:")
-        for checklist, items in ops_checklists.items():
-            lines.append(f"\n  {checklist.upper()}:")
-            for i, item in enumerate(items, 1):
-                lines.append(f"    {i}. {item}")
-
-    # ─── Stock Minimums ───
+    # ─── Stock Minimums (only section injected every message) ───
     if stock_minimums:
-        lines.append("\n\nSTOCK MINIMUM LEVELS (alert if below):")
+        lines.append("\nSTOCK MINIMUMS (alert if below):")
         for item, info in stock_minimums.items():
             unit = info.get("unit", "")
             loc = info.get("location", "")
@@ -84,12 +42,12 @@ def build_sop_prompt(bingsu_recipes=None, foam_recipes=None, topping_recipes=Non
             loc_str = f" [{loc}]" if loc else ""
             lines.append(f"  {item}: min {info['min']}{extra}{loc_str}")
 
-    # ─── Inspection ───
-    if inspection_checklist:
-        lines.append("\n\nINSPECTION CHECKLIST:")
-        for zone, items in inspection_checklist.items():
-            lines.append(f"\n  [{zone}]")
-            for item in items:
-                lines.append(f"    {item}")
+    # ─── read_tab directory (everything else lives here) ───
+    lines.append("")
+    lines.append("FETCH LIVE via read_tab (do NOT answer these from memory):")
+    lines.append("  Bingsu bases (scaled by batch: 100ml/1L/2L/3L/4L)  →  read_tab \"Bingsu Recipes\"")
+    lines.append("  Drinks (per cup, don't scale) / Foam / Topping     →  read_tab \"Other Recipes\"")
+    lines.append("  Opening / 6pm / Closing checklists                 →  read_tab \"Checklists\"")
+    lines.append("  Inspection items                                    →  read_tab \"Inspection\"")
 
     return "\n".join(lines)
