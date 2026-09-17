@@ -18,21 +18,17 @@ instead of a stale/confusing injected copy.
 def build_sop_prompt(bingsu_recipes=None, foam_recipes=None, topping_recipes=None,
                      drinks_recipes=None, stock_minimums=None, ops_checklists=None,
                      inspection_checklist=None) -> str:
-    """Build a slim SOP block. Only stock minimums are injected. Recipes,
-    checklists, and inspection items are pointed to via a read_tab directory
-    so the AI fetches them live when asked (see the RECIPES / CHECKLISTS
-    rule in the system prompt)."""
-    # Ignore the recipe / checklist / inspection kwargs — kept in signature
-    # so the caller (refresh_sop_prompt) doesn't need changing.
-    _ = (bingsu_recipes, foam_recipes, topping_recipes, drinks_recipes,
-         ops_checklists, inspection_checklist)
-
+    """Build a slim SOP block. Injects: stock minimums + a NAME directory
+    (which recipes are bingsu bases, which are drinks, etc.) so the AI can
+    resolve casual references like "gula melaka matcha" (drink) or "matcha
+    2L" (bingsu). Full recipe DETAILS are fetched via read_tab on demand
+    (see the RECIPES / CHECKLISTS rule in the system prompt)."""
     lines = []
     lines.append("=" * 50)
     lines.append("SUDU CAFE — LIVE DATA (from Google Sheet)")
     lines.append("=" * 50)
 
-    # ─── Stock Minimums (only section injected every message) ───
+    # ─── Stock Minimums (only stock data section injected every message) ───
     if stock_minimums:
         lines.append("\nSTOCK MINIMUMS (alert if below):")
         for item, info in stock_minimums.items():
@@ -42,12 +38,33 @@ def build_sop_prompt(bingsu_recipes=None, foam_recipes=None, topping_recipes=Non
             loc_str = f" [{loc}]" if loc else ""
             lines.append(f"  {item}: min {info['min']}{extra}{loc_str}")
 
-    # ─── read_tab directory (everything else lives here) ───
+    # ─── RECIPE NAME DIRECTORY (names only, no ingredients) ───
+    # Cheap ~500 chars. Lets the AI know which name maps to which type BEFORE
+    # asking clarifying questions. Solves "gula melaka matcha 2L bingsu" style
+    # confusion without dumping full recipes.
+    if bingsu_recipes or drinks_recipes or foam_recipes or topping_recipes:
+        lines.append("")
+        lines.append("RECIPE DIRECTORY (names only — use read_tab for full details):")
+        if bingsu_recipes:
+            names = ", ".join(bingsu_recipes.keys())
+            lines.append(f"  Bingsu Bases (scaled by batch, read_tab \"Bingsu Recipes\"): {names}")
+        if drinks_recipes:
+            all_drinks = []
+            for category, drinks in drinks_recipes.items():
+                all_drinks.extend(drinks.keys())
+            if all_drinks:
+                lines.append(f"  Drinks (per cup, read_tab \"Other Recipes\"): {', '.join(all_drinks)}")
+        if foam_recipes:
+            lines.append(f"  Foams (read_tab \"Other Recipes\"): {', '.join(foam_recipes.keys())}")
+        if topping_recipes:
+            lines.append(f"  Toppings (read_tab \"Other Recipes\"): {', '.join(topping_recipes.keys())}")
+        lines.append("")
+        lines.append("If a user's request matches names across multiple categories (e.g. \"matcha\" → bingsu Matcha + drinks Matcha Latte / Strawberry Matcha / Gula Melaka Matcha), ASK which one before read_tab.")
+
+    # ─── Fallback read_tab pointers for non-recipe SOP ───
     lines.append("")
-    lines.append("FETCH LIVE via read_tab (do NOT answer these from memory):")
-    lines.append("  Bingsu bases (scaled by batch: 100ml/1L/2L/3L/4L)  →  read_tab \"Bingsu Recipes\"")
-    lines.append("  Drinks (per cup, don't scale) / Foam / Topping     →  read_tab \"Other Recipes\"")
-    lines.append("  Opening / 6pm / Closing checklists                 →  read_tab \"Checklists\"")
-    lines.append("  Inspection items                                    →  read_tab \"Inspection\"")
+    lines.append("Other SOP (fetch via read_tab):")
+    lines.append("  Opening / 6pm / Closing checklists  →  read_tab \"Checklists\"")
+    lines.append("  Inspection items                    →  read_tab \"Inspection\"")
 
     return "\n".join(lines)
