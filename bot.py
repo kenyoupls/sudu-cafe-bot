@@ -52,12 +52,8 @@ logger = logging.getLogger(__name__)
 TZ = ZoneInfo(config.TIMEZONE)
 store = get_store()
 
-# ─── SOP data: seed Google Sheets on first run, then load AI prompts ───
+# ─── SOP data: Google Sheets is the only source of truth. Load into prompt. ───
 if store._sheets:
-    try:
-        store._sheets.seed_sop_to_sheets()
-    except Exception as e:
-        logger.error(f"seed_sop_to_sheets failed: {e}")
     try:
         from ai_chat import refresh_sop_prompt
         refresh_sop_prompt(store._sheets)

@@ -822,131 +822,6 @@ class SheetsSync:
             logger.error(f"Error reading row count for {name}: {e}")
             return 0
 
-    def seed_sop_to_sheets(self):
-        """One-time seed: write the hardcoded SOP data (from sop_data.py) into the
-        SOP worksheets, but only for tabs that are currently empty (no data rows).
-        Safe to call on every startup — it's a no-op once sheets are populated."""
-        if not self.spreadsheet:
-            return
-        try:
-            from sop_data import (
-                BINGSU_RECIPES, FOAM_RECIPES, TOPPING_RECIPES, DRINKS_RECIPES,
-                STOCK_MINIMUMS, OPS_CHECKLISTS, INSPECTION_CHECKLIST,
-            )
-        except Exception as e:
-            logger.info(f"seed_sop_to_sheets: sop_data hardcoded dicts not available ({e}) — skipping seed")
-            return
-
-        # ── Bingsu Recipes ──
-        try:
-            if self._ws_row_count("Bingsu Recipes") == 0:
-                ws = self._get_ws("Bingsu Recipes")
-                if ws:
-                    rows = []
-                    for flavor, sizes in BINGSU_RECIPES.items():
-                        for batch_size, ingredients in sizes.items():
-                            for ingredient, qty in ingredients.items():
-                                rows.append([flavor, batch_size, ingredient, qty])
-                    if rows:
-                        ws.update("A2", rows)
-                        logger.info(f"Seeded {len(rows)} rows into Bingsu Recipes")
-        except Exception as e:
-            logger.error(f"seed_sop_to_sheets (Bingsu Recipes): {e}")
-
-        _time.sleep(1)
-
-        # ── Other Recipes (Foam, Topping, Drink) ──
-        try:
-            if self._ws_row_count("Other Recipes") == 0:
-                ws = self._get_ws("Other Recipes")
-                if ws:
-                    rows = []
-                    # Foam recipes
-                    for name, data in FOAM_RECIPES.items():
-                        method = data.get("method", "")
-                        ingredients = data.get("ingredients", {})
-                        if ingredients:
-                            for ingredient, qty in ingredients.items():
-                                rows.append(["Foam", name, "", ingredient, qty, method, "", ""])
-                        else:
-                            rows.append(["Foam", name, "", "", "", method, "", ""])
-
-                    # Topping recipes
-                    for name, data in TOPPING_RECIPES.items():
-                        ingredients_str = data.get("ingredients", "")
-                        method_steps = data.get("method", [])
-                        if method_steps:
-                            for i, step in enumerate(method_steps, 1):
-                                rows.append(["Topping", name, "", ingredients_str if i == 1 else "", "", "", i, step])
-                        else:
-                            rows.append(["Topping", name, "", ingredients_str, "", "", "", ""])
-
-                    # Drinks recipes
-                    for category, drinks in DRINKS_RECIPES.items():
-                        for drink_name, data in drinks.items():
-                            method = data.get("method", "")
-                            ingredients = data.get("ingredients", {})
-                            if ingredients:
-                                for ingredient, qty in ingredients.items():
-                                    rows.append(["Drink", drink_name, category, ingredient, qty, method, "", ""])
-                            else:
-                                rows.append(["Drink", drink_name, category, "", "", method, "", ""])
-
-                    if rows:
-                        ws.update("A2", rows)
-                        logger.info(f"Seeded {len(rows)} rows into Other Recipes")
-        except Exception as e:
-            logger.error(f"seed_sop_to_sheets (Other Recipes): {e}")
-
-        _time.sleep(1)
-
-        # ── Stock Minimums ──
-        try:
-            if self._ws_row_count("Stock Minimums") == 0:
-                ws = self._get_ws("Stock Minimums")
-                if ws:
-                    rows = []
-                    for item, info in STOCK_MINIMUMS.items():
-                        rows.append([item, info.get("min", ""), info.get("unit", ""), info.get("location", "")])
-                    if rows:
-                        ws.update("A2", rows)
-                        logger.info(f"Seeded {len(rows)} rows into Stock Minimums")
-        except Exception as e:
-            logger.error(f"seed_sop_to_sheets (Stock Minimums): {e}")
-
-        _time.sleep(1)
-
-        # ── Checklists ──
-        try:
-            if self._ws_row_count("Checklists") == 0:
-                ws = self._get_ws("Checklists")
-                if ws:
-                    rows = []
-                    for checklist, items in OPS_CHECKLISTS.items():
-                        for i, task in enumerate(items, 1):
-                            rows.append([checklist, i, task])
-                    if rows:
-                        ws.update("A2", rows)
-                        logger.info(f"Seeded {len(rows)} rows into Checklists")
-        except Exception as e:
-            logger.error(f"seed_sop_to_sheets (Checklists): {e}")
-
-        _time.sleep(1)
-
-        # ── Inspection ──
-        try:
-            if self._ws_row_count("Inspection") == 0:
-                ws = self._get_ws("Inspection")
-                if ws:
-                    rows = []
-                    for section, items in INSPECTION_CHECKLIST.items():
-                        for item in items:
-                            rows.append([section, item])
-                    if rows:
-                        ws.update("A2", rows)
-                        logger.info(f"Seeded {len(rows)} rows into Inspection")
-        except Exception as e:
-            logger.error(f"seed_sop_to_sheets (Inspection): {e}")
 
     def read_sop_from_sheets(self) -> dict:
         """Read all SOP data from the SOP worksheets and reconstruct it into the
@@ -2342,9 +2217,9 @@ class LocalJsonStore:
         return True
 
     def _get_stock_minimums(self) -> dict:
-        """Read stock minimums from Google Sheets (source of truth) with a
-        fallback to the hardcoded sop_data.py dict for backward compatibility
-        (e.g. before the sheet has been seeded, or sheets unavailable)."""
+        """Read stock minimums from Google Sheets — the ONLY source of truth.
+        Returns an empty dict on failure; callers must handle that (no
+        low-stock alerts fire when the sheet is unreachable)."""
         if self._sheets:
             try:
                 minimums = self._sheets.read_stock_minimums_from_sheet()
@@ -2352,16 +2227,12 @@ class LocalJsonStore:
                     return minimums
             except Exception as e:
                 logger.error(f"_get_stock_minimums: sheet read failed: {e}")
-        try:
-            from sop_data import STOCK_MINIMUMS
-            return STOCK_MINIMUMS
-        except Exception as e:
-            logger.error(f"_get_stock_minimums: fallback import failed: {e}")
-            return {}
+        logger.warning("_get_stock_minimums: no sheet data available — returning empty")
+        return {}
 
     def _get_ops_checklists(self) -> dict:
-        """Read ops checklists from Google Sheets (source of truth) with a
-        fallback to the hardcoded sop_data.py dict for backward compatibility."""
+        """Read ops checklists from Google Sheets — the ONLY source of truth.
+        Returns an empty dict on failure."""
         if self._sheets:
             try:
                 sop = self._sheets.read_sop_from_sheets()
@@ -2370,12 +2241,8 @@ class LocalJsonStore:
                     return checklists
             except Exception as e:
                 logger.error(f"_get_ops_checklists: sheet read failed: {e}")
-        try:
-            from sop_data import OPS_CHECKLISTS
-            return OPS_CHECKLISTS
-        except Exception as e:
-            logger.error(f"_get_ops_checklists: fallback import failed: {e}")
-            return {}
+        logger.warning("_get_ops_checklists: no sheet data available — returning empty")
+        return {}
 
     def check_low_stock(self, items_updated: list = None) -> list:
         """Check stock against SOP minimums. Returns list of {item, qty, min} for low items.
