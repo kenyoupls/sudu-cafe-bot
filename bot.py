@@ -4223,7 +4223,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         r"(?:let me (?:check|pull|verify|look|confirm)|i'?ll (?:check|pull|verify|look|grab|get|confirm)|check the (?:live|stock|sheet)|pull the (?:exact|latest|current))",
         _re_bot.IGNORECASE,
     )
-    if chat_reply and _CHECK_PHRASES.search(chat_reply) and len(chat_reply) < 200:
+    # Only fire the stall-guard when the AI is NOT actually going to fetch.
+    # If read_tab was emitted, "let me check" is the correct flow (the
+    # read_tab safety net below re-invokes with the results).
+    _read_tab_emitted = any(a.get("action") == "read_tab" for a in (actions or []))
+    if chat_reply and _CHECK_PHRASES.search(chat_reply) and len(chat_reply) < 200 and not _read_tab_emitted:
         logger.info(f"AI replied with check-promise: '{chat_reply[:100]}' — forcing refresh and re-asking")
         store.refresh_if_stale(cooldown=0)
         # Log what stock_current contains for debugging
