@@ -39,6 +39,15 @@ from sop_data import build_sop_prompt
 
 logger = logging.getLogger(__name__)
 
+# Bot's confirmation-style messages that are moment-in-time acknowledgements.
+# These are STALE by construction the moment they hit chat history — the sheet
+# is the authoritative source. Filter them out of the verbatim history so the
+# AI never quotes an old "📦 Full Cream Milk → 156" as the current number.
+import re as _re_stale
+_STALE_BOT_REPORT_RE = _re_stale.compile(
+    r"^(?:📦|✏️|🧹|🛒|🍰|📋|⚠️\s*LOW STOCK)"
+)
+
 # ─── Timezone-aware now ────────────────────────────────────
 _TZ = ZoneInfo(config.TIMEZONE)
 
@@ -688,6 +697,12 @@ def get_memory_context(chat_id: int = 0) -> str:
         if day_date >= verbatim_cutoff:
             # Verbatim window — include important messages
             for msg in msgs:
+                # Drop bot's own stock/count/status confirmations from history —
+                # they're stale by construction. Truth lives in the sheet.
+                if msg.get("type") == "bot_response":
+                    txt = (msg.get("text") or "").lstrip()
+                    if _STALE_BOT_REPORT_RE.match(txt):
+                        continue
                 if msg.get("important", True) or msg.get("type") in ("bot_response", "voice", "photo"):
                     recent_messages.append(msg)
         else:
@@ -749,7 +764,9 @@ def get_memory_context(chat_id: int = 0) -> str:
 #  SYSTEM PROMPT
 # ═══════════════════════════════════════════════════════════
 
-_SYSTEM_PROMPT_TEMPLATE = """You are the AI MANAGER of CAFE_NAME_HERE, a bingsu café in Melaka, Malaysia. You are not an assistant — you are the MANAGER. You live in the café's Telegram group and you actively run the business alongside the team.
+_SYSTEM_PROMPT_TEMPLATE = """🚨 STOCK ANSWERS: The ONLY source of truth for stock numbers is the CURRENT STOCK section in your context data. If a chat history message (yours or anyone's) mentions a specific stock quantity, IGNORE the number — it's stale. Never quote past bot stock/count messages as current. Always answer from CURRENT STOCK.
+
+You are the AI MANAGER of CAFE_NAME_HERE, a bingsu café in Melaka, Malaysia. You are not an assistant — you are the MANAGER. You live in the café's Telegram group and you actively run the business alongside the team.
 
 YOUR ROLE — FULL BOSS MODE:
 - You THINK like a café owner. Every message you read, you ask: "What does this mean for the business? What should happen next? Who needs to do what?"
@@ -1069,7 +1086,9 @@ STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
 # Condensed core prompt; SOP recipes appended below via build_sop_prompt().
 # Groq is fast/cheap so we keep its system prompt small to save tokens
 # and reduce 413 "request too large" errors.
-_GROQ_BASE_PROMPT = f"""You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
+_GROQ_BASE_PROMPT = f"""🚨 STOCK ANSWERS: The ONLY source of truth for stock numbers is the CURRENT STOCK section in your context data. If a chat history message mentions a specific stock quantity, IGNORE the number — it's stale. Never quote past bot stock/count messages as current. Always answer from CURRENT STOCK.
+
+You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
 
 Reply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.
 
