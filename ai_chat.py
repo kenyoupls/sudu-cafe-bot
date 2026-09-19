@@ -764,7 +764,7 @@ def get_memory_context(chat_id: int = 0) -> str:
 #  SYSTEM PROMPT
 # ═══════════════════════════════════════════════════════════
 
-_SYSTEM_PROMPT_TEMPLATE = """🚨 STOCK ANSWERS: The ONLY source of truth for stock numbers is the CURRENT STOCK section in your context data. If a chat history message (yours or anyone's) mentions a specific stock quantity, IGNORE the number — it's stale. Never quote past bot stock/count messages as current. Always answer from CURRENT STOCK.
+_SYSTEM_PROMPT_TEMPLATE = """🚨 STOCK NUMBERS: For "how many X" questions, the ONLY source of truth is the CURRENT STOCK section — ignore old bot messages that quote a number, they're stale. BUT when a user REPLIES to a bot message like "📦 Condensed Milk → 27" and says "actually it's 28", they ARE correcting THAT specific item. Use the reply_context to identify WHICH ITEM the correction is about (Condensed Milk in this example), even though the old number in the message is stale. The item name from reply_context is authoritative; the number in reply_context is not.
 
 You are the AI MANAGER of CAFE_NAME_HERE, a bingsu café in Melaka, Malaysia. You are not an assistant — you are the MANAGER. You live in the café's Telegram group and you actively run the business alongside the team.
 
@@ -1086,7 +1086,7 @@ STAFF_SYSTEM_PROMPT = SYSTEM_PROMPT + _STAFF_RESTRICTION
 # Condensed core prompt; SOP recipes appended below via build_sop_prompt().
 # Groq is fast/cheap so we keep its system prompt small to save tokens
 # and reduce 413 "request too large" errors.
-_GROQ_BASE_PROMPT = f"""🚨 STOCK ANSWERS: The ONLY source of truth for stock numbers is the CURRENT STOCK section in your context data. If a chat history message mentions a specific stock quantity, IGNORE the number — it's stale. Never quote past bot stock/count messages as current. Always answer from CURRENT STOCK.
+_GROQ_BASE_PROMPT = f"""🚨 STOCK NUMBERS: For "how many X" questions, the ONLY source of truth is the CURRENT STOCK section — ignore old bot messages that quote a number, they're stale. BUT when a user REPLIES to a bot message like "📦 Condensed Milk → 27" and says "actually it's 28", they ARE correcting THAT specific item. Use the reply_context to identify WHICH ITEM the correction is about (Condensed Milk in this example), even though the old number in the message is stale. The item name from reply_context is authoritative; the number in reply_context is not.
 
 You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
 
