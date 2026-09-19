@@ -3502,6 +3502,10 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                 tab = act.get("tab", "")
                 if tab:
                     data = store.read_tab(tab)
+                    # Stash results on ctx so the follow-up call can inject them
+                    # into the AI's context.
+                    if ctx is not None and hasattr(ctx, "chat_data") and data:
+                        ctx.chat_data.setdefault("_read_tab_results", {})[tab] = data
                     # Only show read_tab output if it's NOT followed by a write action
                     # (read before write = silent lookup, read alone = user wants to see data)
                     has_write_action = any(
@@ -3511,7 +3515,8 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                     if not has_write_action:
                         if not data or not data.get("rows"):
                             feedback.append(f"❌ Could not read tab '{tab}'")
-                        # Success = silent. AI's chat reply already summarizes the data naturally.
+                        # Success = silent. Follow-up AI call will read the data
+                        # from ctx.chat_data["_read_tab_results"] and produce the answer.
 
             elif action_type == "append_row":
                 tab = act.get("tab", "")
@@ -4272,13 +4277,33 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     pend["msg_id"] = sent.message_id
 
             # Safety net: if AI triggered read_tab without a write action,
-            # force refresh and re-answer so user doesn't get left hanging
+            # feed the freshly-read tab data back to the AI so it can answer
+            # from real sheet content instead of "let me check...".
             read_tab_actions = [a for a in actions if a.get("action") == "read_tab"]
             write_actions = [a for a in actions if a.get("action") in ("append_row", "update_row")]
             if read_tab_actions and not write_actions:
                 store.refresh_if_stale(cooldown=0)
+                # Build an extra context block from the stashed read_tab results
+                extra_ctx = None
+                stashed = ctx.chat_data.pop("_read_tab_results", {}) if hasattr(ctx, "chat_data") else {}
+                if stashed:
+                    lines = ["── read_tab RESULTS (fresh from Google Sheet) ──"]
+                    for tab_name, data in stashed.items():
+                        lines.append(f"\n### Tab: {tab_name}")
+                        headers = data.get("headers", [])
+                        rows = data.get("rows", [])
+                        if headers:
+                            lines.append("Columns: " + " | ".join(headers))
+                        for row in rows:
+                            if isinstance(row, dict):
+                                lines.append("• " + ", ".join(f"{k}: {v}" for k, v in row.items() if v))
+                            elif isinstance(row, list):
+                                lines.append("• " + " | ".join(str(c) for c in row))
+                    lines.append("\nUse this data to answer the user's original question exactly. Only use rows that match what they asked for.")
+                    extra_ctx = "\n".join(lines)
                 followup_reply, _ = await process_message(
                     text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
+                    extra_context=extra_ctx,
                 )
                 if followup_reply and followup_reply != chat_reply:
                     await update.message.reply_text(followup_reply)

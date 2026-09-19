@@ -1635,14 +1635,24 @@ def _parse_actions(raw_text: str) -> tuple:
 
 
 async def process_message(user_message: str, user_name: str, reply_context: str = None,
-                          chat_id: int = 0, is_staff_group: bool = False) -> tuple:
+                          chat_id: int = 0, is_staff_group: bool = False,
+                          extra_context: str = None) -> tuple:
     """
     Process a chat message through Gemini.
     Returns (chat_reply: str, actions: list[dict]).
     Actions are structured commands the bot should execute (stock updates, etc).
+
+    extra_context: optional block appended before the user message — used to
+    feed back read_tab results on a follow-up call so the AI can answer
+    from fresh sheet data.
     """
     # Use staff-restricted prompt when in staff group
     groq_sys = _GROQ_STAFF_SYSTEM_PROMPT if is_staff_group else _GROQ_SYSTEM_PROMPT
+
+    # If we have extra context (e.g. read_tab result on a follow-up), prepend it
+    # to the reply_context so both AI paths see it before the user message.
+    if extra_context:
+        reply_context = (reply_context + "\n\n" + extra_context) if reply_context else extra_context
 
     # ── Primary: Groq ──
     try:
