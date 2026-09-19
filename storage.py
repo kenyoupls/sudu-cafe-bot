@@ -1508,22 +1508,21 @@ class LocalJsonStore:
         if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
             qty = "0"
         elif qty_upper in ("OK", "YES", "ADA", "LOW"):
-            # These are STATUS words, not quantities. If the item already has
-            # a real count, keep it — never clobber a real number with 1 or 0
-            # just because the AI sent "OK" or "LOW". User must give a number
-            # to actually change the count.
+            # SCHEMA VIOLATION: the AI is only supposed to emit a number or "OUT".
+            # If we see status words here, the AI ignored its prompt. Safety net:
+            # never clobber a real count. Log ERROR so we notice slippage.
             current = self.data.get("stock_current", {}).get(item)
             try:
                 current_n = int(current) if current is not None else None
             except (ValueError, TypeError):
                 current_n = None
+            logger.error(
+                f"update_stock SCHEMA VIOLATION: AI sent qty='{qty_upper}' for {item} "
+                f"(current={current_n}). Skipping write. AI should ask user for a number instead."
+            )
             if current_n is not None and current_n > 0:
-                logger.warning(
-                    f"update_stock: qty='{qty_upper}' for {item} but current={current_n} — "
-                    f"keeping count (status words don't overwrite real numbers, by {updated_by})"
-                )
-                return True  # nothing to do; not a failure
-            # No count yet: OK/YES/ADA → 1 (placeholder), LOW → 0 (assume out)
+                return True  # preserve the real count; not a failure
+            # No count yet — fall back to conservative default
             qty = "1" if qty_upper in ("OK", "YES", "ADA") else "0"
         today = _now().strftime("%d/%m/%y")
 
@@ -1831,18 +1830,19 @@ class LocalJsonStore:
                         if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
                             qty = 0
                         elif qty_upper in ("OK", "YES", "ADA", "LOW"):
-                            # Status words, not counts. If real count exists, skip.
+                            # SCHEMA VIOLATION: bulk should only get numbers.
+                            # Log ERROR and skip the row rather than clobber.
                             canonical = self._find_existing_stock_name(item_name)
                             current = self.data.get("stock_current", {}).get(canonical)
                             try:
                                 current_n = int(current) if current is not None else None
                             except (ValueError, TypeError):
                                 current_n = None
+                            logger.error(
+                                f"update_stock_bulk SCHEMA VIOLATION: qty='{qty_upper}' for "
+                                f"{canonical} (current={current_n}). Skipping row."
+                            )
                             if current_n is not None and current_n > 0:
-                                logger.warning(
-                                    f"update_stock_bulk: qty='{qty_upper}' for {canonical} but "
-                                    f"current={current_n} — skipping row"
-                                )
                                 continue
                             qty = 1 if qty_upper in ("OK", "YES", "ADA") else 0
                         else:

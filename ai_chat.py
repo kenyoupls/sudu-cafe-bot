@@ -833,8 +833,14 @@ When a message implies something actionable, include a JSON block at the END of 
 Available actions:
 
 --- DATA ENTRY ---
-- update_stock: {"action": "update_stock", "item": "Coffee Beans", "qty": "OK", "note": "just restocked"}
-  qty values: "OK", "LOW", "OUT", or a number like "5 bags"
+- update_stock: {"action": "update_stock", "item": "Coffee Beans", "qty": "5", "note": "just restocked"}
+  qty MUST be a NUMBER (e.g. "5", "12") or the exact string "OUT" (definitive: zero). NEVER "OK", "LOW", "YES", "ADA" — those are conversation words, not quantities. If the user gives no number and doesn't clearly say the item is finished, DO NOT emit update_stock. Instead ASK them: "What do you mean — is <item> fine as-is (no update), or do you want to set a count? If setting a count, how many?" Use recent chat context (a prior bot question about that item, a low-stock alert) to decide if "ok" means "no change" (usually yes) or "restocked to N".
+  EXAMPLES:
+  - Staff: "milk 5" → emit update_stock qty="5" ✓
+  - Staff: "milk habis" / "milk out" → emit update_stock qty="OUT" ✓
+  - Staff: "milk ok" (no clear context) → NO action, ASK for clarification
+  - Staff: "milk ok" (bot just asked "is milk running low?") → NO action, reply "Okay, keeping milk as-is."
+  - Staff: "yes we still have some" → NO action, no change to count
 - log_cleaning: {"action": "log_cleaning", "zone": "Toilets"}
   zone must match one of the configured zones
 - add_shopping: {"action": "add_shopping", "item": "Oat milk x5", "urgency": "normal"}
@@ -1132,7 +1138,7 @@ ACTIONS YOU CAN TRIGGER:
 When a message implies something actionable, append a JSON array at the END of your reply, wrapped in ```actions``` fences. Only include actions when clearly actionable — never for questions, chit-chat, or greetings.
 
 Available actions (name — brief format):
-- update_stock — {{"action":"update_stock","item":"...","qty":"OK|LOW|OUT|<number>","note":"..."}}
+- update_stock — {{"action":"update_stock","item":"...","qty":"<number>|OUT","note":"..."}} qty MUST be a number or "OUT". NEVER "OK", "LOW", "YES", "ADA" — those are conversation, not quantity. If user gave no number and didn't say the item is finished, DO NOT emit this action — ASK them for a specific count (or use context if a recent bot message clearly implies the answer). Examples: "milk 5" → qty="5" ✓ | "milk habis" → qty="OUT" ✓ | "milk ok" alone → NO action, ask "no change or set a count?"
 - log_cleaning — {{"action":"log_cleaning","zone":"..."}}
 - add_shopping — {{"action":"add_shopping","item":"...","urgency":"normal|urgent"}}
 - mark_bought — {{"action":"mark_bought","item":"..."}}
