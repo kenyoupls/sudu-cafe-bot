@@ -1492,7 +1492,8 @@ def _build_context(is_staff_group: bool = False) -> str:
 
 
 def _full_context(user_name: str, user_message: str, reply_context: str = None,
-                   chat_id: int = 0, is_staff_group: bool = False) -> str:
+                   chat_id: int = 0, is_staff_group: bool = False,
+                   extra_context: str = None) -> str:
     """Combine café data + memory + new message into one context block."""
     cafe_data = _build_context(is_staff_group=is_staff_group)
     memory = get_memory_context(chat_id=chat_id)
@@ -1508,13 +1509,18 @@ def _full_context(user_name: str, user_message: str, reply_context: str = None,
     if reply_context:
         parts.append(f"⚠️ REPLY CONTEXT — The user is replying to this message: \"{reply_context}\"\nTHEIR FOLLOW-UP IS ABOUT THIS TOPIC ONLY. Do NOT answer broadly — scope your response to what was being discussed above.\n⚠️ IMPORTANT: The replied message above may contain OUTDATED information. NEVER blindly repeat or trust what was said before — always re-check against your current context data before answering. If the user says 'again' or asks you to retry, treat it as a fresh question and answer from your current data.")
 
+    # Extra context (e.g. read_tab results) — full-length, not truncated
+    if extra_context:
+        parts.append(extra_context)
+
     parts.append(f"New message: {user_message}")
 
     return "\n\n".join(parts)
 
 
 def _groq_context(user_name: str, user_message: str, reply_context: str = None,
-                   chat_id: int = 0, is_staff_group: bool = False) -> str:
+                   chat_id: int = 0, is_staff_group: bool = False,
+                   extra_context: str = None) -> str:
     """Trimmed context for Groq — no memory/history, shorter café data."""
     store = get_store()
     store.refresh_if_stale(cooldown=60)
@@ -1646,6 +1652,10 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     if reply_context:
         parts.append(f"⚠️ REPLY CONTEXT — User is replying to: \"{reply_context[:300]}\"\nSCOPE YOUR ANSWER TO THIS TOPIC ONLY. Do NOT answer broadly.\n⚠️ The replied message may be OUTDATED — never blindly repeat old answers. Re-check against current context and answer fresh.")
 
+    # Extra context (e.g. read_tab results) — full-length, not truncated
+    if extra_context:
+        parts.append(extra_context)
+
     parts.append(f"Message: {user_message}")
 
     return "\n".join(parts)
@@ -1721,15 +1731,11 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     # Use staff-restricted prompt when in staff group
     groq_sys = _GROQ_STAFF_SYSTEM_PROMPT if is_staff_group else _GROQ_SYSTEM_PROMPT
 
-    # If we have extra context (e.g. read_tab result on a follow-up), prepend it
-    # to the reply_context so both AI paths see it before the user message.
-    if extra_context:
-        reply_context = (reply_context + "\n\n" + extra_context) if reply_context else extra_context
-
     # ── Primary: Groq ──
     try:
         prompt = _groq_context(user_name, user_message, reply_context,
-                               chat_id=chat_id, is_staff_group=is_staff_group)
+                               chat_id=chat_id, is_staff_group=is_staff_group,
+                               extra_context=extra_context)
         raw = await _groq_text(prompt, system=groq_sys, temperature=0.7, max_tokens=2000)
         if raw:
             chat_reply, actions, parse_failed = _parse_actions(raw)
@@ -1752,7 +1758,8 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
 
     try:
         prompt = _full_context(user_name, user_message, reply_context,
-                               chat_id=chat_id, is_staff_group=is_staff_group)
+                               chat_id=chat_id, is_staff_group=is_staff_group,
+                               extra_context=extra_context)
 
         response = client.models.generate_content(
             model="gemini-3.5-flash-lite",
