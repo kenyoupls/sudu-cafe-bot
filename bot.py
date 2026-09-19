@@ -2796,6 +2796,74 @@ def _narrow_candidates(fragment: str, candidates: list) -> list:
     return minimal if minimal else kept
 
 
+# ─── Clarification state tracker ─────────────────────────────────────────
+# Detects "Which X — A, B, or C?" style questions the bot asks, saves the
+# options, and matches the user's next short reply against them.
+# Small models forget context between turns; this is the code-side scaffold
+# that lets them reason across turns reliably.
+
+# Match patterns like:
+#   "Which matcha — Matcha Latte, Strawberry Matcha, or Gula Melaka Matcha?"
+#   "Which cup: Plastic Cup or Hot Tea Cup?"
+#   "Do you mean the drink recipe or the bingsu base?"
+_CLARIFY_PATTERNS = [
+    # "Which X — A, B, or C?" / "Which X: A, B, C?" / "which X — A or B?"
+    re.compile(
+        r"(?:which|what)\s+\w+[^?\n]*?[—–:\-]\s*(.+?)\?",
+        re.IGNORECASE,
+    ),
+    # "A, B, or C?" — trailing options list
+    re.compile(
+        r"([A-Z][^?\n]*?(?:,\s*[^,?\n]+){1,}(?:,?\s+or\s+[^?\n]+)?)\?",
+    ),
+]
+
+
+def _extract_clarification_options(bot_reply: str) -> list:
+    """From a bot reply like 'Which X — A, B, or C?', extract [A, B, C].
+    Returns [] if the reply doesn't look like a clarification question."""
+    if not bot_reply or "?" not in bot_reply:
+        return []
+    # Only fire when the reply is short-ish (< 500 chars) — long paragraphs
+    # aren't clarification questions.
+    if len(bot_reply) > 500:
+        return []
+    for pat in _CLARIFY_PATTERNS:
+        m = pat.search(bot_reply)
+        if not m:
+            continue
+        raw = m.group(1)
+        # Split on ", " and " or ". Keep segments that look like real options.
+        segments = re.split(r"\s*,\s*|\s+or\s+", raw, flags=re.IGNORECASE)
+        opts = []
+        for s in segments:
+            # Drop any parenthesized qualifiers ("(pick 1L-4L batch)")
+            s = re.sub(r"\([^)]*\)", "", s)
+            # Drop any unbalanced "(..." trailing chunks
+            s = re.sub(r"\([^)]*$", "", s)
+            s = s.strip(" .:;)(\"'")
+            # Strip leading fillers: "the ", "a ", "an ", "or "
+            s = re.sub(r"^(?:the|a|an|or)\s+", "", s, flags=re.IGNORECASE)
+            # Strip trailing fillers: " drink", " stock" if that's ALL that's left of a compound
+            s = re.sub(r"\s+(?:drink|stock)$", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"\s+", " ", s).strip()
+            if 2 <= len(s) <= 80 and not s.lower().startswith(("do you", "please", "let me")):
+                opts.append(s)
+        # Need 2+ options for it to be a real clarification
+        if len(opts) >= 2:
+            return opts
+    return []
+
+
+def _match_clarification_reply(user_text: str, options: list) -> str | None:
+    """Given a user's short reply and a list of options the bot offered,
+    return the single matched option, or None if 0 / 2+ matches."""
+    if not user_text or not options:
+        return None
+    narrowed = _narrow_candidates(user_text, options)
+    return narrowed[0] if len(narrowed) == 1 else None
+
+
 # Question starters — if the message opens with one of these it's a question,
 # not a stock update, so the pre-emptive check must skip it.
 _QUESTION_STARTERS = (
@@ -4160,6 +4228,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         # Nothing matched — probably unrelated; let the AI handle it, keep state.
 
+    # ─── Pending clarification resolver ────
+    # If bot recently asked "Which X — A, B, or C?" and user's reply is short,
+    # match against saved options and rewrite user's message so the AI has
+    # zero ambiguity. Auto-expires after 10 minutes.
+    _pc = ctx.chat_data.get("pending_clarification")
+    if _pc and _pc.get("options"):
+        import time as _t
+        age = _t.time() - _pc.get("asked_at", 0)
+        if age > 600:  # 10 min expiry
+            ctx.chat_data.pop("pending_clarification", None)
+        elif len(text.split()) <= 4:
+            matched = _match_clarification_reply(text, _pc["options"])
+            if matched:
+                logger.info(f"Clarification resolved: '{text}' → '{matched}'")
+                text = f"[User is answering your previous 'which one?' question. They picked: {matched}] {text}"
+                ctx.chat_data.pop("pending_clarification", None)
+            # 0 or 2+ matches → leave state, let AI re-ask
+
     # ─── Pre-emptive stock ambiguity check ────
     # If the message reads like "<item> <number>" AND the item is ambiguous,
     # ask directly (bypass AI). Stops the AI from asking "which one?" in plain
@@ -4259,7 +4345,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             actions = []
 
     if chat_reply:
-        await update.message.reply_text(chat_reply)
+        _sent_reply = await update.message.reply_text(chat_reply)
+        # ─── Save clarification state if this reply is a "which one?" question ───
+        _clarify_opts = _extract_clarification_options(chat_reply)
+        if _clarify_opts and _sent_reply:
+            import time as _t
+            ctx.chat_data["pending_clarification"] = {
+                "options": _clarify_opts,
+                "msg_id": _sent_reply.message_id,
+                "asked_at": _t.time(),
+            }
+            logger.info(f"Saved clarification options: {_clarify_opts}")
 
         # Execute any actions the AI triggered
         if actions:

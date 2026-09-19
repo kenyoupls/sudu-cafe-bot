@@ -85,8 +85,10 @@ WEEKLY_REVIEW_TIME = time(9, 0)
 
 # ─── Memory ────────────────────────────────────────────────
 MEMORY_RETENTION_DAYS = 0              # 0 = keep forever (no auto-delete)
-RECENT_MESSAGES_FULL = 200             # Send last 200 important messages verbatim to AI
-SUMMARY_DAYS_START = 3                 # Summarise messages older than 3 days
+RECENT_MESSAGES_FULL = 1000            # Safety cap: max verbatim msgs even if 30-day window has more
+VERBATIM_DAYS = 30                     # Days within N days = verbatim in prompt
+SUMMARY_DAYS_START = 30                # Daily summaries kick in for days >= this age
+WEEKLY_ROLLUP_DAYS = 90                # After this age, roll daily summaries into weekly
 
 # ─── Chase-up / Action Items ──────────────────────────────
 CHASEUP_REMINDER_TIMES = [

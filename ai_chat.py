@@ -605,24 +605,77 @@ def _get_all_recent_days(chat_id: int = 0) -> list:
     return days
 
 
+def _auto_summarise_week(week_label: str, daily_summaries: list) -> str:
+    """Rule-based rollup of ~7 daily summaries into one weekly line.
+    Each daily summary is like '2026-09-15: 45 msgs | from Ken, Eric | topics: stock, milk | 3 voice notes'."""
+    if not daily_summaries:
+        return ""
+    total_msgs = 0
+    people = set()
+    topics = []
+    voice = 0
+    photo = 0
+    days_with_data = 0
+    for s in daily_summaries:
+        days_with_data += 1
+        m = re.search(r"(\d+)\s+msgs", s)
+        if m:
+            total_msgs += int(m.group(1))
+        m = re.search(r"from\s+([^|]+)", s)
+        if m:
+            for p in re.split(r",\s*", m.group(1).strip()):
+                if p:
+                    people.add(p)
+        m = re.search(r"topics:\s+([^|]+)", s)
+        if m:
+            for t in re.split(r",\s*", m.group(1).strip()):
+                if t and t not in topics:
+                    topics.append(t)
+        m = re.search(r"(\d+)\s+voice", s)
+        if m:
+            voice += int(m.group(1))
+        m = re.search(r"(\d+)\s+photo", s)
+        if m:
+            photo += int(m.group(1))
+
+    parts = [f"Week {week_label}: {days_with_data} active days, {total_msgs} msgs"]
+    if people:
+        parts.append(f"from {', '.join(sorted(people))}")
+    if topics:
+        parts.append(f"topics: {', '.join(topics[:12])}")
+    if voice:
+        parts.append(f"{voice} voice notes")
+    if photo:
+        parts.append(f"{photo} photos")
+    return " | ".join(parts)
+
+
 def get_memory_context(chat_id: int = 0) -> str:
     """
-    Build memory context for Gemini:
-    - Days older than SUMMARY_DAYS_START → one-line summaries
-    - Last RECENT_MESSAGES_FULL messages → verbatim
+    Build memory context for the AI:
+    - Days within VERBATIM_DAYS (default 30) → verbatim messages (capped by RECENT_MESSAGES_FULL)
+    - Days between VERBATIM_DAYS and WEEKLY_ROLLUP_DAYS (default 30-90) → one-line daily summaries
+    - Days older than WEEKLY_ROLLUP_DAYS (default 90+) → grouped into weekly rollups
     """
     _init_memory(chat_id)
+    import re as _re_mem
+    verbatim_days = getattr(config, "VERBATIM_DAYS", 30)
+    weekly_rollup_days = getattr(config, "WEEKLY_ROLLUP_DAYS", 90)
     today = _today()
-    summary_cutoff = today - __import__("datetime").timedelta(days=config.SUMMARY_DAYS_START)
+    dt = __import__("datetime")
+    verbatim_cutoff = today - dt.timedelta(days=verbatim_days)
+    weekly_cutoff = today - dt.timedelta(days=weekly_rollup_days)
 
     all_days = _get_all_recent_days(chat_id)
     if not all_days:
         return ""
 
-    lines = []
+    daily_summary_lines = []            # for the 30-90 day window
+    week_bucket = {}                    # (year, iso_week) -> [daily_summary_strings]
     recent_messages = []
+    summaries = _load_summaries(chat_id)
+    summaries_dirty = False
 
-    # Split days into "old" (summarise) and "recent" (verbatim)
     for day_str in all_days:
         try:
             day_date = date.fromisoformat(day_str)
@@ -632,32 +685,47 @@ def get_memory_context(chat_id: int = 0) -> str:
         if not msgs:
             continue
 
-        if day_date < summary_cutoff:
-            # Use cached summary or generate one
-            summaries = _load_summaries(chat_id)
-            if day_str not in summaries:
-                summaries[day_str] = _auto_summarise_day(day_str, msgs)
-                _save_summaries(chat_id)
-            lines.append(summaries[day_str])
-        else:
-            # Only include important messages in verbatim context
+        if day_date >= verbatim_cutoff:
+            # Verbatim window — include important messages
             for msg in msgs:
                 if msg.get("important", True) or msg.get("type") in ("bot_response", "voice", "photo"):
                     recent_messages.append(msg)
+        else:
+            # Older — need the daily summary
+            if day_str not in summaries:
+                summaries[day_str] = _auto_summarise_day(day_str, msgs)
+                summaries_dirty = True
+            summary_line = summaries[day_str]
+            if day_date < weekly_cutoff:
+                # Group into weeks
+                iso_year, iso_week, _ = day_date.isocalendar()
+                week_bucket.setdefault((iso_year, iso_week), []).append(summary_line)
+            else:
+                daily_summary_lines.append(summary_line)
 
-    # Build output
+    if summaries_dirty:
+        _save_summaries(chat_id)
+
     output = []
 
-    if lines:
-        output.append("--- OLDER CHAT SUMMARIES (past month) ---")
-        output.extend(lines)
-        output.append("--- END SUMMARIES ---\n")
+    # ── Weekly rollups (oldest first) ──
+    if week_bucket:
+        output.append("--- WEEKLY ROLLUPS (older than 90 days) ---")
+        for (iso_year, iso_week) in sorted(week_bucket.keys()):
+            label = f"{iso_year}-W{iso_week:02d}"
+            output.append(_auto_summarise_week(label, week_bucket[(iso_year, iso_week)]))
+        output.append("--- END WEEKLY ---\n")
 
-    # Take last N messages verbatim
+    # ── Daily summaries (30-90 days old) ──
+    if daily_summary_lines:
+        output.append("--- DAILY SUMMARIES (30-90 days) ---")
+        output.extend(daily_summary_lines)
+        output.append("--- END DAILY SUMMARIES ---\n")
+
+    # ── Verbatim (last 30 days, capped) ──
     recent_messages = recent_messages[-config.RECENT_MESSAGES_FULL:]
-
     if recent_messages:
-        output.append("--- RECENT GROUP CHAT (newest last) ---")
+        output.append(f"--- RECENT GROUP CHAT (last {verbatim_days} days, newest last) ---")
         for msg in recent_messages:
             time_str = msg.get("time", "")
             who = msg.get("who", "Unknown")
