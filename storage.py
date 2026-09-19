@@ -2684,6 +2684,29 @@ class LocalJsonStore:
             return self._sheets.read_any_tab(tab_name, max_rows)
         return {}
 
+    def read_tab_filtered(self, tab_name: str, keywords: list, max_rows: int = 500) -> dict:
+        """Read a tab and filter rows to those containing ANY of the keywords
+        (case-insensitive substring match on any cell). Used by the read_tab
+        feedback loop so the AI only sees rows relevant to what the user asked."""
+        data = self.read_tab(tab_name, max_rows=max_rows)
+        if not data or not keywords:
+            return data
+        kws = [k.strip().lower() for k in keywords if k and k.strip()]
+        if not kws:
+            return data
+        rows = data.get("rows", [])
+        filtered = []
+        for row in rows:
+            if isinstance(row, dict):
+                blob = " ".join(str(v) for v in row.values()).lower()
+            elif isinstance(row, (list, tuple)):
+                blob = " ".join(str(c) for c in row).lower()
+            else:
+                blob = str(row).lower()
+            if any(kw in blob for kw in kws):
+                filtered.append(row)
+        return {"headers": data.get("headers", []), "rows": filtered, "total_rows": data.get("total_rows", 0)}
+
     def update_in_tab(self, tab_name: str, match_col: str, match_val: str, data: dict) -> str:
         """Update a row in any Google Sheets tab. Returns 'updated', 'not_found', or 'error'."""
         if self._sheets:

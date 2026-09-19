@@ -3501,7 +3501,14 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
             elif action_type == "read_tab":
                 tab = act.get("tab", "")
                 if tab:
-                    data = store.read_tab(tab)
+                    # Recipe / SOP tabs are static-ish and small; grab lots of rows
+                    # so we don't truncate the specific recipe the user asked about.
+                    tab_l = tab.lower()
+                    is_sop_tab = any(k in tab_l for k in (
+                        "recipe", "bingsu", "checklist", "inspection", "minimum"
+                    ))
+                    max_rows = 500 if is_sop_tab else 50
+                    data = store.read_tab(tab, max_rows=max_rows)
                     # Stash results on ctx so the follow-up call can inject them
                     # into the AI's context.
                     if ctx is not None and hasattr(ctx, "chat_data") and data:
@@ -4283,15 +4290,40 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             write_actions = [a for a in actions if a.get("action") in ("append_row", "update_row")]
             if read_tab_actions and not write_actions:
                 store.refresh_if_stale(cooldown=0)
-                # Build an extra context block from the stashed read_tab results
+                # Build an extra context block from the stashed read_tab results.
+                # Filter rows by keywords in the user's message + recent bot Q
+                # so we don't dump 200 rows on Groq and drown out the match.
                 extra_ctx = None
                 stashed = ctx.chat_data.pop("_read_tab_results", {}) if hasattr(ctx, "chat_data") else {}
                 if stashed:
+                    # Build the keyword set: user text + reply context text
+                    kw_source = text + " " + (reply_context or "")
+                    kws = [w for w in re.findall(r"[A-Za-z]{3,}", kw_source.lower())
+                           if w not in {"the", "and", "for", "how", "what", "with",
+                                        "make", "please", "recipe", "which", "one",
+                                        "matcha" if False else "", "you", "your", "our",
+                                        "give", "want", "need", "just", "some", "any",
+                                        "this", "that", "there", "here"}]
+                    kws = list(dict.fromkeys(kws))[:8]  # dedupe, cap at 8
                     lines = ["── read_tab RESULTS (fresh from Google Sheet) ──"]
                     for tab_name, data in stashed.items():
-                        lines.append(f"\n### Tab: {tab_name}")
                         headers = data.get("headers", [])
-                        rows = data.get("rows", [])
+                        rows_all = data.get("rows", [])
+                        # Filter rows to those matching any keyword
+                        filtered = []
+                        if kws:
+                            for row in rows_all:
+                                if isinstance(row, dict):
+                                    blob = " ".join(str(v) for v in row.values()).lower()
+                                elif isinstance(row, (list, tuple)):
+                                    blob = " ".join(str(c) for c in row).lower()
+                                else:
+                                    blob = str(row).lower()
+                                if any(k in blob for k in kws):
+                                    filtered.append(row)
+                        # If filtering was too aggressive (nothing left), show all
+                        rows = filtered if filtered else rows_all
+                        lines.append(f"\n### Tab: {tab_name} (showing {len(rows)} of {len(rows_all)} rows)")
                         if headers:
                             lines.append("Columns: " + " | ".join(headers))
                         for row in rows:
