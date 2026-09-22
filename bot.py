@@ -3167,29 +3167,23 @@ def _preempt_new_item_detection(text: str):
     Returns (None, None) when it's not a clean new-item candidate (multiple
     fragments, item already known, or ambiguous with an existing item)."""
     intents = _extract_stock_update_intent(text)
-    logger.info(f"[NI-PREEMPT] text={text!r} intents={intents}")
     if not intents or len(intents) != 1:
-        logger.info(f"[NI-PREEMPT] REJECT: intents count={len(intents)}")
         return None, None
     candidate = intents[0]
     item_name = candidate["item"]
     if len(item_name) < 2:
-        logger.info(f"[NI-PREEMPT] REJECT: item too short: {item_name!r}")
         return None, None
     # Already known under this name or a close alias — not a new item.
     if _is_item_known(item_name):
-        logger.info(f"[NI-PREEMPT] REJECT: known item: {item_name!r}")
         return None, None
     # If it fuzzy-matches existing stock, let the normal ambiguity/AI path
     # handle it instead of treating it as brand new.
-    if _find_ambiguous_stock_matches(item_name, store, text):
-        logger.info(f"[NI-PREEMPT] REJECT: ambiguous: {item_name!r}")
+    if len(_find_ambiguous_stock_matches(item_name, store, text)) > 1:
         return None, None
     try:
         qty = int(float(candidate["qty"]))
     except (ValueError, TypeError):
         qty = None
-    logger.info(f"[NI-PREEMPT] ACCEPT: {item_name!r} qty={qty}")
     return item_name, qty
 
 
@@ -5108,10 +5102,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # instead of letting the AI improvise a Regular/One-off question it
     # can't actually act on. Skipped if replying to something, or if a
     # new-item flow is already in progress (handled above).
-    logger.info(f"[NI-CALL] text={text!r} reply_to={bool(update.message.reply_to_message)} has_pending={bool(ctx.chat_data.get('pending_new_item'))}")
     if not update.message.reply_to_message and not ctx.chat_data.get("pending_new_item"):
         _ni_item, _ni_qty = _preempt_new_item_detection(text)
-        logger.info(f"[NI-CALL] preempt returned item={_ni_item!r} qty={_ni_qty!r}")
         if _ni_item:
             await _ask_new_item_regular_confirm(update, ctx, _ni_item, _ni_qty)
             return
