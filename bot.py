@@ -2979,6 +2979,11 @@ _BULK_LINE_RE = re.compile(
     r"^\s*(?P<name>[^:\n]+?)\s*:\s*(?P<qty>\d+(?:\.\d+)?)\b[^\n]*$",
     re.MULTILINE,
 )
+# Empty-value line like "Salt:" or "Taro Balls: " (colon + only whitespace / nothing)
+_BULK_EMPTY_LINE_RE = re.compile(
+    r"^\s*(?P<name>[^:\n]+?)\s*:\s*$",
+    re.MULTILINE,
+)
 # Optional metadata at the top
 _BULK_CHECKED_BY_RE = re.compile(r"checked\s+by\s*:?\s*([^\n]+)", re.IGNORECASE)
 _BULK_UPDATED_BY_RE = re.compile(r"updated\s+by\s*:?\s*([^\n]+)", re.IGNORECASE)
@@ -3003,25 +3008,38 @@ def _looks_like_bulk_stock_list(text: str) -> bool:
 
 
 def _parse_bulk_stock_message(text: str, sender_name: str = "") -> tuple:
-    """Parse a bulk-stock message into (items, checked_by, stock_date).
-    Lines with no number ("Salt:") are skipped — staff means "not counted",
-    not "zero". Returns ([], "", None) if nothing usable found."""
+    """Parse a bulk-stock message.
+    Returns (items, empty_names, checked_by, stock_date).
+    - items: list of {item, qty} dicts for lines with a number.
+    - empty_names: list of item names where the line had no value (like "Salt:").
+      These represent "did staff forget to count?" — caller should confirm before
+      treating as 0.
+    Returns ([], [], "", None) if nothing usable found."""
     items = []
-    # Guard: skip any line inside the metadata header (checked/updated lines
-    # themselves match Name:value regex but aren't stock)
-    metadata_keys = ("checked by", "updated by", "stock check", "stock list")
+    empty_names = []
+    # Metadata rows that match Name:value regex but aren't stock
+    metadata_keys = ("checked by", "updated by", "stock check", "stock list", "date")
     for m in _BULK_LINE_RE.finditer(text):
         name = m.group("name").strip()
         qty = m.group("qty")
-        if not qty:  # empty value like "Salt:" → skip
+        if not qty:
             continue
-        # Skip metadata rows
         if name.lower() in metadata_keys:
             continue
-        # Skip @mentions or bot commands
         if name.startswith("@") or name.startswith("/"):
             continue
         items.append({"item": name, "qty": str(qty)})
+    # Empty-value lines — separate pass with its own regex
+    for m in _BULK_EMPTY_LINE_RE.finditer(text):
+        name = m.group("name").strip()
+        if name.lower() in metadata_keys:
+            continue
+        if name.startswith("@") or name.startswith("/"):
+            continue
+        # Skip if the name is a header/section title (usually all-caps or a
+        # very short word). Also skip if it happens to also match the qty
+        # regex (defensive — shouldn't happen since \s*$ requires empty end).
+        empty_names.append(name)
 
     checked_by = ""
     m = _BULK_CHECKED_BY_RE.search(text)
@@ -3031,14 +3049,12 @@ def _parse_bulk_stock_message(text: str, sender_name: str = "") -> tuple:
         m2 = _BULK_UPDATED_BY_RE.search(text)
         if m2:
             v = m2.group(1).strip()
-            # "Updated by: 18/9/26" — that's a date, not a name; skip if it looks numeric
             if not _BULK_DATE_RE.match(v):
                 checked_by = v.rstrip(":").strip()
     if not checked_by:
         checked_by = sender_name
 
     stock_date = None
-    # Take first date-shaped token in the first ~200 chars
     dm = _BULK_DATE_RE.search(text[:200])
     if dm:
         d, mo, y = dm.group(1), dm.group(2), dm.group(3)
@@ -3046,7 +3062,7 @@ def _parse_bulk_stock_message(text: str, sender_name: str = "") -> tuple:
             y = y[-2:]
         stock_date = f"{int(d):02d}/{int(mo):02d}/{y}"
 
-    return items, checked_by, stock_date
+    return items, empty_names, checked_by, stock_date
 
 
 async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
@@ -4320,6 +4336,76 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         # Nothing matched — probably unrelated; let the AI handle it, keep state.
 
+    # ─── Pending bulk-zeroes confirmation ────
+    # After a bulk stock update, if some items had blank values, the bot asked
+    # "zero or skip?". Handle the reply here.
+    _pbz = ctx.chat_data.get("pending_bulk_zeroes")
+    if _pbz and _pbz.get("items"):
+        import time as _t
+        age = _t.time() - _pbz.get("asked_at", 0)
+        if age > 600:  # 10 min expiry
+            ctx.chat_data.pop("pending_bulk_zeroes", None)
+        else:
+            t_low = text.strip().lower()
+            # Explicit zero/skip
+            if t_low in ("zero", "0", "yes zero", "set zero", "set to zero", "all zero", "all 0"):
+                items_to_zero = [{"item": n, "qty": "0"} for n in _pbz["items"]]
+                sheet_ok = store.update_stock_bulk(items_to_zero, _pbz.get("date"))
+                busy = " (⚠️ sheet busy, will auto-retry)" if not sheet_ok else ""
+                await update.message.reply_text(
+                    f"📦 Set {len(items_to_zero)} blank items to 0{busy}."
+                )
+                # Fire low-stock check for the zeroed items
+                low_items = store.check_low_stock([e["item"] for e in items_to_zero])
+                if low_items:
+                    alert_lines = ["⚠️ LOW STOCK ALERT:"]
+                    for li in low_items:
+                        unit = f" {li['unit']}" if li.get('unit') else ""
+                        alert_lines.append(f"  • {li['item']}: {li['qty']} (min: {li['min']}{unit})")
+                    await update.message.reply_text("\n".join(alert_lines))
+                    await _auto_add_low_to_shopping(low_items, store, update.get_bot(), update.effective_chat.id)
+                ctx.chat_data.pop("pending_bulk_zeroes", None)
+                return
+            if t_low in ("skip", "no", "leave", "leave them", "leave it", "ignore"):
+                await update.message.reply_text(f"Okay, leaving those {len(_pbz['items'])} items as-is.")
+                ctx.chat_data.pop("pending_bulk_zeroes", None)
+                return
+            # If the reply looks like a mini bulk-count (has Name qty pattern),
+            # parse it and set just those items. Others stay pending? — keep it
+            # simple: parse whatever we can, clear state.
+            mini_items, mini_empty, _, _ = _parse_bulk_stock_message(text, sender_name=name)
+            # Also allow "Salt 2, Glass Spray 1" comma-separated shorthand
+            if not mini_items:
+                mini_items = []
+                for frag in re.split(r"[,;\n]+", text):
+                    frag = frag.strip()
+                    m = re.match(r"^(.+?)\s+(\d+(?:\.\d+)?)\s*$", frag)
+                    if m:
+                        mini_items.append({"item": m.group(1).strip(), "qty": m.group(2)})
+            if mini_items:
+                # Only take items that are actually in the pending list
+                pending_set = {n.strip().lower() for n in _pbz["items"]}
+                accepted = [i for i in mini_items if i["item"].strip().lower() in pending_set]
+                if accepted:
+                    sheet_ok = store.update_stock_bulk(accepted, _pbz.get("date"))
+                    busy = " (⚠️ sheet busy, will auto-retry)" if not sheet_ok else ""
+                    names = ", ".join(i["item"] for i in accepted)
+                    await update.message.reply_text(f"📦 Updated: {names}{busy}.")
+                    # Remove those from pending, keep asking about the rest
+                    remaining = [n for n in _pbz["items"] if n.strip().lower() not in {a["item"].strip().lower() for a in accepted}]
+                    if remaining:
+                        blank_list = "\n".join(f"  • {n}" for n in remaining[:30])
+                        follow = await update.message.reply_text(
+                            f"❓ Still blank:\n{blank_list}\n\nReply *zero*, *skip*, or send specific counts.",
+                            parse_mode="Markdown",
+                        )
+                        _pbz["items"] = remaining
+                        _pbz["msg_id"] = follow.message_id if follow else _pbz.get("msg_id")
+                    else:
+                        ctx.chat_data.pop("pending_bulk_zeroes", None)
+                    return
+            # Anything else: leave state, let normal flow handle it
+
     # ─── Pending clarification resolver ────
     # If bot recently asked "Which X — A, B, or C?" and user's reply is short,
     # match against saved options and rewrite user's message so the AI has
@@ -4343,9 +4429,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # lines), parse it in code — skip the AI entirely. Groq can't reliably
     # emit a 78-item JSON action.
     if not update.message.reply_to_message and _looks_like_bulk_stock_list(text):
-        bulk_items, checked_by, stock_date = _parse_bulk_stock_message(text, sender_name=name)
+        bulk_items, empty_names, checked_by, stock_date = _parse_bulk_stock_message(text, sender_name=name)
         if bulk_items and len(bulk_items) >= 8:
-            logger.info(f"Pre-empt bulk stock: {len(bulk_items)} items, by {checked_by}, date {stock_date}")
+            logger.info(f"Pre-empt bulk stock: {len(bulk_items)} items + {len(empty_names)} empty, by {checked_by}, date {stock_date}")
             pseudo_actions = [{
                 "action": "bulk_stock",
                 "items": bulk_items,
@@ -4355,6 +4441,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             feedback = await _execute_actions(pseudo_actions, name, update, ctx)
             if feedback:
                 await update.message.reply_text("\n".join(feedback))
+
+            # If any items were left blank, ask user what to do with them.
+            if empty_names:
+                import time as _t
+                blank_list = "\n".join(f"  • {n}" for n in empty_names[:30])
+                more = f"\n  … and {len(empty_names) - 30} more" if len(empty_names) > 30 else ""
+                prompt_text = (
+                    f"❓ These items were left blank in your list:\n{blank_list}{more}\n\n"
+                    f"Reply *zero* to set all to 0, *skip* to leave them, "
+                    f"or send specific counts (e.g. \"Salt 2, Glass Spray 1\")."
+                )
+                sent = await update.message.reply_text(prompt_text, parse_mode="Markdown")
+                ctx.chat_data["pending_bulk_zeroes"] = {
+                    "items": empty_names,
+                    "msg_id": sent.message_id if sent else None,
+                    "checked_by": checked_by or name,
+                    "date": stock_date,
+                    "asked_at": _t.time(),
+                }
             return
 
     # ─── Pre-emptive stock ambiguity check ────
