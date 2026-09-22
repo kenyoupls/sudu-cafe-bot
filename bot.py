@@ -4267,12 +4267,10 @@ _STATE_CHANGING_ACTIONS = {
 def _maybe_send_pending_reminder(chat_id: int) -> str:
     """Return the current pending-tasks reminder text, or "" if none.
 
-    Called at the very end of handle_message, after every pending-task
-    handler has had its chance to consume/resolve the user's message.
-    Any task the current message just answered/cancelled was already
-    removed from pending_store by that point, so if a task still shows
-    up here it genuinely wasn't addressed this turn — worth reminding
-    about. If the user's message resolved everything, this returns "".
+    No longer called during normal message processing (removed — it was
+    noisy, firing even right after the user created a task). Kept in case
+    it's useful elsewhere; the daily nudge now uses
+    ``pending_store.format_reminder_list`` directly instead.
     """
     try:
         return pending_store.format_reminder_list(chat_id)
@@ -4301,24 +4299,12 @@ def _honesty_guard(chat_reply: str, actions: list):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle all natural language messages — AI-driven, fully conversational.
 
-    Thin wrapper around _handle_message_inner: the real handler has many
-    early `return`s (one per pending-flow intercept), so the pending-tasks
-    reminder is sent HERE, once, after the inner handler fully finishes —
-    no matter which return path it took. That guarantees a message that
-    resolved a pending task (Bug B) never gets the reminder about the very
-    task it just answered, while a message that resolved nothing still
-    gets reminded about whatever's left.
+    Thin wrapper around _handle_message_inner. The per-message pending-tasks
+    reminder was removed (too noisy — fired even right after creating a
+    task); pending tasks are now surfaced only by the daily 12:00 MYT nudge
+    (see `scheduled_pending_nudge`).
     """
-    chat_id = _get_chat_id(update) if update.message else None
     await _handle_message_inner(update, ctx)
-    if chat_id is not None and update.message and update.message.text and not update.message.text.strip().startswith("/"):
-        if not await _group_gate(update):
-            _reminder_text = _maybe_send_pending_reminder(chat_id)
-            if _reminder_text:
-                try:
-                    await update.message.reply_text(_reminder_text)
-                except Exception as e:
-                    logger.error(f"Pending-tasks reminder send failed: {e}")
 
 
 async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -5365,9 +5351,9 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Sorry {name}, I'm having trouble processing that. "
             f"Try again in a moment or use /help to see what I can do."
         )
-    # NOTE: the pending-tasks reminder is sent by the `handle_message`
-    # wrapper AFTER this function returns (whichever return path was
-    # taken) — see its docstring. Do not send it here too.
+    # NOTE: no per-message pending-tasks reminder is sent — that was
+    # removed as noisy. See `scheduled_pending_nudge` for the daily
+    # 12:00 MYT digest instead.
 
 
 # ═══════════════════════════════════════════════════════════
@@ -6121,26 +6107,19 @@ async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def scheduled_pending_nudge(ctx: ContextTypes.DEFAULT_TYPE):
-    """Daily nudge (12:00 MYT) for any pending task older than 24h that
-    hasn't been nudged in the last 24h. Groups candidates by chat and sends
-    one message per chat with the full reminder list, then marks each
-    nudged so it isn't re-sent for another day."""
-    candidates = pending_store.nudge_candidates(min_age_hours=24)
-    if not candidates:
+    """Daily nudge (12:00 MYT): send every chat with pending tasks the
+    FULL list of its pending tasks. No age filter, no dedupe — this runs
+    once a day and just shows what's outstanding, every time."""
+    chat_ids = pending_store.get_all_chat_ids()
+    if not chat_ids:
         return
 
-    by_chat = {}
-    for task in candidates:
-        by_chat.setdefault(task["chat_id"], []).append(task)
-
-    for chat_id, tasks in by_chat.items():
+    for chat_id in chat_ids:
         try:
             listing = pending_store.format_reminder_list(chat_id)
             if not listing:
                 continue
             await ctx.bot.send_message(chat_id, listing)
-            for task in tasks:
-                pending_store.mark_nudged(task["id"])
         except Exception as e:
             logger.error(f"Pending-tasks nudge failed for chat {chat_id}: {e}")
 

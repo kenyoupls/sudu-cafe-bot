@@ -95,6 +95,10 @@ class PendingTasksStore:
         """All pending tasks for this chat, oldest first."""
         return [t for t in self._tasks if t.get("chat_id") == chat_id]
 
+    def get_all_chat_ids(self) -> list:
+        """Unique chat_ids that have at least one pending task."""
+        return list({t["chat_id"] for t in self._tasks})
+
     def get_by_id(self, task_id: str):
         for t in self._tasks:
             if t.get("id") == task_id:
