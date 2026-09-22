@@ -1159,6 +1159,14 @@ class LocalJsonStore:
     def __init__(self):
         self.file = DATA_DIR / "cafe_data.json"
         self.data = self._load()
+
+        # One-time cleanup: action_items system deprecated in favor of pending_tasks.
+        # Clear any accumulated junk from previous versions.
+        if self.data.get("action_items"):
+            logger.info(f"Purging {len(self.data['action_items'])} stale action_items (deprecated system)")
+            self.data["action_items"] = []
+            self._save_local_only()
+
         self._sheets = None
         self._pending_syncs = set()   # Collect changed categories
         self._sync_timer = None       # Debounce timer
@@ -2812,68 +2820,29 @@ class LocalJsonStore:
     def get_daily_reports(self, days: int = 7) -> list:
         return self.data.get("daily_reports", [])[-days:]
 
-    # ─── Action Items (Chase-up System) ──────────────────────
+    # ─── Action Items (legacy — DEPRECATED, replaced by PendingTasksStore) ──
+    # DEPRECATED: replaced by PendingTasksStore. These are kept as no-ops so
+    # any lingering call site doesn't crash. Do not add new callers.
     def add_action_item(self, task: str, assigned_to: str, mentioned_by: str,
                         source_msg: str = "", urgency: str = "normal"):
-        if "action_items" not in self.data:
-            self.data["action_items"] = []
-        self.data["action_items"].append({
-            "task": task,
-            "assigned_to": assigned_to,
-            "mentioned_by": mentioned_by,
-            "source_msg": source_msg[:200],
-            "urgency": urgency,
-            "status": "pending",
-            "created_at": _fmt_ts(),
-            "last_chased": None,
-            "chase_count": 0,
-        })
-        self._save("actions")
+        # DEPRECATED: replaced by PendingTasksStore
+        return None
 
     def get_action_items(self, status: str = "pending") -> list:
-        items = self.data.get("action_items", [])
-        if status:
-            items = [i for i in items if i.get("status") == status]
-        return items
+        # DEPRECATED: replaced by PendingTasksStore
+        return []
 
     def complete_action_item(self, index: int, completed_by: str = ""):
-        pending = [i for i in self.data.get("action_items", []) if i.get("status") == "pending"]
-        if 0 <= index < len(pending):
-            count = 0
-            for idx, item in enumerate(self.data["action_items"]):
-                if item.get("status") == "pending":
-                    if count == index:
-                        self.data["action_items"][idx]["status"] = "done"
-                        self.data["action_items"][idx]["completed_at"] = _fmt_ts()
-                        self.data["action_items"][idx]["completed_by"] = completed_by
-                        break
-                    count += 1
-            self._save("actions")
+        # DEPRECATED: replaced by PendingTasksStore
+        return None
 
     def mark_action_chased(self, index: int):
-        pending = [i for i in self.data.get("action_items", []) if i.get("status") == "pending"]
-        if 0 <= index < len(pending):
-            count = 0
-            for idx, item in enumerate(self.data["action_items"]):
-                if item.get("status") == "pending":
-                    if count == index:
-                        self.data["action_items"][idx]["last_chased"] = _fmt_ts()
-                        self.data["action_items"][idx]["chase_count"] = item.get("chase_count", 0) + 1
-                        break
-                    count += 1
-            self._save("actions")
+        # DEPRECATED: replaced by PendingTasksStore
+        return None
 
     def dismiss_action_item(self, index: int):
-        pending = [i for i in self.data.get("action_items", []) if i.get("status") == "pending"]
-        if 0 <= index < len(pending):
-            count = 0
-            for idx, item in enumerate(self.data["action_items"]):
-                if item.get("status") == "pending":
-                    if count == index:
-                        self.data["action_items"][idx]["status"] = "dismissed"
-                        break
-                    count += 1
-            self._save("actions")
+        # DEPRECATED: replaced by PendingTasksStore
+        return None
 
     # ─── Custom Instructions ──────────────────────────────────
     def add_custom_instruction(self, instruction: str, added_by: str):

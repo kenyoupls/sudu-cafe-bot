@@ -38,7 +38,7 @@ from ai_chat import (
     handle_voice, handle_photo, handle_video, remember, process_message,
     classify_photo, classify_video, classify_receipt_reply,
     validate_stock_count, generate_content_suggestions,
-    extract_action_items_ai, generate_chaseup_message, text_to_speech,
+    text_to_speech,
     search_memory, process_receipt, process_sales_report, analyze_pos_file,
     ask_about_data,
 )
@@ -353,7 +353,7 @@ I'm your digital café manager\\! Here's what I can do:
   /week — Weekly overview
 
 📋 *Tasks \\& Follow\\-up*
-  /tasks — View pending action items
+  /tasks — View pending tasks
   /taskdone — Mark task as done
   /taskdismiss — Dismiss a task
   /search — Search chat history
@@ -2815,54 +2815,6 @@ async def cb_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  💬 NATURAL LANGUAGE / AI CHAT
 # ═══════════════════════════════════════════════════════════
 
-# Action type → keywords that map to task descriptions
-_ACTION_TASK_KEYWORDS = {
-    "update_stock": lambda a: ["stock", a.get("item", "").lower()],
-    "log_cleaning": lambda a: ["clean", a.get("zone", "").lower()],
-    "add_shopping": lambda a: ["buy", "shopping", a.get("item", "").lower()],
-    "mark_bought": lambda a: ["buy", "bought", a.get("item", "").lower()],
-    "checklist_done": lambda a: ["checklist", a.get("checklist", "").lower()],
-    "bulk_stock": lambda a: ["stock", "count", "check"],
-    "correct_stock": lambda a: ["stock", a.get("item", "").lower()],
-}
-
-
-def _auto_clear_matching_tasks(actions: list):
-    """After actions execute, auto-clear pending tasks that match what was just done.
-    Uses fuzzy keyword overlap: if 2+ significant words from the action match a task
-    description, mark it done."""
-    pending = store.get_action_items(status="pending")
-    if not pending:
-        return
-
-    cleared = []
-    for act in actions:
-        if not isinstance(act, dict):
-            continue
-        action_type = act.get("action", "")
-        kw_func = _ACTION_TASK_KEYWORDS.get(action_type)
-        if not kw_func:
-            continue
-
-        keywords = [w for w in kw_func(act) if w and len(w) > 2]
-        if not keywords:
-            continue
-
-        for idx, task in enumerate(pending):
-            if task.get("status") != "pending":
-                continue
-            desc = task.get("task", "").lower()
-            # Count how many keywords appear in the task description
-            matches = sum(1 for kw in keywords if kw in desc)
-            if matches >= 2:
-                store.complete_action_item(idx, "Auto (bot did it)")
-                cleared.append(task.get("task", "?"))
-                break  # one action clears one task max
-
-    if cleared:
-        logger.info(f"Auto-cleared {len(cleared)} tasks: {cleared}")
-
-
 def _find_ambiguous_stock_matches(item_name: str, store, user_text: str = "") -> list:
     """Check if item_name could match multiple stock items by word containment.
     Returns list of matching stock item names. If len > 1, it's ambiguous.
@@ -4127,14 +4079,11 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                     await update.message.reply_text("\n".join(rpt), parse_mode="Markdown")
 
             elif action_type == "show_tasks":
-                pending = store.get_action_items("pending")
-                if not pending:
-                    await update.message.reply_text("✅ No pending tasks! Everything's settled.")
-                else:
-                    rpt = [f"📋 *Pending Tasks* ({len(pending)})\n"]
-                    for i, task in enumerate(pending[:15], 1):
-                        rpt.append(f"  {i}. {task.get('task', '?')} (→ {task.get('assigned_to', '?')})")
-                    await update.message.reply_text("\n".join(rpt), parse_mode="Markdown")
+                reminder_list = pending_store.format_reminder_list(update.effective_chat.id)
+                await update.message.reply_text(
+                    reminder_list or "✅ No pending tasks! Everything's settled.",
+                    parse_mode="Markdown",
+                )
 
             elif action_type == "show_staff":
                 staff_list = store.get_staff()
@@ -4866,34 +4815,8 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tagged = _bot_is_tagged(update, ctx)
 
     if in_group and not tagged:
-        # Silently read & remember, extract action items, but don't reply
-        try:
-            action_items = await extract_action_items_ai(text, name)
-            for item in action_items:
-                store.add_action_item(
-                    task=item.get("task", text[:200]),
-                    assigned_to=item.get("assigned_to", name),
-                    mentioned_by=name,
-                    source_msg=text,
-                    urgency=item.get("urgency", "normal"),
-                )
-        except Exception as e:
-            logger.debug(f"Action item extraction skipped: {e}")
+        # Silently read & remember, but don't reply
         return  # Stay quiet — not tagged
-
-    # ─── Extract action items for chase-up system ──────────
-    try:
-        action_items = await extract_action_items_ai(text, name)
-        for item in action_items:
-            store.add_action_item(
-                task=item.get("task", text[:200]),
-                assigned_to=item.get("assigned_to", name),
-                mentioned_by=name,
-                source_msg=text,
-                urgency=item.get("urgency", "normal"),
-            )
-    except Exception as e:
-        logger.debug(f"Action item extraction skipped: {e}")
 
     # Strip the @tag from the message before sending to AI
     if tagged and ctx.bot.username:
@@ -5276,11 +5199,6 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if a.get("action", "") not in config.STAFF_BLOCKED_ACTIONS
                 ]
             feedback = await _execute_actions(actions, name, update, ctx)
-            # Auto-clear pending tasks that match executed actions
-            try:
-                _auto_clear_matching_tasks(actions)
-            except Exception as e:
-                logger.error(f"Auto-clear tasks error: {e}")
             if feedback:
                 sent = await update.message.reply_text(
                     "\n".join(feedback),
@@ -5361,38 +5279,30 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════
 
 async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """View pending action items."""
-    pending = store.get_action_items("pending")
-    if not pending:
+    """View pending tasks (pending_tasks system)."""
+    chat_id = update.effective_chat.id
+    reminder_list = pending_store.format_reminder_list(chat_id)
+    if not reminder_list:
         await update.message.reply_text("✅ No pending tasks! Everything's settled.")
         return
 
-    lines = ["📋 *Pending Tasks*\n"]
-    for i, item in enumerate(pending):
-        urgency = "🔴" if item.get("urgency") == "urgent" else "⚪"
-        who = item.get("assigned_to", "?")
-        task = item.get("task", "?")[:80]
-        created = item.get("created_at", "")[:10]
-        chased = item.get("chase_count", 0)
-        lines.append(f"  {i+1}. {urgency} {task}")
-        lines.append(f"     → {who} (since {created}, chased {chased}x)")
-
-    lines.append("\n/taskdone <number> — mark as done")
-    lines.append("/taskdismiss <number> — dismiss/cancel")
+    lines = [reminder_list, "\n/taskdone <number> — mark as done"]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_taskdone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Mark action item as done: /taskdone <number>"""
+    """Mark a pending task as done: /taskdone <number>"""
     if not ctx.args:
         await update.message.reply_text("Usage: /taskdone <number>\nSee /tasks for the list.")
         return
     try:
         idx = int(ctx.args[0]) - 1
-        pending = store.get_action_items("pending")
+        chat_id = update.effective_chat.id
+        pending = pending_store.get_for_chat(chat_id)
         if 0 <= idx < len(pending):
-            task_name = pending[idx].get("task", "?")[:60]
-            store.complete_action_item(idx, user_name(update))
+            task = pending[idx]
+            task_name = task.get("summary", "?")[:60]
+            pending_store.complete(task["id"])
             await update.message.reply_text(f"✅ Done: {task_name}")
         else:
             await update.message.reply_text("❌ Invalid number. Check /tasks for the list.")
@@ -5401,16 +5311,18 @@ async def cmd_taskdone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_taskdismiss(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Dismiss an action item: /taskdismiss <number>"""
+    """Dismiss a pending task: /taskdismiss <number>"""
     if not ctx.args:
         await update.message.reply_text("Usage: /taskdismiss <number>\nSee /tasks for the list.")
         return
     try:
         idx = int(ctx.args[0]) - 1
-        pending = store.get_action_items("pending")
+        chat_id = update.effective_chat.id
+        pending = pending_store.get_for_chat(chat_id)
         if 0 <= idx < len(pending):
-            task_name = pending[idx].get("task", "?")[:60]
-            store.dismiss_action_item(idx)
+            task = pending[idx]
+            task_name = task.get("summary", "?")[:60]
+            pending_store.complete(task["id"])
             await update.message.reply_text(f"🗑️ Dismissed: {task_name}")
         else:
             await update.message.reply_text("❌ Invalid number. Check /tasks for the list.")
@@ -6065,47 +5977,6 @@ async def scheduled_shift_reminder(ctx: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
-async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
-    """Chase up on pending action items that are stale."""
-    if not config.OWNER_GROUP_ID:
-        return
-    pending = store.get_action_items("pending")
-    if not pending:
-        return
-
-    # Filter to stale items (not chased recently)
-    stale = []
-    now = now_sg()
-    for i, item in enumerate(pending):
-        last_chased = item.get("last_chased")
-        created = item.get("created_at", "")
-        ref_time = last_chased or created
-        if ref_time:
-            try:
-                ref_dt = _parse_ts(ref_time)
-                hours_old = (now - ref_dt).total_seconds() / 3600
-                if hours_old >= config.CHASEUP_STALE_HOURS:
-                    stale.append((i, item))
-            except (ValueError, TypeError):
-                stale.append((i, item))
-
-    if not stale:
-        return
-
-    # Generate and send chase-up message — pass staff roster so AI knows who's owner vs staff
-    items_only = [item for _, item in stale]
-    message = await generate_chaseup_message(items_only, staff_info=store.get_staff())
-    if message:
-        await ctx.bot.send_message(
-            config.OWNER_GROUP_ID,
-            message,
-            parse_mode="Markdown",
-        )
-        # Mark as chased
-        for idx, _ in stale:
-            store.mark_action_chased(idx)
-
-
 async def scheduled_pending_nudge(ctx: ContextTypes.DEFAULT_TYPE):
     """Daily nudge (12:00 MYT): send every chat with pending tasks the
     FULL list of its pending tasks. No age filter, no dedupe — this runs
@@ -6332,7 +6203,7 @@ def main():
     app.add_handler(CommandHandler("analyze", o("analyze")(cmd_analyze)))
     app.add_handler(CommandHandler("aicontent", g(cmd_aicontent)))
 
-    # Action items / chase-up (allowed everywhere)
+    # Pending tasks (allowed everywhere)
     app.add_handler(CommandHandler("tasks", g(cmd_tasks)))
     app.add_handler(CommandHandler("taskdone", g(cmd_taskdone)))
     app.add_handler(CommandHandler("taskdismiss", g(cmd_taskdismiss)))
@@ -6418,15 +6289,6 @@ def main():
             days=(0, 1, 2, 3, 4, 5, 6),
             name="event_reminder",
         )
-
-        # Chase-up reminders for pending action items
-        for i, t in enumerate(config.CHASEUP_REMINDER_TIMES):
-            jq.run_daily(
-                scheduled_chaseup,
-                time=t,
-                days=(0, 1, 2, 3, 4, 5, 6),
-                name=f"chaseup_{i}",
-            )
 
         # Holiday refresh — every Sunday at 3:00 AM MYT
         jq.run_daily(
