@@ -318,9 +318,11 @@ class SheetsSync:
             def _find_row(item_name):
                 # Exact match wins (case-insensitive) so "(Cook)" vs "(Jelly)"
                 # don't collide when normalize_item_name strips both parens.
-                item_lower = item_name.strip().lower()
+                def _strip_edges(s):
+                    return s.strip().rstrip(':;,. ').strip().lower()
+                item_key = _strip_edges(item_name)
                 for i, row in enumerate(existing[1:], 1):
-                    if row and row[0].strip().lower() == item_lower:
+                    if row and _strip_edges(row[0]) == item_key:
                         return i
                 norm = normalize_item_name(item_name)
                 if norm in row_lookup:
@@ -1818,9 +1820,11 @@ class LocalJsonStore:
                         # Exact match wins (case-insensitive) so "(Cook)" vs
                         # "(Jelly)" don't collide when normalize_item_name strips
                         # both parenthesised suffixes.
-                        item_lower = item_name.strip().lower()
+                        def _strip_edges(s):
+                            return s.strip().rstrip(':;,. ').strip().lower()
+                        item_key = _strip_edges(item_name)
                         for i, row in enumerate(existing[1:], 1):
-                            if row and row[0].strip().lower() == item_lower:
+                            if row and _strip_edges(row[0]) == item_key:
                                 return i
                         norm = normalize_item_name(item_name)
                         if norm in row_lookup:
