@@ -2718,6 +2718,16 @@ def _find_ambiguous_stock_matches(item_name: str, store, user_text: str = "") ->
     stock_current = store.data.get("stock_current", {})
     all_names = set(list(all_stock.keys()) + list(stock_current.keys()))
 
+    # Exact match wins immediately. If item_name matches a real stock name
+    # (case-insensitive), there's no ambiguity — even if brand-strip
+    # normalisation would collapse it into a common suffix like "powder".
+    # Example: "Milo Powder" IS a real item — don't treat it as ambiguous
+    # just because normalize_item_name strips "milo" as a brand.
+    input_lower = item_name.strip().lower()
+    for existing in all_names:
+        if existing.strip().lower() == input_lower:
+            return [existing]
+
     def _word_matches(query: str) -> list:
         """Find stock items where ALL query words appear in the stock name."""
         query_norm = normalize_item_name(query)
@@ -2957,6 +2967,88 @@ def _preempt_stock_ambiguity(text: str):
     return lines, pending_items
 
 
+# ─── Pre-emptive bulk stock parser ───────────────────────────────────────
+# Detects and parses structured stock-count messages like the ones staff
+# send from a paper checklist ("Full Cream Milk: 120\nLow Fat Milk: 139\n...").
+# Groq can't reliably build a 78-item JSON action; code-side parsing is
+# deterministic and works for any list size.
+
+# Line like "Full Cream Milk: 120" or "Vanilla Ice Cream (big=4 small): 11"
+# or "Glove: 4 (white)" — number can have trailing note text.
+_BULK_LINE_RE = re.compile(
+    r"^\s*(?P<name>[^:\n]+?)\s*:\s*(?P<qty>\d+(?:\.\d+)?)\b[^\n]*$",
+    re.MULTILINE,
+)
+# Optional metadata at the top
+_BULK_CHECKED_BY_RE = re.compile(r"checked\s+by\s*:?\s*([^\n]+)", re.IGNORECASE)
+_BULK_UPDATED_BY_RE = re.compile(r"updated\s+by\s*:?\s*([^\n]+)", re.IGNORECASE)
+# dd/mm/yy or dd/mm/yyyy or dd.mm.yy
+_BULK_DATE_RE = re.compile(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2}(?:\d{2})?)\b")
+
+
+def _looks_like_bulk_stock_list(text: str) -> bool:
+    """Heuristic: does this message look like a paper-checklist stock count?
+    True if it has 8+ "Name: number" lines OR mentions 'stock check'/'checked by'
+    and has at least 4 Name:number lines."""
+    if not text or len(text) < 30:
+        return False
+    matches = _BULK_LINE_RE.findall(text)
+    numbered = sum(1 for _name, qty in matches if qty)
+    if numbered >= 8:
+        return True
+    lower = text[:300].lower()
+    if numbered >= 4 and any(kw in lower for kw in ("stock check", "checked by", "updated by", "stock list")):
+        return True
+    return False
+
+
+def _parse_bulk_stock_message(text: str, sender_name: str = "") -> tuple:
+    """Parse a bulk-stock message into (items, checked_by, stock_date).
+    Lines with no number ("Salt:") are skipped — staff means "not counted",
+    not "zero". Returns ([], "", None) if nothing usable found."""
+    items = []
+    # Guard: skip any line inside the metadata header (checked/updated lines
+    # themselves match Name:value regex but aren't stock)
+    metadata_keys = ("checked by", "updated by", "stock check", "stock list")
+    for m in _BULK_LINE_RE.finditer(text):
+        name = m.group("name").strip()
+        qty = m.group("qty")
+        if not qty:  # empty value like "Salt:" → skip
+            continue
+        # Skip metadata rows
+        if name.lower() in metadata_keys:
+            continue
+        # Skip @mentions or bot commands
+        if name.startswith("@") or name.startswith("/"):
+            continue
+        items.append({"item": name, "qty": str(qty)})
+
+    checked_by = ""
+    m = _BULK_CHECKED_BY_RE.search(text)
+    if m:
+        checked_by = m.group(1).strip().rstrip(":").strip()
+    if not checked_by:
+        m2 = _BULK_UPDATED_BY_RE.search(text)
+        if m2:
+            v = m2.group(1).strip()
+            # "Updated by: 18/9/26" — that's a date, not a name; skip if it looks numeric
+            if not _BULK_DATE_RE.match(v):
+                checked_by = v.rstrip(":").strip()
+    if not checked_by:
+        checked_by = sender_name
+
+    stock_date = None
+    # Take first date-shaped token in the first ~200 chars
+    dm = _BULK_DATE_RE.search(text[:200])
+    if dm:
+        d, mo, y = dm.group(1), dm.group(2), dm.group(3)
+        if len(y) == 4:
+            y = y[-2:]
+        stock_date = f"{int(d):02d}/{int(mo):02d}/{y}"
+
+    return items, checked_by, stock_date
+
+
 async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
     """Execute structured actions returned by the AI."""
     feedback = []
@@ -3139,8 +3231,8 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
                     if missing:
                         missing_list = "\n".join(f"  • {m}" for m in sorted(missing)[:30])
                         await update.effective_message.reply_text(
-                            f"📋 *Items not counted yet:*\n\n{missing_list}\n\n"
-                            f"_Send their counts when ready, or say 'skip' to keep current values._",
+                            f"📋 *Not in this update:*\n\n{missing_list}\n\n"
+                            f"_If you already counted these, please re-send those lines (parser may have skipped them). Otherwise say 'skip' to keep current values._",
                             parse_mode="Markdown",
                         )
                 except Exception as e:
@@ -4245,6 +4337,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 text = f"[User is answering your previous 'which one?' question. They picked: {matched}] {text}"
                 ctx.chat_data.pop("pending_clarification", None)
             # 0 or 2+ matches → leave state, let AI re-ask
+
+    # ─── Pre-emptive bulk stock parser ────
+    # If message is a paper-checklist style stock count (many "Name: number"
+    # lines), parse it in code — skip the AI entirely. Groq can't reliably
+    # emit a 78-item JSON action.
+    if not update.message.reply_to_message and _looks_like_bulk_stock_list(text):
+        bulk_items, checked_by, stock_date = _parse_bulk_stock_message(text, sender_name=name)
+        if bulk_items and len(bulk_items) >= 8:
+            logger.info(f"Pre-empt bulk stock: {len(bulk_items)} items, by {checked_by}, date {stock_date}")
+            pseudo_actions = [{
+                "action": "bulk_stock",
+                "items": bulk_items,
+                "checked_by": checked_by or name,
+                "date": stock_date,
+            }]
+            feedback = await _execute_actions(pseudo_actions, name, update, ctx)
+            if feedback:
+                await update.message.reply_text("\n".join(feedback))
+            return
 
     # ─── Pre-emptive stock ambiguity check ────
     # If the message reads like "<item> <number>" AND the item is ambiguous,
