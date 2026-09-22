@@ -36,6 +36,26 @@ import requests
 import config
 from storage import get_store, normalize_item_name
 from sop_data import build_sop_prompt
+from pending_tasks import PendingTasksStore
+
+_pending_store = PendingTasksStore(get_store())
+
+
+def _pending_tasks_context(chat_id: int) -> str:
+    """Build the CURRENT PENDING TASKS block injected into every AI call's
+    context, so the AI can answer or cancel a pending task using its id.
+    Returns "" when there are no pending tasks for this chat."""
+    tasks = _pending_store.get_for_chat(chat_id)
+    if not tasks:
+        return ""
+    lines = ["CURRENT PENDING TASKS FOR THIS CHAT:"]
+    for i, t in enumerate(tasks, start=1):
+        lines.append(f"{i}. [task_id: {t.get('id')}] {t.get('summary', '')}")
+    lines.append(
+        "\nIf user's current message answers or cancels any of these, "
+        "respond appropriately (see PENDING TASKS rule)."
+    )
+    return "\n".join(lines)
 
 logger = logging.getLogger(__name__)
 
@@ -777,6 +797,11 @@ _SYSTEM_PROMPT_TEMPLATE = """🚨 STOCK NUMBERS: For "how many X" questions, the
 - If user provides expense info in bulk (e.g. "yes, RM15 for 3 from FairPrice paid by me"), extract all fields and emit log_expense_detail with everything at once — do not re-ask what's already provided.
 - Required expense fields: item, qty_purchased, price_total, supplier, date (default today: YYYY-MM-DD), paid_by (staff name).
 
+🚨 PENDING TASKS:
+- When context lists pending tasks and user's message clearly withdraws, cancels, or dismisses them (phrases like "cancel", "forget it", "nvm", "skip it", "don't do it", "actually no", etc — use judgment, not exact matching), emit action: {"action": "cancel_pending", "target": "all"} OR {"action": "cancel_pending", "task_id": "<specific id from context>"}.
+- When user answers a pending task, emit the appropriate action AS IF they had just started that flow (e.g. "yes" to a pending "regular stock?" → emit update_stock with the saved qty).
+- Never repeat a pending task's question — the reminder is added automatically.
+
 You are the AI MANAGER of CAFE_NAME_HERE, a bingsu café in Melaka, Malaysia. You are not an assistant — you are the MANAGER. You live in the café's Telegram group and you actively run the business alongside the team.
 
 YOUR ROLE — FULL BOSS MODE:
@@ -915,6 +940,8 @@ Available actions:
   Use when someone asks "any pending tasks", "what needs to be done", "action items", etc.
 - show_staff: {"action": "show_staff"}
   Use when someone asks "who's on the team", "staff list", "senarai pekerja", etc.
+- cancel_pending: {"action": "cancel_pending", "target": "all"} OR {"action": "cancel_pending", "task_id": "<id from CURRENT PENDING TASKS context>"} OR {"action": "cancel_pending", "target": "latest"}
+  See the 🚨 PENDING TASKS rule below for when to use this.
 
 You can include MULTIPLE actions in one array. Examples:
 
@@ -1116,6 +1143,11 @@ _GROQ_BASE_PROMPT = f"""🚨 STOCK NUMBERS: For "how many X" questions, the ONLY
 - If user provides expense info in bulk (e.g. "yes, RM15 for 3 from FairPrice paid by me"), extract all fields and emit log_expense_detail with everything at once — do not re-ask what's already provided.
 - Required expense fields: item, qty_purchased, price_total, supplier, date (default today: YYYY-MM-DD), paid_by (staff name).
 
+🚨 PENDING TASKS:
+- When context lists pending tasks and user's message clearly withdraws, cancels, or dismisses them (phrases like "cancel", "forget it", "nvm", "skip it", "don't do it", "actually no", etc — use judgment, not exact matching), emit action: {{"action": "cancel_pending", "target": "all"}} OR {{"action": "cancel_pending", "task_id": "<specific id from context>"}}.
+- When user answers a pending task, emit the appropriate action AS IF they had just started that flow (e.g. "yes" to a pending "regular stock?" → emit update_stock with the saved qty).
+- Never repeat a pending task's question — the reminder is added automatically.
+
 You are the AI MANAGER of {config.CAFE_NAME}, a bingsu café in Melaka, Malaysia. You run the business alongside the team in the café's Telegram group — not an assistant, the manager.
 
 Reply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.
@@ -1178,6 +1210,7 @@ Available actions (name — brief format):
 - checklist_done — {{"action":"checklist_done","checklist":"opening|6pm|closing","items":["all"] or [...]}}
 - monthly_summary — {{"action":"monthly_summary","month":"YYYY-MM"}}
 - Reports (no data made up, just trigger): show_today, show_expenses, show_whopaid, show_sales, show_pnl, show_stock, show_lowstock, show_shopping, show_cleaning, show_shifts, show_week, show_tasks, show_staff — each {{"action":"show_x"}}, month optional where relevant.
+- cancel_pending — {{"action":"cancel_pending","target":"all"}} OR {{"action":"cancel_pending","task_id":"<id from CURRENT PENDING TASKS context>"}} OR {{"action":"cancel_pending","target":"latest"}}. See 🚨 PENDING TASKS rule.
 
 Use show_whopaid when someone asks "how much did X pay", "siapa bayar", "who paid", "berapa X spent", expenses by person.
 Use show_expenses when someone asks "how much we spend", "total expenses", "berapa belanja".
@@ -1553,6 +1586,10 @@ def _full_context(user_name: str, user_message: str, reply_context: str = None,
         f"Staff member: {user_name}",
     ]
 
+    pending_ctx = _pending_tasks_context(chat_id)
+    if pending_ctx:
+        parts.append(pending_ctx)
+
     if reply_context:
         parts.append(f"⚠️ REPLY CONTEXT — The user is replying to this message: \"{reply_context}\"\nTHEIR FOLLOW-UP IS ABOUT THIS TOPIC ONLY. Do NOT answer broadly — scope your response to what was being discussed above.\n⚠️ IMPORTANT: The replied message above may contain OUTDATED information. NEVER blindly repeat or trust what was said before — always re-check against your current context data before answering. If the user says 'again' or asks you to retry, treat it as a fresh question and answer from your current data.")
 
@@ -1641,6 +1678,10 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
     now = _now().strftime("%A, %d %B %Y, %I:%M %p")
     parts.append(f"Time: {now}")
     parts.append(f"Staff: {user_name}")
+
+    pending_ctx = _pending_tasks_context(chat_id)
+    if pending_ctx:
+        parts.append(pending_ctx)
 
     # Recent chat history (last 15 messages — enough to follow conversation threads)
     try:

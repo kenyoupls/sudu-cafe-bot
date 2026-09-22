@@ -32,6 +32,7 @@ import functools
 
 import config
 from storage import get_store, normalize_item_name, clean_item_name
+from pending_tasks import PendingTasksStore
 from ai_chat import (
     ask_ai, get_content_idea, analyze_stock_and_suggest, suggest_for_event,
     handle_voice, handle_photo, handle_video, remember, process_message,
@@ -51,6 +52,72 @@ logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo(config.TIMEZONE)
 store = get_store()
+pending_store = PendingTasksStore(store)
+
+# Maps our chat_data flow keys to the universal pending-task type name,
+# and the chat_data key that stores that flow's persistent task id.
+_PENDING_CHAT_DATA_KEYS = {
+    "sales": "pending_sales",
+    "receipts": "pending_receipts",
+    "new_item": "pending_new_item",
+    "new_items": "pending_new_items",
+    "disambiguation": "pending_disambiguation",
+    "bulk_zeroes": "pending_bulk_zeroes",
+    "clarification": "pending_clarification",
+}
+
+
+def _pending_task_id_key(task_type: str) -> str:
+    return f"_pending_{task_type}_task_id"
+
+
+def _add_pending_task(ctx, chat_id: int, task_type: str, data, summary: str) -> str:
+    """Persist a pending task and remember its id on ctx.chat_data so the
+    in-session flow (which still reads ctx.chat_data["pending_X"]) can
+    later mark it complete."""
+    task_id = pending_store.add(chat_id, task_type, data, summary)
+    ctx.chat_data[_pending_task_id_key(task_type)] = task_id
+    return task_id
+
+
+def _complete_pending_task(ctx, task_type: str):
+    """Remove the persistent pending task tied to this chat_data flow, if any."""
+    key = _pending_task_id_key(task_type)
+    task_id = ctx.chat_data.pop(key, None)
+    if task_id:
+        pending_store.complete(task_id)
+
+
+def _rehydrate_pending_tasks(ctx, chat_id: int):
+    """On first touch of a chat after a restart, ctx.chat_data is empty even
+    though pending_store may still have tasks for this chat (persisted to
+    disk). Repopulate the chat_data slots the existing flow handlers read
+    from, so those handlers keep working exactly as before without knowing
+    about pending_store at all.
+
+    "receipts" is special: pending_receipts is a multi-slot dict keyed by
+    confirmation message id, and image_bytes (not JSON-serializable) is
+    never persisted, so a rehydrated receipt can't be re-confirmed with a
+    fresh image — but it still shows up in reminders/cancel and its other
+    fields (data, new_items, msg_ids) are restored so replies keep working.
+    """
+    for task in pending_store.get_for_chat(chat_id):
+        task_type = task.get("type")
+        chat_data_key = _PENDING_CHAT_DATA_KEYS.get(task_type)
+        if not chat_data_key:
+            continue
+        if task_type == "receipts":
+            receipts = ctx.chat_data.setdefault("pending_receipts", {})
+            msg_id = task.get("data", {}).get("msg_id")
+            if msg_id is not None and msg_id not in receipts:
+                entry = dict(task.get("data") or {})
+                entry.setdefault("image_bytes", None)
+                entry["_task_id"] = task.get("id")
+                receipts[msg_id] = entry
+            continue
+        if chat_data_key not in ctx.chat_data:
+            ctx.chat_data[chat_data_key] = task.get("data")
+            ctx.chat_data[_pending_task_id_key(task_type)] = task.get("id")
 
 # ─── SOP data: Google Sheets is the only source of truth. Load into prompt. ───
 if store._sheets:
@@ -1229,15 +1296,18 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 # Limit to 5 pending receipts — expire oldest if needed
                 while len(receipts) >= 5:
                     oldest_key = next(iter(receipts))
-                    receipts.pop(oldest_key)
-                receipts[sent_msg.message_id] = {
+                    old_entry = receipts.pop(oldest_key)
+                    _old_task_id = old_entry.get("_task_id") if isinstance(old_entry, dict) else None
+                    if _old_task_id:
+                        pending_store.complete(_old_task_id)
+                _track_pending_receipt(ctx, chat_id, sent_msg.message_id, {
                     "data": receipt_data,
                     "image_bytes": image_bytes,
                     "user": name,
                     "caption": caption,
                     "msg_ids": [processing_msg.message_id, sent_msg.message_id],
                     "new_items": new_items,
-                }
+                })
             else:
                 await update.message.reply_text(
                     f"🧾 Couldn't read that receipt, {name}. "
@@ -1303,6 +1373,12 @@ async def handle_photo_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "data": sales_data,
                     "user": name,
                 }
+                _add_pending_task(
+                    ctx, chat_id, "sales",
+                    {"data": sales_data, "user": name},
+                    f"Sales RM{float(sales_data.get('total_sales', 0) or 0):.2f} on "
+                    f"{sales_data.get('date', '?')} — confirm to save?",
+                )
 
                 buttons = [
                     [
@@ -1470,6 +1546,12 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "data": sales_data,
                     "user": name,
                 }
+                _add_pending_task(
+                    ctx, chat_id, "sales",
+                    {"data": sales_data, "user": name},
+                    f"Sales RM{float(sales_data.get('total_sales', 0) or 0):.2f} on "
+                    f"{sales_data.get('date', '?')} — confirm to save?",
+                )
 
                 buttons = [
                     [
@@ -1521,15 +1603,18 @@ async def handle_video_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 receipts = _get_pending_receipts(ctx)
                 while len(receipts) >= 5:
                     oldest_key = next(iter(receipts))
-                    receipts.pop(oldest_key)
-                receipts[sent_msg.message_id] = {
+                    old_entry = receipts.pop(oldest_key)
+                    _old_task_id = old_entry.get("_task_id") if isinstance(old_entry, dict) else None
+                    if _old_task_id:
+                        pending_store.complete(_old_task_id)
+                _track_pending_receipt(ctx, chat_id, sent_msg.message_id, {
                     "data": receipt_data,
                     "image_bytes": video_bytes,
                     "user": name,
                     "caption": caption,
                     "msg_ids": [processing_msg.message_id, sent_msg.message_id],
                     "new_items": new_items,
-                }
+                })
             else:
                 await msg.reply_text(
                     f"🧾 Couldn't read that receipt from the video, {name}. "
@@ -1622,7 +1707,11 @@ def _clear_receipt_tracking(ctx, receipt_key: int = None):
     """Clear receipt tracking state after confirmation or cancellation."""
     if receipt_key is not None:
         receipts = ctx.chat_data.get("pending_receipts", {})
-        receipts.pop(receipt_key, None)
+        removed = receipts.pop(receipt_key, None)
+        if isinstance(removed, dict):
+            _task_id = removed.get("_task_id")
+            if _task_id:
+                pending_store.complete(_task_id)
         if not receipts:
             ctx.chat_data.pop("pending_receipts", None)
     # Always clean old-format keys
@@ -1630,6 +1719,41 @@ def _clear_receipt_tracking(ctx, receipt_key: int = None):
     ctx.chat_data.pop("pending_receipt_msg_id", None)
     ctx.chat_data.pop("pending_receipt_msg_ids", None)
     ctx.chat_data.pop("pending_receipt_changing", None)
+
+
+def _track_pending_receipt(ctx, chat_id: int, msg_id: int, entry: dict):
+    """Store a receipt awaiting confirmation in ctx.chat_data (existing
+    in-session flow) AND persist it to pending_store (survives restart).
+    `entry` may contain raw image_bytes — those are dropped from the
+    persisted copy since they're not JSON-serializable and not needed
+    for the reminder/cancel flow."""
+    receipts = _get_pending_receipts(ctx)
+    receipts[msg_id] = entry
+    supplier = entry.get("data", {}).get("supplier", "?")
+    total = float(entry.get("data", {}).get("total") or 0)
+    persist_data = {k: v for k, v in entry.items() if k != "image_bytes"}
+    persist_data["msg_id"] = msg_id
+    task_id = _add_pending_task(
+        ctx, chat_id, "receipts", persist_data,
+        f"Receipt from {supplier} RM{total:.2f} — confirm items?",
+    )
+    entry["_task_id"] = task_id
+
+
+def _sync_pending_receipt_task(pending_entry: dict):
+    """Refresh the persisted copy of a receipt task after in-place edits
+    (e.g. new_items classification, item corrections) so a restart/nudge
+    reflects the latest state."""
+    if not pending_entry:
+        return
+    task_id = pending_entry.get("_task_id")
+    if not task_id:
+        return
+    task = pending_store.get_by_id(task_id)
+    if not task:
+        return
+    task["data"] = {k: v for k, v in pending_entry.items() if k != "image_bytes"}
+    pending_store._persist()
 
 
 def _get_pending_receipts(ctx) -> dict:
@@ -1872,13 +1996,15 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
             except (ValueError, TypeError):
                 item_qty = None
             import time as _t
-            ctx.chat_data["pending_new_item"] = {
+            _pni = {
                 "item_name": item,
                 "qty": item_qty,
                 "raw_message": "",
                 "timestamp": _t.time(),
                 "stage": "awaiting_regular_confirm",
             }
+            ctx.chat_data["pending_new_item"] = _pni
+            _add_pending_task(ctx, update.effective_chat.id, "new_item", _pni, _new_item_summary(_pni))
             buttons = [
                 [
                     InlineKeyboardButton("✅ Regular stock", callback_data="newitem:regular"),
@@ -1979,13 +2105,15 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except (ValueError, TypeError):
             next_qty = None
         import time as _t
-        ctx.chat_data["pending_new_item"] = {
+        _pni = {
             "item_name": next_item,
             "qty": next_qty,
             "raw_message": "",
             "timestamp": _t.time(),
             "stage": "awaiting_regular_confirm",
         }
+        ctx.chat_data["pending_new_item"] = _pni
+        _add_pending_task(ctx, update.effective_chat.id, "new_item", _pni, _new_item_summary(_pni))
         buttons = [
             [
                 InlineKeyboardButton("✅ Regular stock", callback_data="newitem:regular"),
@@ -1999,6 +2127,7 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
     else:
+        _complete_pending_task(ctx, "new_item")
         ctx.chat_data.pop("pending_new_item", None)
 
 
@@ -2026,8 +2155,13 @@ async def cb_rcpnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     new_items[idx]["choice"] = choice
     if pending_entry:
         pending_entry["new_items"] = new_items
+        _sync_pending_receipt_task(pending_entry)
     else:
         ctx.chat_data["pending_new_items"] = new_items
+        _add_pending_task(
+            ctx, update.effective_chat.id, "new_items", new_items,
+            f"{len(new_items)} new items from receipt — classify each?",
+        )
 
     # Re-render the confirmation message with updated buttons
     pending = {
@@ -2594,6 +2728,7 @@ async def _confirm_sales(pending: dict, confirmed_by: str,
 
     ctx.chat_data.pop("pending_sales", None)
     ctx.chat_data.pop("pending_sales_msg_id", None)
+    _complete_pending_task(ctx, "sales")
 
     summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
     await status_msg.edit_text(
@@ -2665,6 +2800,7 @@ async def cb_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.chat_data.pop("pending_sales", None)
     ctx.chat_data.pop("pending_sales_msg_id", None)
+    _complete_pending_task(ctx, "sales")
 
     summary = "\n".join(f"  {r}" for r in results) if results else "  Saved locally"
     await query.edit_message_text(
@@ -3051,17 +3187,45 @@ def _preempt_new_item_detection(text: str):
     return item_name, qty
 
 
+def _new_item_summary(pni: dict) -> str:
+    """Human-readable one-liner for a pending_new_item task, reflecting its
+    current stage (used both at creation and when the stage advances)."""
+    item = pni.get("item_name", "?")
+    stage = pni.get("stage", "")
+    if stage == "awaiting_regular_confirm":
+        return f"{item} — is this a regular stock item?"
+    if stage == "awaiting_qty":
+        return f"{item} — how many units?"
+    if stage == "awaiting_expense_confirm":
+        return f"{item} — was this bought? Add to expenses?"
+    if stage == "awaiting_expense_fields":
+        expense = pni.get("expense", {})
+        if "price_total" not in expense:
+            return f"{item} — price paid (total)?"
+        if "qty_purchased" not in expense:
+            return f"{item} — how many units did you buy?"
+        if "supplier" not in expense:
+            return f"{item} — who was it bought from (supplier)?"
+        if "date" not in expense:
+            return f"{item} — date of purchase?"
+        return f"{item} — paid by whom?"
+    return f"{item} — new item classification in progress"
+
+
 async def _ask_new_item_regular_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                          item_name: str, qty):
     """Send the Regular-stock confirmation prompt and save pending_new_item state."""
     import time as _t
-    ctx.chat_data["pending_new_item"] = {
+    pni = {
         "item_name": item_name,
         "qty": qty,
         "raw_message": update.message.text if update.message else "",
         "timestamp": _t.time(),
         "stage": "awaiting_regular_confirm",
     }
+    ctx.chat_data["pending_new_item"] = pni
+    chat_id = update.effective_chat.id
+    _add_pending_task(ctx, chat_id, "new_item", pni, _new_item_summary(pni))
     qty_note = f" ({qty} units)" if qty is not None else ""
     buttons = [
         [
@@ -3087,10 +3251,17 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
         return False
 
     import time as _t
-    age = _t.time() - pni.get("timestamp", 0)
-    if age > 600:  # 10 min expiry
-        ctx.chat_data.pop("pending_new_item", None)
-        return False
+
+    def _touch_task_summary():
+        """Keep the persisted pending-task summary in sync with the
+        current stage, so reminders/nudges show the right question."""
+        _tid = ctx.chat_data.get(_pending_task_id_key("new_item"))
+        if _tid:
+            _task = pending_store.get_by_id(_tid)
+            if _task:
+                _task["summary"] = _new_item_summary(pni)
+                _task["data"] = pni
+                pending_store._persist()
 
     stage = pni.get("stage", "")
     item = pni.get("item_name", "")
@@ -3098,10 +3269,12 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
 
     def _touch():
         pni["timestamp"] = _t.time()
+        _touch_task_summary()
 
     if stage == "awaiting_regular_confirm":
         if _PNI_NO_RE.search(t_stripped) and not _PNI_YES_RE.search(t_stripped):
             ctx.chat_data.pop("pending_new_item", None)
+            _complete_pending_task(ctx, "new_item")
             await update.message.reply_text(f"👍 OK — {item} not added to stock.")
             return True
         if _PNI_YES_RE.search(t_stripped):
@@ -3149,6 +3322,7 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
     elif stage == "awaiting_expense_confirm":
         if _PNI_NO_RE.search(t_stripped) and not _PNI_YES_RE.search(t_stripped):
             ctx.chat_data.pop("pending_new_item", None)
+            _complete_pending_task(ctx, "new_item")
             await update.message.reply_text(f"OK — {item} saved to stock, no expense logged.")
             return True
         if _PNI_YES_RE.search(t_stripped):
@@ -3220,6 +3394,7 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
                 logged = False
 
             ctx.chat_data.pop("pending_new_item", None)
+            _complete_pending_task(ctx, "new_item")
             if logged:
                 await update.message.reply_text(
                     f"✅ Logged expense — {item}: {expense['qty_purchased']} units, "
@@ -3363,6 +3538,47 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
         action_type = act.get("action", "")
 
         try:
+            if action_type == "cancel_pending":
+                _chat_id_for_cancel = update.effective_chat.id
+
+                def _clear_chat_data_for_type(_ttype):
+                    _key = _PENDING_CHAT_DATA_KEYS.get(_ttype)
+                    if _key and ctx is not None and hasattr(ctx, "chat_data"):
+                        ctx.chat_data.pop(_key, None)
+                        ctx.chat_data.pop(_pending_task_id_key(_ttype), None)
+
+                _target = act.get("target")
+                _task_id = act.get("task_id")
+                if _target == "all":
+                    _tasks_before = pending_store.get_for_chat(_chat_id_for_cancel)
+                    _summaries = [t.get("summary", "") for t in _tasks_before]
+                    for _t in _tasks_before:
+                        _clear_chat_data_for_type(_t.get("type"))
+                    _count = pending_store.cancel_all(_chat_id_for_cancel)
+                    if _count:
+                        _list = "\n".join(f"  • {s}" for s in _summaries)
+                        feedback.append(f"OK — cancelled all {_count} pending:\n{_list}")
+                    else:
+                        feedback.append("Nothing pending to cancel.")
+                elif _task_id:
+                    _task = pending_store.get_by_id(_task_id)
+                    if _task and _task.get("chat_id") == _chat_id_for_cancel:
+                        _clear_chat_data_for_type(_task.get("type"))
+                        pending_store.complete(_task_id)
+                        feedback.append(f"OK — cancelled: {_task.get('summary', '')}")
+                    else:
+                        feedback.append("Couldn't find that pending task.")
+                elif _target == "latest":
+                    _tasks = pending_store.get_for_chat(_chat_id_for_cancel)
+                    if _tasks:
+                        _latest = _tasks[-1]
+                        _clear_chat_data_for_type(_latest.get("type"))
+                        pending_store.complete(_latest["id"])
+                        feedback.append(f"OK — cancelled: {_latest.get('summary', '')}")
+                    else:
+                        feedback.append("Nothing pending to cancel.")
+                continue
+
             if action_type == "update_stock":
                 item = act.get("item", "")
                 qty = act.get("qty", "1")
@@ -4011,7 +4227,13 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
             logger.error(f"Action execution error ({action_type}): {e}")
 
     if pending_items and ctx is not None and hasattr(ctx, "chat_data"):
-        ctx.chat_data["pending_disambiguation"] = {"msg_id": None, "reporter": name, "items": pending_items}
+        _disamb = {"msg_id": None, "reporter": name, "items": pending_items}
+        ctx.chat_data["pending_disambiguation"] = _disamb
+        _opts = "; ".join(e.get("original", "?") for e in pending_items)
+        _add_pending_task(
+            ctx, update.effective_chat.id, "disambiguation", _disamb,
+            f"Which item did you mean: {_opts}?",
+        )
 
     return feedback
 
@@ -4075,6 +4297,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Skip commands
     if text.startswith("/"):
         return
+
+    # ─── Rehydrate pending tasks after a restart ────
+    # If chat_data is empty (fresh process) but pending_store still has
+    # tasks for this chat from before the restart, repopulate chat_data
+    # so the existing flow handlers below keep working unmodified.
+    _rehydrate_pending_tasks(ctx, chat_id)
+
+    # ─── Reminder: let the user know about unfinished tasks ────
+    # Does NOT block the current message from being processed — the
+    # reminder is sent as its own message, then normal handling continues.
+    _reminder_text = pending_store.format_reminder_list(chat_id)
+    if _reminder_text:
+        try:
+            await update.message.reply_text(_reminder_text)
+        except Exception as e:
+            logger.error(f"Pending-tasks reminder send failed: {e}")
 
     # Store in memory — ALWAYS, even if bot won't reply
     remember(name, text, "text", chat_id=chat_id)
@@ -4375,8 +4613,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if pending_entry:
                         pending_entry["new_items"] = new_items
                         pending_entry["data"] = rd
+                        _sync_pending_receipt_task(pending_entry)
                     else:
                         ctx.chat_data["pending_new_items"] = new_items
+                        _add_pending_task(
+                            ctx, chat_id, "new_items", new_items,
+                            f"{len(new_items)} new items from receipt — classify each?",
+                        )
 
                     # If receipt was already confirmed, update the Google Sheet too
                     if _is_confirmed and rd.get("receipt_id"):
@@ -4538,15 +4781,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         receipts = _get_pending_receipts(ctx)
                         while len(receipts) >= 5:
                             oldest_key = next(iter(receipts))
-                            receipts.pop(oldest_key)
-                        receipts[sent_msg.message_id] = {
+                            old_entry = receipts.pop(oldest_key)
+                            _old_task_id = old_entry.get("_task_id") if isinstance(old_entry, dict) else None
+                            if _old_task_id:
+                                pending_store.complete(_old_task_id)
+                        _track_pending_receipt(ctx, chat_id, sent_msg.message_id, {
                             "data": receipt_data,
                             "image_bytes": image_bytes,
                             "user": name,
                             "caption": combined_caption,
                             "msg_ids": [processing_msg.message_id, sent_msg.message_id],
                             "new_items": new_items,
-                        }
+                        })
                     else:
                         await update.message.reply_text(
                             f"🧾 Couldn't read that receipt, {name}. Try a clearer photo."
@@ -4558,6 +4804,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if sales_data:
                         _s_total = float(sales_data.get('total_sales') or 0)
                         ctx.chat_data["pending_sales"] = {"data": sales_data, "user": name}
+                        _add_pending_task(
+                            ctx, chat_id, "sales",
+                            {"data": sales_data, "user": name},
+                            f"Sales RM{_s_total:.2f} on {sales_data.get('date', '?')} — confirm to save?",
+                        )
                         await update.message.reply_text(
                             f"📊 Sales report detected: RM{_s_total:.2f}. Reply 'yes' to confirm."
                         )
@@ -4655,8 +4906,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     lines.append(f"❓ \"{entry['original']}\" — which one?\n{ml}")
                 lines.append("Reply with the name or number.")
             sent = await update.message.reply_text("\n".join(lines))
+            _complete_pending_task(ctx, "disambiguation")
             if still_pending:
-                ctx.chat_data["pending_disambiguation"] = {"msg_id": sent.message_id, "reporter": reporter, "items": still_pending}
+                _disamb = {"msg_id": sent.message_id, "reporter": reporter, "items": still_pending}
+                ctx.chat_data["pending_disambiguation"] = _disamb
+                _opts = "; ".join(e.get("original", "?") for e in still_pending)
+                _add_pending_task(
+                    ctx, update.effective_chat.id, "disambiguation", _disamb,
+                    f"Which item did you mean: {_opts}?",
+                )
             else:
                 ctx.chat_data.pop("pending_disambiguation", None)
             if low_all:
@@ -4670,10 +4928,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _pbz = ctx.chat_data.get("pending_bulk_zeroes")
     if _pbz and _pbz.get("items"):
         import time as _t
-        age = _t.time() - _pbz.get("asked_at", 0)
-        if age > 600:  # 10 min expiry
-            ctx.chat_data.pop("pending_bulk_zeroes", None)
-        else:
+        if True:  # no expiry — persists until resolved or cancelled
             t_low = text.strip().lower()
             # Explicit zero/skip
             if t_low in ("zero", "0", "yes zero", "set zero", "set to zero", "all zero", "all 0"):
@@ -4693,10 +4948,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("\n".join(alert_lines))
                     await _auto_add_low_to_shopping(low_items, store, update.get_bot(), update.effective_chat.id)
                 ctx.chat_data.pop("pending_bulk_zeroes", None)
+                _complete_pending_task(ctx, "bulk_zeroes")
                 return
             if t_low in ("skip", "no", "leave", "leave them", "leave it", "ignore"):
                 await update.message.reply_text(f"Okay, leaving those {len(_pbz['items'])} items as-is.")
                 ctx.chat_data.pop("pending_bulk_zeroes", None)
+                _complete_pending_task(ctx, "bulk_zeroes")
                 return
             # If the reply looks like a mini bulk-count (has Name qty pattern),
             # parse it and set just those items. Others stay pending? — keep it
@@ -4729,8 +4986,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         )
                         _pbz["items"] = remaining
                         _pbz["msg_id"] = follow.message_id if follow else _pbz.get("msg_id")
+                        _tid = ctx.chat_data.get(_pending_task_id_key("bulk_zeroes"))
+                        if _tid:
+                            _task = pending_store.get_by_id(_tid)
+                            if _task:
+                                _task["data"] = _pbz
+                                _names_preview = ", ".join(remaining[:3])
+                                _more = "..." if len(remaining) > 3 else ""
+                                _task["summary"] = (
+                                    f"Bulk stock {_pbz.get('date', '?')} — {len(remaining)} blank items "
+                                    f"({_names_preview}{_more}) — zero or skip?"
+                                )
+                                pending_store._persist()
                     else:
                         ctx.chat_data.pop("pending_bulk_zeroes", None)
+                        _complete_pending_task(ctx, "bulk_zeroes")
                     return
             # Anything else: leave state, let normal flow handle it
 
@@ -4746,19 +5016,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ─── Pending clarification resolver ────
     # If bot recently asked "Which X — A, B, or C?" and user's reply is short,
     # match against saved options and rewrite user's message so the AI has
-    # zero ambiguity. Auto-expires after 10 minutes.
+    # zero ambiguity. No expiry — persists until resolved or cancelled.
     _pc = ctx.chat_data.get("pending_clarification")
     if _pc and _pc.get("options"):
-        import time as _t
-        age = _t.time() - _pc.get("asked_at", 0)
-        if age > 600:  # 10 min expiry
-            ctx.chat_data.pop("pending_clarification", None)
-        elif len(text.split()) <= 4:
+        if len(text.split()) <= 4:
             matched = _match_clarification_reply(text, _pc["options"])
             if matched:
                 logger.info(f"Clarification resolved: '{text}' → '{matched}'")
                 text = f"[User is answering your previous 'which one?' question. They picked: {matched}] {text}"
                 ctx.chat_data.pop("pending_clarification", None)
+                _complete_pending_task(ctx, "clarification")
             # 0 or 2+ matches → leave state, let AI re-ask
 
     # ─── Pre-emptive bulk stock parser ────
@@ -4790,13 +5057,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"or send specific counts (e.g. \"Salt 2, Glass Spray 1\")."
                 )
                 sent = await update.message.reply_text(prompt_text, parse_mode="Markdown")
-                ctx.chat_data["pending_bulk_zeroes"] = {
+                _pbz_new = {
                     "items": empty_names,
                     "msg_id": sent.message_id if sent else None,
                     "checked_by": checked_by or name,
                     "date": stock_date,
                     "asked_at": _t.time(),
                 }
+                ctx.chat_data["pending_bulk_zeroes"] = _pbz_new
+                _names_preview = ", ".join(empty_names[:3])
+                _more = "..." if len(empty_names) > 3 else ""
+                _add_pending_task(
+                    ctx, update.effective_chat.id, "bulk_zeroes", _pbz_new,
+                    f"Bulk stock {stock_date or '?'} — {len(empty_names)} blank items "
+                    f"({_names_preview}{_more}) — zero or skip?",
+                )
             return
 
     # ─── Pre-emptive stock ambiguity check ────
@@ -4808,11 +5083,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pre_lines, pre_pending = _preempt_stock_ambiguity(text)
         if pre_pending:
             sent = await update.message.reply_text("\n".join(pre_lines))
-            ctx.chat_data["pending_disambiguation"] = {
+            _disamb = {
                 "msg_id": sent.message_id,
                 "reporter": name,
                 "items": pre_pending,
             }
+            ctx.chat_data["pending_disambiguation"] = _disamb
+            _opts = "; ".join(e.get("original", "?") for e in pre_pending)
+            _add_pending_task(
+                ctx, update.effective_chat.id, "disambiguation", _disamb,
+                f"Which item did you mean: {_opts}?",
+            )
             return
 
     # ─── Pre-emptive new-item detection ────
@@ -4917,11 +5198,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _clarify_opts = _extract_clarification_options(chat_reply)
         if _clarify_opts and _sent_reply:
             import time as _t
-            ctx.chat_data["pending_clarification"] = {
+            _clar = {
                 "options": _clarify_opts,
                 "msg_id": _sent_reply.message_id,
                 "asked_at": _t.time(),
             }
+            ctx.chat_data["pending_clarification"] = _clar
+            _add_pending_task(
+                ctx, chat_id, "clarification", _clar,
+                f"Clarification needed: {chat_reply[:120]}",
+            )
             logger.info(f"Saved clarification options: {_clarify_opts}")
 
         # Execute any actions the AI triggered
@@ -5760,6 +6046,31 @@ async def scheduled_chaseup(ctx: ContextTypes.DEFAULT_TYPE):
             store.mark_action_chased(idx)
 
 
+async def scheduled_pending_nudge(ctx: ContextTypes.DEFAULT_TYPE):
+    """Daily nudge (12:00 MYT) for any pending task older than 24h that
+    hasn't been nudged in the last 24h. Groups candidates by chat and sends
+    one message per chat with the full reminder list, then marks each
+    nudged so it isn't re-sent for another day."""
+    candidates = pending_store.nudge_candidates(min_age_hours=24)
+    if not candidates:
+        return
+
+    by_chat = {}
+    for task in candidates:
+        by_chat.setdefault(task["chat_id"], []).append(task)
+
+    for chat_id, tasks in by_chat.items():
+        try:
+            listing = pending_store.format_reminder_list(chat_id)
+            if not listing:
+                continue
+            await ctx.bot.send_message(chat_id, listing)
+            for task in tasks:
+                pending_store.mark_nudged(task["id"])
+        except Exception as e:
+            logger.error(f"Pending-tasks nudge failed for chat {chat_id}: {e}")
+
+
 async def scheduled_event_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     """Remind about events happening today or tomorrow."""
     if not config.OWNER_GROUP_ID:
@@ -6086,6 +6397,14 @@ def main():
             time=dtime(9, 0, tzinfo=TZ),
             days=(0, 1, 2, 3, 4, 5, 6),
             name="school_holiday_reminder",
+        )
+
+        # Pending-tasks nudge — daily at 12:00 MYT for tasks >24h old
+        jq.run_daily(
+            scheduled_pending_nudge,
+            time=dtime(12, 0, tzinfo=TZ),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="pending_nudge",
         )
 
         logger.info("✅ Scheduled jobs registered")
