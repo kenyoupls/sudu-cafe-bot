@@ -56,10 +56,12 @@ pending_store = PendingTasksStore(store)
 
 # Maps our chat_data flow keys to the universal pending-task type name,
 # and the chat_data key that stores that flow's persistent task id.
+# NOTE: "new_item" tasks now live in the LIST at pending_new_items_active
+# (see _rehydrate_pending_tasks' special-case below) — this dict is still
+# used to route other flow types generically.
 _PENDING_CHAT_DATA_KEYS = {
     "sales": "pending_sales",
     "receipts": "pending_receipts",
-    "new_item": "pending_new_item",
     "new_items": "pending_new_items",
     "disambiguation": "pending_disambiguation",
     "bulk_zeroes": "pending_bulk_zeroes",
@@ -100,9 +102,24 @@ def _rehydrate_pending_tasks(ctx, chat_id: int):
     never persisted, so a rehydrated receipt can't be re-confirmed with a
     fresh image — but it still shows up in reminders/cancel and its other
     fields (data, new_items, msg_ids) are restored so replies keep working.
+
+    "new_item" is also multi-slot (pending_new_items_active is a LIST, one
+    entry per concurrent new-item flow) — rehydrate every persisted
+    new_item task into that list rather than a single chat_data key.
     """
+    active = ctx.chat_data.setdefault("pending_new_items_active", [])
+    _seen_task_ids = {pni.get("task_id") for pni in active}
     for task in pending_store.get_for_chat(chat_id):
         task_type = task.get("type")
+        if task_type == "new_item":
+            tid = task.get("id")
+            if tid in _seen_task_ids:
+                continue
+            entry = dict(task.get("data") or {})
+            entry["task_id"] = tid
+            active.append(entry)
+            _seen_task_ids.add(tid)
+            continue
         chat_data_key = _PENDING_CHAT_DATA_KEYS.get(task_type)
         if not chat_data_key:
             continue
@@ -118,6 +135,27 @@ def _rehydrate_pending_tasks(ctx, chat_id: int):
         if chat_data_key not in ctx.chat_data:
             ctx.chat_data[chat_data_key] = task.get("data")
             ctx.chat_data[_pending_task_id_key(task_type)] = task.get("id")
+    _migrate_pending_new_item(ctx)
+
+
+def _migrate_pending_new_item(ctx):
+    """One-time migration of the old singular ctx.chat_data["pending_new_item"]
+    slot (pre-multi-item-queue) into the new pending_new_items_active list.
+    Safe to call repeatedly — no-ops once migrated."""
+    old = ctx.chat_data.pop("pending_new_item", None)
+    if not old:
+        return
+    active = ctx.chat_data.setdefault("pending_new_items_active", [])
+    # Avoid duplicating if this same entry (by task_id, or by identity when
+    # no task_id was ever assigned) is already present.
+    old_tid = old.get("task_id") or ctx.chat_data.pop(_pending_task_id_key("new_item"), None)
+    if old_tid:
+        old["task_id"] = old_tid
+        if any(pni.get("task_id") == old_tid for pni in active):
+            return
+    elif old in active:
+        return
+    active.append(old)
 
 # ─── SOP data: Google Sheets is the only source of truth. Load into prompt. ───
 if store._sheets:
@@ -3166,8 +3204,38 @@ def _new_item_summary(pni: dict) -> str:
 
 async def _ask_new_item_regular_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                          item_name: str, qty):
-    """Send the Regular-stock confirmation prompt and save pending_new_item state."""
+    """Send the Regular-stock confirmation prompt and append a new pending
+    entry to pending_new_items_active (multiple concurrent flows supported —
+    see _match_pending_new_item for how replies get routed back)."""
     import time as _t
+
+    # If this exact item name is already pending (e.g. staff re-sent the
+    # same "<item> <qty>" while the first prompt was still unanswered),
+    # don't spawn a duplicate flow — just re-prompt with the new qty.
+    active = ctx.chat_data.setdefault("pending_new_items_active", [])
+    for existing in active:
+        if normalize_item_name(existing.get("item_name", "")) == normalize_item_name(item_name):
+            existing["qty"] = qty if qty is not None else existing.get("qty")
+            existing["timestamp"] = _t.time()
+            _touch_pending_new_item_task(existing)
+            qty_note = f" ({existing['qty']} units)" if existing.get("qty") is not None else ""
+            buttons = [
+                [
+                    InlineKeyboardButton("✅ Regular stock", callback_data="newitem:regular"),
+                    InlineKeyboardButton("❌ Not stock", callback_data="newitem:skip"),
+                ]
+            ]
+            sent = await update.message.reply_text(
+                f"🆕 *New item detected:* {item_name}{qty_note} (already pending)\n\n"
+                f"Is this a regular stock item?",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode="Markdown",
+            )
+            if sent is not None:
+                existing["prompt_msg_id"] = sent.message_id
+                _touch_pending_new_item_task(existing)
+            return
+
     pni = {
         "item_name": item_name,
         "qty": qty,
@@ -3175,9 +3243,9 @@ async def _ask_new_item_regular_confirm(update: Update, ctx: ContextTypes.DEFAUL
         "timestamp": _t.time(),
         "stage": "awaiting_regular_confirm",
     }
-    ctx.chat_data["pending_new_item"] = pni
     chat_id = update.effective_chat.id
-    _add_pending_task(ctx, chat_id, "new_item", pni, _new_item_summary(pni))
+    task_id = _add_pending_task(ctx, chat_id, "new_item", pni, _new_item_summary(pni))
+    pni["task_id"] = task_id
     qty_note = f" ({qty} units)" if qty is not None else ""
     buttons = [
         [
@@ -3185,39 +3253,195 @@ async def _ask_new_item_regular_confirm(update: Update, ctx: ContextTypes.DEFAUL
             InlineKeyboardButton("❌ Not stock", callback_data="newitem:skip"),
         ]
     ]
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         f"🆕 *New item detected:* {item_name}{qty_note}\n\n"
         f"Is this a regular stock item?",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown",
     )
+    if sent is not None:
+        pni["prompt_msg_id"] = sent.message_id
+        task = pending_store.get_by_id(task_id)
+        if task is not None:
+            task["data"] = pni
+            pending_store._persist()
+    _active = ctx.chat_data.setdefault("pending_new_items_active", [])
+    _active.append(pni)
+
+
+def _touch_pending_new_item_task(pni: dict):
+    """Keep the persisted pending-task summary/data in sync with the
+    current stage, so reminders/nudges show the right question."""
+    tid = pni.get("task_id")
+    if tid:
+        task = pending_store.get_by_id(tid)
+        if task:
+            task["summary"] = _new_item_summary(pni)
+            task["data"] = pni
+            pending_store._persist()
+
+
+def _remove_pending_new_item(ctx: ContextTypes.DEFAULT_TYPE, pni: dict):
+    """Remove one entry from pending_new_items_active and complete its
+    persisted task. Safe to call even if pni is already gone from the list."""
+    active = ctx.chat_data.get("pending_new_items_active", [])
+    if pni in active:
+        active.remove(pni)
+    tid = pni.get("task_id")
+    if tid:
+        pending_store.complete(tid)
+
+
+_WORD_SPLIT_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def _item_name_in_text(item_name: str, text: str) -> bool:
+    """Word-boundary, case-insensitive check for whether item_name (or a
+    meaningful chunk of it) appears in text."""
+    if not item_name:
+        return False
+    norm_text = text.lower()
+    full_pat = r"\b" + re.escape(item_name.lower()) + r"\b"
+    if re.search(full_pat, norm_text):
+        return True
+    # Also allow matching on individual significant words of a multi-word
+    # item name (e.g. "phoenix" alone matching "phoenix feather"), skipping
+    # very short/common filler words to avoid over-matching.
+    words = [w for w in _WORD_SPLIT_RE.split(item_name.lower()) if len(w) >= 3]
+    for w in words:
+        if re.search(r"\b" + re.escape(w) + r"\b", norm_text):
+            return True
+    return False
+
+
+def _strip_item_name_from_text(item_name: str, text: str) -> str:
+    """Remove the matched item name (full or partial) from text, returning
+    what's left (the actual answer, e.g. "no phoenix" -> "no")."""
+    norm_text = text
+    full_pat = re.compile(r"\b" + re.escape(item_name) + r"\b", re.IGNORECASE)
+    if full_pat.search(norm_text):
+        return full_pat.sub("", norm_text).strip()
+    words = [w for w in _WORD_SPLIT_RE.split(item_name) if len(w) >= 3]
+    for w in words:
+        pat = re.compile(r"\b" + re.escape(w) + r"\b", re.IGNORECASE)
+        if pat.search(norm_text):
+            return pat.sub("", norm_text).strip()
+    return norm_text.strip()
+
+
+async def _match_pending_new_item(text: str, name: str, update: Update,
+                                   ctx: ContextTypes.DEFAULT_TYPE):
+    """Identify which pending new-item entry a text reply belongs to.
+
+    Returns (matched_item_dict_or_None, remaining_reply_text_or_None).
+    If the reply is genuinely ambiguous between 2+ pending items, sends a
+    disambiguation prompt itself and returns (None, None) — caller should
+    treat that as "consumed" (return True) without further processing.
+    """
+    active = ctx.chat_data.get("pending_new_items_active", [])
+    if not active:
+        return None, None
+
+    t_stripped = text.strip()
+
+    # 1) Telegram reply-to-message match — exact, no ambiguity possible.
+    reply_to = update.message.reply_to_message if update.message else None
+    if reply_to is not None:
+        rid = reply_to.message_id
+        for pni in active:
+            if pni.get("prompt_msg_id") == rid:
+                return pni, t_stripped
+
+    # 2) Name-in-message match — check each pending item's name (or a
+    # significant word of it) against the reply text.
+    name_matches = [pni for pni in active if _item_name_in_text(pni.get("item_name", ""), t_stripped)]
+    if len(name_matches) == 1:
+        pni = name_matches[0]
+        remaining = _strip_item_name_from_text(pni.get("item_name", ""), t_stripped)
+        return pni, (remaining if remaining else t_stripped)
+
+    # 3) Number reference — "1", "1 yes", "2 no", etc. (1-indexed).
+    m = re.match(r"^\s*(\d+)\b(.*)$", t_stripped)
+    if m:
+        idx = int(m.group(1))
+        if 1 <= idx <= len(active):
+            pni = active[idx - 1]
+            remaining = m.group(2).strip()
+            return pni, (remaining if remaining else t_stripped)
+
+    # 4) Single-item case — no ambiguity possible.
+    if len(active) == 1:
+        return active[0], t_stripped
+
+    # 5) Otherwise ambiguous — ask which one, and remember the answer text
+    # so the next short reply resolves it.
+    names = [pni.get("item_name", "?") for pni in active]
+    prompt = "Which one — " + " or ".join(names) + "?"
+    sent = await update.message.reply_text(prompt)
+    import time as _t
+    ctx.chat_data["pending_new_item_disambiguation"] = {
+        "answer_text": t_stripped,
+        "msg_id": sent.message_id if sent else None,
+        "asked_at": _t.time(),
+    }
+    return None, None
 
 
 async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
                                           ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Handle a text reply against an in-flight pending_new_item state.
+    """Handle a text reply against in-flight pending_new_items_active state.
     Returns True if the message was consumed here (caller should stop),
     False if there's no relevant pending state (caller continues normally)."""
-    pni = ctx.chat_data.get("pending_new_item")
-    if not pni:
+    _migrate_pending_new_item(ctx)
+    active = ctx.chat_data.get("pending_new_items_active", [])
+    if not active:
         return False
 
     import time as _t
+    t_stripped = text.strip()
+
+    # If we're mid-disambiguation ("which one?"), a short follow-up reply
+    # resolves it — combine the saved answer text with whichever item name
+    # this new reply picks out.
+    disamb = ctx.chat_data.get("pending_new_item_disambiguation")
+    if disamb and len(t_stripped.split()) <= 6:
+        matched = None
+        for pni in active:
+            if _item_name_in_text(pni.get("item_name", ""), t_stripped):
+                matched = pni
+                break
+        if matched is None:
+            m = re.match(r"^\s*(\d+)\b", t_stripped)
+            if m:
+                idx = int(m.group(1))
+                if 1 <= idx <= len(active):
+                    matched = active[idx - 1]
+        if matched is not None:
+            ctx.chat_data.pop("pending_new_item_disambiguation", None)
+            pni = matched
+            t_stripped = disamb.get("answer_text", t_stripped)
+        else:
+            # Still can't tell — leave disambiguation state, let it fall
+            # through to normal matching below (don't consume silently).
+            pni = None
+    else:
+        pni = None
+
+    if pni is None:
+        pni, matched_text = await _match_pending_new_item(t_stripped, name, update, ctx)
+        if pni is None:
+            # _match_pending_new_item sends its own disambiguation prompt
+            # when the reply is ambiguous between 2+ pending items — that
+            # counts as consumed. Otherwise there was no match at all and
+            # the caller should fall through to normal handling (e.g. AI).
+            return ctx.chat_data.get("pending_new_item_disambiguation") is not None
+        t_stripped = matched_text
 
     def _touch_task_summary():
-        """Keep the persisted pending-task summary in sync with the
-        current stage, so reminders/nudges show the right question."""
-        _tid = ctx.chat_data.get(_pending_task_id_key("new_item"))
-        if _tid:
-            _task = pending_store.get_by_id(_tid)
-            if _task:
-                _task["summary"] = _new_item_summary(pni)
-                _task["data"] = pni
-                pending_store._persist()
+        _touch_pending_new_item_task(pni)
 
     stage = pni.get("stage", "")
     item = pni.get("item_name", "")
-    t_stripped = text.strip()
 
     def _touch():
         pni["timestamp"] = _t.time()
@@ -3225,8 +3449,7 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
 
     if stage == "awaiting_regular_confirm":
         if _PNI_NO_RE.search(t_stripped) and not _PNI_YES_RE.search(t_stripped):
-            ctx.chat_data.pop("pending_new_item", None)
-            _complete_pending_task(ctx, "new_item")
+            _remove_pending_new_item(ctx, pni)
             await update.message.reply_text(f"👍 OK — {item} not added to stock.")
             return True
         if _PNI_YES_RE.search(t_stripped):
@@ -3273,8 +3496,7 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
 
     elif stage == "awaiting_expense_confirm":
         if _PNI_NO_RE.search(t_stripped) and not _PNI_YES_RE.search(t_stripped):
-            ctx.chat_data.pop("pending_new_item", None)
-            _complete_pending_task(ctx, "new_item")
+            _remove_pending_new_item(ctx, pni)
             await update.message.reply_text(f"OK — {item} saved to stock, no expense logged.")
             return True
         if _PNI_YES_RE.search(t_stripped):
@@ -3345,8 +3567,7 @@ async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
                 logger.error(f"log_expense_detail error in new-item flow: {e}")
                 logged = False
 
-            ctx.chat_data.pop("pending_new_item", None)
-            _complete_pending_task(ctx, "new_item")
+            _remove_pending_new_item(ctx, pni)
             if logged:
                 await update.message.reply_text(
                     f"✅ Logged expense — {item}: {expense['qty_purchased']} units, "
@@ -5061,11 +5282,14 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ─── Pre-emptive new-item detection ────
     # If the message reads like "<item> <number>" for an item never seen
-    # before, hand off to the code-side pending_new_item state machine
-    # instead of letting the AI improvise a Regular/One-off question it
-    # can't actually act on. Skipped if replying to something, or if a
-    # new-item flow is already in progress (handled above).
-    if not update.message.reply_to_message and not ctx.chat_data.get("pending_new_item"):
+    # before, hand off to the code-side pending_new_items_active state
+    # machine instead of letting the AI improvise a Regular/One-off
+    # question it can't actually act on. Skipped only if replying to
+    # something — fires even when OTHER new-item flows are already
+    # pending, so each new item gets its own entry in the list (Bug A fix:
+    # a second "<item> <qty>" no longer gets hijacked by the AI just
+    # because a first one is still awaiting confirmation).
+    if not update.message.reply_to_message:
         _ni_item, _ni_qty = _preempt_new_item_detection(text)
         if _ni_item:
             await _ask_new_item_regular_confirm(update, ctx, _ni_item, _ni_qty)
