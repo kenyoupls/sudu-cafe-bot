@@ -4264,6 +4264,23 @@ _STATE_CHANGING_ACTIONS = {
 }
 
 
+def _maybe_send_pending_reminder(chat_id: int) -> str:
+    """Return the current pending-tasks reminder text, or "" if none.
+
+    Called at the very end of handle_message, after every pending-task
+    handler has had its chance to consume/resolve the user's message.
+    Any task the current message just answered/cancelled was already
+    removed from pending_store by that point, so if a task still shows
+    up here it genuinely wasn't addressed this turn — worth reminding
+    about. If the user's message resolved everything, this returns "".
+    """
+    try:
+        return pending_store.format_reminder_list(chat_id)
+    except Exception as e:
+        logger.error(f"Pending-tasks reminder build failed: {e}")
+        return ""
+
+
 def _honesty_guard(chat_reply: str, actions: list):
     """If chat_reply claims success but no state-changing action was
     emitted, strip that claim and append an honest correction."""
@@ -4282,6 +4299,29 @@ def _honesty_guard(chat_reply: str, actions: list):
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle all natural language messages — AI-driven, fully conversational.
+
+    Thin wrapper around _handle_message_inner: the real handler has many
+    early `return`s (one per pending-flow intercept), so the pending-tasks
+    reminder is sent HERE, once, after the inner handler fully finishes —
+    no matter which return path it took. That guarantees a message that
+    resolved a pending task (Bug B) never gets the reminder about the very
+    task it just answered, while a message that resolved nothing still
+    gets reminded about whatever's left.
+    """
+    chat_id = _get_chat_id(update) if update.message else None
+    await _handle_message_inner(update, ctx)
+    if chat_id is not None and update.message and update.message.text and not update.message.text.strip().startswith("/"):
+        if not await _group_gate(update):
+            _reminder_text = _maybe_send_pending_reminder(chat_id)
+            if _reminder_text:
+                try:
+                    await update.message.reply_text(_reminder_text)
+                except Exception as e:
+                    logger.error(f"Pending-tasks reminder send failed: {e}")
+
+
+async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle all natural language messages — AI-driven, fully conversational."""
     if not update.message or not update.message.text:
         return
@@ -4304,15 +4344,29 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # so the existing flow handlers below keep working unmodified.
     _rehydrate_pending_tasks(ctx, chat_id)
 
+    # ─── Bug D guard: bare short answer with no context to anchor it ────
+    # A bare "yes"/"no"/"ok"/"1" etc. only means something if it's
+    # answering a pending task or replying to a specific bot message.
+    # With neither, the AI has nothing to go on and tends to fabricate an
+    # interpretation (e.g. referencing an item from a task that was just
+    # cancelled). Short-circuit here instead of calling the AI at all.
+    if (
+        len(text) <= 5
+        and not update.message.reply_to_message
+        and not pending_store.get_for_chat(chat_id)
+    ):
+        await update.message.reply_text(
+            "I don't have anything pending — was that meant for something else?"
+        )
+        return
+
     # ─── Reminder: let the user know about unfinished tasks ────
-    # Does NOT block the current message from being processed — the
-    # reminder is sent as its own message, then normal handling continues.
-    _reminder_text = pending_store.format_reminder_list(chat_id)
-    if _reminder_text:
-        try:
-            await update.message.reply_text(_reminder_text)
-        except Exception as e:
-            logger.error(f"Pending-tasks reminder send failed: {e}")
+    # NOTE: the reminder is NOT sent here. If it fired before the pending
+    # handlers below got a chance to run, it would show up even when the
+    # current message IS the answer to that pending task (noise — see
+    # Bug B). Instead we send it at the very end of this function, and
+    # only if tasks are still outstanding after everything below has had
+    # its chance to consume/resolve them.
 
     # Store in memory — ALWAYS, even if bot won't reply
     remember(name, text, "text", chat_id=chat_id)
@@ -5192,8 +5246,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_reply = _honesty_guard(chat_reply, actions)
 
+    # ─── Bug C: suppress redundant AI chat_reply on cancel_pending ────
+    # _execute_actions() further below sends its own authoritative
+    # confirmation ("OK — cancelled: <task>") for every cancel_pending
+    # action. The AI's chat_reply for the same turn is typically a
+    # generic "Okay, cancelled" acknowledgement — sending both is double
+    # confirmation. The code-side message reflects what was actually
+    # cancelled, so it wins; suppress the AI's text for this turn without
+    # touching the `if chat_reply:` gate below (that gate still needs to
+    # run so `actions`, including this very cancel_pending, get executed).
+    _suppress_chat_reply_for_cancel = any(
+        isinstance(a, dict) and a.get("action") == "cancel_pending"
+        for a in (actions or [])
+    )
+
     if chat_reply:
-        _sent_reply = await update.message.reply_text(chat_reply)
+        if not _suppress_chat_reply_for_cancel:
+            _sent_reply = await update.message.reply_text(chat_reply)
+        else:
+            _sent_reply = None
         # ─── Save clarification state if this reply is a "which one?" question ───
         _clarify_opts = _extract_clarification_options(chat_reply)
         if _clarify_opts and _sent_reply:
@@ -5294,6 +5365,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Sorry {name}, I'm having trouble processing that. "
             f"Try again in a moment or use /help to see what I can do."
         )
+    # NOTE: the pending-tasks reminder is sent by the `handle_message`
+    # wrapper AFTER this function returns (whichever return path was
+    # taken) — see its docstring. Do not send it here too.
 
 
 # ═══════════════════════════════════════════════════════════

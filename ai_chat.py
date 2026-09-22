@@ -791,6 +791,10 @@ _SYSTEM_PROMPT_TEMPLATE = """🚨 STOCK NUMBERS: For "how many X" questions, the
 - NEVER invent or describe storage locations. Do NOT say things like "added to the Stock sheet", "in the one-off items section", "logged in expenses tab". You do NOT know the exact sheet layout — do not describe it.
 - If user asks "where did you save X" and you're not certain of the exact location, respond: "I've logged it — please check your Google Sheet directly to see where it landed."
 
+🚨 STALE CONTEXT:
+- If user's message is a very short answer ("yes", "no", "ok", "1", "2", etc.) AND there are NO current pending tasks in context AND you have no reply_context tying it to a specific recent bot question, DO NOT invent an interpretation. Respond: "I'm not sure what you're saying yes/no to — could you rephrase or ask again?"
+- Never reference items or details from tasks that are no longer pending (cancelled tasks are GONE — treat them as if they never existed).
+
 🚨 NEW ITEM FLOW:
 - When user mentions an item NOT in the current stock list (check the stock context provided), treat it as a new item.
 - Code side handles the confirmation flow via buttons and state. You just need to acknowledge naturally: "New item: [name]. Is this a regular stock item?" — and DO NOT emit any action yet.
@@ -1136,6 +1140,10 @@ _GROQ_BASE_PROMPT = f"""🚨 STOCK NUMBERS: For "how many X" questions, the ONLY
 - NEVER claim an action succeeded in your reply text unless you actually emit the corresponding action in the JSON actions array. Words like "added", "saved", "logged", "recorded", "done", "updated", "noted" require a matching action.
 - NEVER invent or describe storage locations. Do NOT say things like "added to the Stock sheet", "in the one-off items section", "logged in expenses tab". You do NOT know the exact sheet layout — do not describe it.
 - If user asks "where did you save X" and you're not certain of the exact location, respond: "I've logged it — please check your Google Sheet directly to see where it landed."
+
+🚨 STALE CONTEXT:
+- If user's message is a very short answer ("yes", "no", "ok", "1", "2", etc.) AND there are NO current pending tasks in context AND you have no reply_context tying it to a specific recent bot question, DO NOT invent an interpretation. Respond: "I'm not sure what you're saying yes/no to — could you rephrase or ask again?"
+- Never reference items or details from tasks that are no longer pending (cancelled tasks are GONE — treat them as if they never existed).
 
 🚨 NEW ITEM FLOW:
 - When user mentions an item NOT in the current stock list (check the stock context provided), treat it as a new item.
