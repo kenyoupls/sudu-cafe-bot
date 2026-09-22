@@ -314,8 +314,14 @@ class SheetsSync:
                     if norm not in row_lookup:  # first match wins
                         row_lookup[norm] = i
 
-            # Helper: find row by normalized name, with substring fallback
+            # Helper: find row by exact match first, then normalized, then substring
             def _find_row(item_name):
+                # Exact match wins (case-insensitive) so "(Cook)" vs "(Jelly)"
+                # don't collide when normalize_item_name strips both parens.
+                item_lower = item_name.strip().lower()
+                for i, row in enumerate(existing[1:], 1):
+                    if row and row[0].strip().lower() == item_lower:
+                        return i
                 norm = normalize_item_name(item_name)
                 if norm in row_lookup:
                     return row_lookup[norm]
@@ -1807,8 +1813,15 @@ class LocalJsonStore:
                             if norm not in row_lookup:
                                 row_lookup[norm] = i
 
-                    # Helper: find row by normalized name, with substring fallback
+                    # Helper: find row by exact match first, then normalized, then substring
                     def _find_row(item_name):
+                        # Exact match wins (case-insensitive) so "(Cook)" vs
+                        # "(Jelly)" don't collide when normalize_item_name strips
+                        # both parenthesised suffixes.
+                        item_lower = item_name.strip().lower()
+                        for i, row in enumerate(existing[1:], 1):
+                            if row and row[0].strip().lower() == item_lower:
+                                return i
                         norm = normalize_item_name(item_name)
                         if norm in row_lookup:
                             return row_lookup[norm]
