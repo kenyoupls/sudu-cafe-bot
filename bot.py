@@ -1784,10 +1784,8 @@ def _build_receipt_confirm_msg(receipt_data: dict, name: str, new_items=None, co
             choice = ni.get("choice", "")
             if choice == "regular":
                 confirm_msg += f"\n  ✅ {ni['name']}: Regular stock"
-            elif choice == "oneoff":
-                confirm_msg += f"\n  ✅ {ni['name']}: One-off"
             else:
-                confirm_msg += f"\n  • {ni['name']} — reply 'regular' or 'oneoff'"
+                confirm_msg += f"\n  • {ni['name']} — reply 'regular' or 'skip'"
     if corrections:
         confirm_msg += "\n\n🔄 *Auto-corrected from memory:*"
         for old_n, new_n in corrections:
@@ -1805,13 +1803,10 @@ def _receipt_confirm_buttons(new_items=None):
             choice = item.get("choice", "")
             if choice == "regular":
                 rows.append([InlineKeyboardButton(f"✅ {name}: Regular stock", callback_data=f"noop")])
-            elif choice == "oneoff":
-                rows.append([InlineKeyboardButton(f"✅ {name}: One-off", callback_data=f"noop")])
             else:
                 short = name[:20] if len(name) > 20 else name
                 rows.append([
-                    InlineKeyboardButton(f"🔄 {short}: Regular", callback_data=f"rcpnew:{i}:regular"),
-                    InlineKeyboardButton(f"🧪 {short}: One-off", callback_data=f"rcpnew:{i}:oneoff"),
+                    InlineKeyboardButton(f"✅ {short}: Regular stock", callback_data=f"rcpnew:{i}:regular"),
                 ])
     rows.append([
         InlineKeyboardButton("✅ Confirm & Save", callback_data="receipt:confirm"),
@@ -1825,7 +1820,7 @@ def _receipt_confirm_buttons(new_items=None):
 
 async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """After a receipt is confirmed, ask about items that look genuinely new
-    (never seen before this receipt) so the user can mark them Regular vs One-off."""
+    (never seen before this receipt) so the user can confirm they're regular stock."""
     try:
         from storage import get_alias_store
         alias_store = get_alias_store()
@@ -1855,15 +1850,14 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
                     if was_known:
                         break
 
-            # Also check aliases and one-off purchase history
+            # Also check aliases and (legacy) one-off purchase history — we no
+            # longer WRITE to oneoff_items, but existing entries still count
+            # as "known" so old data doesn't re-trigger the new-item prompt.
             if not was_known:
                 was_known = alias_store.resolve(r_name) != r_name  # known alias
 
             if not was_known and store.is_known_oneoff(r_name):
-                # It's a known one-off — record another purchase but don't ask again
                 was_known = True
-                store.record_oneoff_item(r_name)
-                store.remove_stock(r_name)  # one-off — don't keep tracking it in stock
 
             if not was_known:
                 new_items.append({"name": r_name, "qty": receipt_item.get("qty", 1)})
@@ -1872,15 +1866,28 @@ async def _detect_new_items(items: list, update: Update, ctx: ContextTypes.DEFAU
             ctx.chat_data["new_receipt_items"] = new_items
             ctx.chat_data["new_receipt_items_idx"] = 0
             item = new_items[0]["name"]
+            item_qty = new_items[0].get("qty")
+            try:
+                item_qty = int(item_qty)
+            except (ValueError, TypeError):
+                item_qty = None
+            import time as _t
+            ctx.chat_data["pending_new_item"] = {
+                "item_name": item,
+                "qty": item_qty,
+                "raw_message": "",
+                "timestamp": _t.time(),
+                "stage": "awaiting_regular_confirm",
+            }
             buttons = [
                 [
-                    InlineKeyboardButton("🔄 Regular (track stock)", callback_data="newitem:regular"),
-                    InlineKeyboardButton("🧪 One-off (don't track)", callback_data="newitem:oneoff"),
+                    InlineKeyboardButton("✅ Regular stock", callback_data="newitem:regular"),
+                    InlineKeyboardButton("❌ Not stock", callback_data="newitem:skip"),
                 ]
             ]
             await update.effective_message.reply_text(
                 f"🆕 *New item detected:* {item}\n\n"
-                f"Is this a regular stock item or a one-off purchase?",
+                f"Is this a regular stock item?",
                 reply_markup=InlineKeyboardMarkup(buttons),
                 parse_mode="Markdown",
             )
@@ -1933,11 +1940,11 @@ def _detect_new_items_list(items: list) -> list:
 
 
 async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle Regular/One-off selection for new receipt items."""
+    """Handle Regular-stock confirmation (or skip) for new receipt items."""
     query = update.callback_query
     await query.answer()
 
-    choice = query.data.split(":", 1)[1]  # "regular" or "oneoff"
+    choice = query.data.split(":", 1)[1]  # "regular" or "skip"
     items = ctx.chat_data.get("new_receipt_items", [])
     idx = ctx.chat_data.get("new_receipt_items_idx", 0)
 
@@ -1948,17 +1955,15 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     item_name = item["name"]
     item_qty = item.get("qty", 1)
 
-    if choice == "oneoff":
-        store.record_oneoff_item(item_name)
-        # No need to remove_stock since we never added it
+    if choice == "skip":
         await query.edit_message_text(
-            f"🧪 Got it — *{item_name}* marked as one-off (won't track in stock).",
+            f"❌ Got it — *{item_name}* not added to stock.",
             parse_mode="Markdown",
         )
     else:
         store.add_receipt_to_stock(item_name, item_qty)
         await query.edit_message_text(
-            f"🔄 Got it — *{item_name}* will be tracked as regular stock.",
+            f"✅ Got it — *{item_name}* will be tracked as regular stock.",
             parse_mode="Markdown",
         )
 
@@ -1968,22 +1973,37 @@ async def cb_newitem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if idx < len(items):
         next_item = items[idx]["name"]
+        next_qty = items[idx].get("qty")
+        try:
+            next_qty = int(next_qty)
+        except (ValueError, TypeError):
+            next_qty = None
+        import time as _t
+        ctx.chat_data["pending_new_item"] = {
+            "item_name": next_item,
+            "qty": next_qty,
+            "raw_message": "",
+            "timestamp": _t.time(),
+            "stage": "awaiting_regular_confirm",
+        }
         buttons = [
             [
-                InlineKeyboardButton("🔄 Regular (track stock)", callback_data="newitem:regular"),
-                InlineKeyboardButton("🧪 One-off (don't track)", callback_data="newitem:oneoff"),
+                InlineKeyboardButton("✅ Regular stock", callback_data="newitem:regular"),
+                InlineKeyboardButton("❌ Not stock", callback_data="newitem:skip"),
             ]
         ]
         await query.message.reply_text(
             f"🆕 *New item detected:* {next_item}\n\n"
-            f"Is this a regular stock item or a one-off purchase?",
+            f"Is this a regular stock item?",
             reply_markup=InlineKeyboardMarkup(buttons),
             parse_mode="Markdown",
         )
+    else:
+        ctx.chat_data.pop("pending_new_item", None)
 
 
 async def cb_rcpnew(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle Regular/One-off classification from receipt confirmation message."""
+    """Handle Regular-stock classification from receipt confirmation message."""
     query = update.callback_query
     await query.answer()
 
@@ -2967,6 +2987,271 @@ def _preempt_stock_ambiguity(text: str):
     return lines, pending_items
 
 
+# ─── Hybrid new-item flow ─────────────────────────────────────────────────
+# Code owns reliability: detecting a brand-new item name in plain chat,
+# tracking the confirm → qty → expense-logging state machine, and making
+# sure every "yes" actually results in a write. The AI's job is just to
+# hold the natural-language side of the conversation (see the NEW ITEM
+# FLOW rules in ai_chat.py) — it never touches storage for this flow.
+
+_PNI_YES_RE = re.compile(r"\b(yes|y|regular|stock|add|ok|okay|correct)\b", re.IGNORECASE)
+_PNI_NO_RE = re.compile(r"\b(no|n|skip|cancel|not|nvm|never ?mind)\b", re.IGNORECASE)
+
+
+def _is_item_known(item_name: str) -> bool:
+    """True if item_name already exists in current stock, recent stock
+    history, or as a known alias / legacy one-off entry."""
+    try:
+        from storage import get_alias_store
+        alias_store = get_alias_store()
+        norm = normalize_item_name(item_name)
+        for k in store.data.get("stock_current", {}):
+            if normalize_item_name(k) == norm:
+                return True
+        today_str = now_sg().strftime("%d/%m/%y")
+        for date_str, date_items in store.data.get("stock_history", {}).items():
+            if date_str == today_str:
+                continue
+            for hist_item in date_items:
+                if normalize_item_name(hist_item) == norm:
+                    return True
+        if alias_store.resolve(item_name) != item_name:
+            return True
+        if store.is_known_oneoff(item_name):
+            return True
+    except Exception as e:
+        logger.error(f"_is_item_known error: {e}")
+        return True  # fail safe — don't trigger the new-item flow on an error
+    return False
+
+
+def _preempt_new_item_detection(text: str):
+    """If the message reads like a single stock update for an item that has
+    never been seen before, return (item_name, qty) — qty may be None.
+    Returns (None, None) when it's not a clean new-item candidate (multiple
+    fragments, item already known, or ambiguous with an existing item)."""
+    intents = _extract_stock_update_intent(text)
+    if not intents or len(intents) != 1:
+        return None, None
+    candidate = intents[0]
+    item_name = candidate["item"]
+    if len(item_name) < 2:
+        return None, None
+    # Already known under this name or a close alias — not a new item.
+    if _is_item_known(item_name):
+        return None, None
+    # If it fuzzy-matches existing stock, let the normal ambiguity/AI path
+    # handle it instead of treating it as brand new.
+    if _find_ambiguous_stock_matches(item_name, store, text):
+        return None, None
+    try:
+        qty = int(float(candidate["qty"]))
+    except (ValueError, TypeError):
+        qty = None
+    return item_name, qty
+
+
+async def _ask_new_item_regular_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                         item_name: str, qty):
+    """Send the Regular-stock confirmation prompt and save pending_new_item state."""
+    import time as _t
+    ctx.chat_data["pending_new_item"] = {
+        "item_name": item_name,
+        "qty": qty,
+        "raw_message": update.message.text if update.message else "",
+        "timestamp": _t.time(),
+        "stage": "awaiting_regular_confirm",
+    }
+    qty_note = f" ({qty} units)" if qty is not None else ""
+    buttons = [
+        [
+            InlineKeyboardButton("✅ Regular stock", callback_data="newitem:regular"),
+            InlineKeyboardButton("❌ Not stock", callback_data="newitem:skip"),
+        ]
+    ]
+    await update.message.reply_text(
+        f"🆕 *New item detected:* {item_name}{qty_note}\n\n"
+        f"Is this a regular stock item?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="Markdown",
+    )
+
+
+async def _handle_pending_new_item_reply(text: str, name: str, update: Update,
+                                          ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle a text reply against an in-flight pending_new_item state.
+    Returns True if the message was consumed here (caller should stop),
+    False if there's no relevant pending state (caller continues normally)."""
+    pni = ctx.chat_data.get("pending_new_item")
+    if not pni:
+        return False
+
+    import time as _t
+    age = _t.time() - pni.get("timestamp", 0)
+    if age > 600:  # 10 min expiry
+        ctx.chat_data.pop("pending_new_item", None)
+        return False
+
+    stage = pni.get("stage", "")
+    item = pni.get("item_name", "")
+    t_stripped = text.strip()
+
+    def _touch():
+        pni["timestamp"] = _t.time()
+
+    if stage == "awaiting_regular_confirm":
+        if _PNI_NO_RE.search(t_stripped) and not _PNI_YES_RE.search(t_stripped):
+            ctx.chat_data.pop("pending_new_item", None)
+            await update.message.reply_text(f"👍 OK — {item} not added to stock.")
+            return True
+        if _PNI_YES_RE.search(t_stripped):
+            if pni.get("qty") is not None:
+                qty = pni["qty"]
+                sheet_ok = store.update_stock(item, str(qty), name)
+                canonical = store._find_existing_stock_name(item)
+                busy = " (⚠️ sheet busy, will auto-retry)" if not sheet_ok else ""
+                pni["stage"] = "awaiting_expense_confirm"
+                _touch()
+                await update.message.reply_text(
+                    f"📦 Added {canonical}: {qty} units to stock{busy}.\n\n"
+                    f"Was this bought? Add to expenses?"
+                )
+            else:
+                pni["stage"] = "awaiting_qty"
+                _touch()
+                await update.message.reply_text(f"How many {item}?")
+            return True
+        # Doesn't clearly match yes/no — let it fall through to the AI.
+        return False
+
+    elif stage == "awaiting_qty":
+        m = re.search(r"\d+(?:\.\d+)?", t_stripped)
+        if not m:
+            await update.message.reply_text("Please reply with just a number, e.g. \"5\".")
+            return True
+        try:
+            qty = int(float(m.group(0)))
+        except (ValueError, TypeError):
+            await update.message.reply_text("Please reply with just a number, e.g. \"5\".")
+            return True
+        pni["qty"] = qty
+        sheet_ok = store.update_stock(item, str(qty), name)
+        canonical = store._find_existing_stock_name(item)
+        busy = " (⚠️ sheet busy, will auto-retry)" if not sheet_ok else ""
+        pni["stage"] = "awaiting_expense_confirm"
+        _touch()
+        await update.message.reply_text(
+            f"📦 Added {canonical}: {qty} units to stock{busy}.\n\n"
+            f"Was this bought? Add to expenses?"
+        )
+        return True
+
+    elif stage == "awaiting_expense_confirm":
+        if _PNI_NO_RE.search(t_stripped) and not _PNI_YES_RE.search(t_stripped):
+            ctx.chat_data.pop("pending_new_item", None)
+            await update.message.reply_text(f"OK — {item} saved to stock, no expense logged.")
+            return True
+        if _PNI_YES_RE.search(t_stripped):
+            pni["stage"] = "awaiting_expense_fields"
+            pni["expense"] = {}
+            _touch()
+            await update.message.reply_text("Price paid (total, e.g. RM15)?")
+            return True
+        return False
+
+    elif stage == "awaiting_expense_fields":
+        expense = pni.setdefault("expense", {})
+        if "price_total" not in expense:
+            m = re.search(r"(\d+(?:\.\d+)?)", t_stripped.replace(",", ""))
+            if not m:
+                await update.message.reply_text("Please reply with just the total price, e.g. \"RM15\" or \"15\".")
+                return True
+            expense["price_total"] = float(m.group(1))
+            _touch()
+            await update.message.reply_text("How many units did you buy?")
+            return True
+        if "qty_purchased" not in expense:
+            m = re.search(r"\d+(?:\.\d+)?", t_stripped)
+            if not m:
+                await update.message.reply_text("Please reply with just a number, e.g. \"3\".")
+                return True
+            expense["qty_purchased"] = int(float(m.group(0)))
+            _touch()
+            await update.message.reply_text("Who was it bought from (supplier)?")
+            return True
+        if "supplier" not in expense:
+            if not t_stripped:
+                await update.message.reply_text("Please reply with the supplier name.")
+                return True
+            expense["supplier"] = t_stripped
+            _touch()
+            await update.message.reply_text(
+                f"Date of purchase? (or reply \"today\" for {now_sg().date().strftime('%Y-%m-%d')})"
+            )
+            return True
+        if "date" not in expense:
+            if t_stripped.lower() in ("today", "now", ""):
+                expense["date"] = now_sg().date().strftime("%Y-%m-%d")
+            else:
+                expense["date"] = _normalize_date_str(t_stripped) or now_sg().date().strftime("%Y-%m-%d")
+            _touch()
+            await update.message.reply_text("Paid by whom?")
+            return True
+        if "paid_by" not in expense:
+            expense["paid_by"] = t_stripped if t_stripped else name
+
+            # All 5 fields present — log the expense.
+            try:
+                from google_integration import log_expense_detail
+                logged = log_expense_detail(
+                    expense_date=expense["date"],
+                    supplier=expense["supplier"],
+                    item_name=item,
+                    qty=expense["qty_purchased"],
+                    unit_price=round(expense["price_total"] / expense["qty_purchased"], 4)
+                        if expense["qty_purchased"] else expense["price_total"],
+                    amount=expense["price_total"],
+                    category="ingredients",
+                    paid_by=expense["paid_by"],
+                    recorded_by=name,
+                )
+            except Exception as e:
+                logger.error(f"log_expense_detail error in new-item flow: {e}")
+                logged = False
+
+            ctx.chat_data.pop("pending_new_item", None)
+            if logged:
+                await update.message.reply_text(
+                    f"✅ Logged expense — {item}: {expense['qty_purchased']} units, "
+                    f"RM{expense['price_total']:.2f} total, from {expense['supplier']}, "
+                    f"{expense['date']}, paid by {expense['paid_by']}."
+                )
+            else:
+                await update.message.reply_text(
+                    "⚠️ Couldn't write the expense to the sheet (sheet busy or unavailable). "
+                    "Stock was still updated — please log the expense manually."
+                )
+            return True
+
+    return False
+
+
+def _normalize_date_str(text: str):
+    """Best-effort dd/mm/yyyy or similar → YYYY-MM-DD. Returns None if unparseable."""
+    m = re.search(r"\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})\b", text)
+    if not m:
+        return None
+    d, mo, y = m.groups()
+    try:
+        d, mo = int(d), int(mo)
+        y = int(y)
+        if y < 100:
+            y += 2000
+        return date(y, mo, d).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
 # ─── Pre-emptive bulk stock parser ───────────────────────────────────────
 # Detects and parses structured stock-count messages like the ones staff
 # send from a paper checklist ("Full Cream Milk: 120\nLow Fat Milk: 139\n...").
@@ -3731,6 +4016,49 @@ async def _execute_actions(actions: list, name: str, update: Update, ctx=None):
     return feedback
 
 
+# ─── AI honesty guard ──────────────────────────────────────────────────────
+# The AI sometimes claims an action succeeded ("added it to stock", "noted!")
+# without actually emitting a matching action, or invents a storage location
+# it doesn't know for sure. This is a last-line code-side check: if the reply
+# text claims success but no state-changing action was emitted, strip the
+# false claim and tell the user plainly instead of letting the hallucination
+# through.
+_HONESTY_SUCCESS_RE = re.compile(
+    r'\b(added|saved|logged|recorded|updated|done|noted|created|marked)\b',
+    re.IGNORECASE,
+)
+# Actions that actually change stored state (matches the action_type
+# strings _execute_actions branches on). Read-only / informational actions
+# (read_tab, the show_* actions, suggest_content, monthly_summary) don't
+# count as "doing" anything the user would call "added"/"saved"/etc.
+_STATE_CHANGING_ACTIONS = {
+    "update_stock", "bulk_stock", "correct_stock", "log_cleaning",
+    "add_shopping", "mark_bought", "add_event", "plan_content",
+    "done_content", "undo_receipt", "checklist_done", "save_instruction",
+    "learn_alias", "stock_count", "append_row", "update_row",
+    # Kept for forward-compat with actions the AI prompt describes but
+    # _execute_actions may not (yet) branch on by this exact name.
+    "record_receipt", "remove_stock", "log_expense_detail",
+}
+
+
+def _honesty_guard(chat_reply: str, actions: list):
+    """If chat_reply claims success but no state-changing action was
+    emitted, strip that claim and append an honest correction."""
+    if not chat_reply:
+        return chat_reply
+    if not _HONESTY_SUCCESS_RE.search(chat_reply):
+        return chat_reply
+    has_state_change = any(
+        isinstance(a, dict) and a.get("action") in _STATE_CHANGING_ACTIONS
+        for a in (actions or [])
+    )
+    if has_state_change:
+        return chat_reply
+    logger.warning(f"AI honesty guard triggered: reply claimed success without action. Reply: {chat_reply[:200]}")
+    return chat_reply + "\n⚠️ Actually — I didn't perform any action. Please rephrase or use the buttons."
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle all natural language messages — AI-driven, fully conversational."""
     if not update.message or not update.message.text:
@@ -3846,8 +4174,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _rcpt_text_lower = rcpt_text.lower().strip()
         _new_items = pending_entry.get("new_items", []) if pending_entry else []
         _unclassified = [ni for ni in _new_items if not ni.get("choice")]
-        if _unclassified and _rcpt_text_lower in ("regular", "oneoff", "one-off", "one off"):
-            _choice = "regular" if _rcpt_text_lower == "regular" else "oneoff"
+        if _unclassified and _rcpt_text_lower in ("regular", "stock", "yes", "add"):
+            _choice = "regular"
             _unclassified[0]["choice"] = _choice
             _item_name = _unclassified[0]["name"]
             if pending_entry:
@@ -4406,6 +4734,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     return
             # Anything else: leave state, let normal flow handle it
 
+    # ─── Pending new-item confirmation (text-reply intercept) ────
+    # Handles the hybrid new-item flow: the AI only acknowledges a new item
+    # in natural language, code owns the state machine so the reply always
+    # results in an actual write (or an explicit cancel) — never a
+    # fabricated "done" with nothing saved.
+    _pni_result = await _handle_pending_new_item_reply(text, name, update, ctx)
+    if _pni_result:
+        return
+
     # ─── Pending clarification resolver ────
     # If bot recently asked "Which X — A, B, or C?" and user's reply is short,
     # match against saved options and rewrite user's message so the AI has
@@ -4476,6 +4813,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "reporter": name,
                 "items": pre_pending,
             }
+            return
+
+    # ─── Pre-emptive new-item detection ────
+    # If the message reads like "<item> <number>" for an item never seen
+    # before, hand off to the code-side pending_new_item state machine
+    # instead of letting the AI improvise a Regular/One-off question it
+    # can't actually act on. Skipped if replying to something, or if a
+    # new-item flow is already in progress (handled above).
+    if not update.message.reply_to_message and not ctx.chat_data.get("pending_new_item"):
+        _ni_item, _ni_qty = _preempt_new_item_detection(text)
+        if _ni_item:
+            await _ask_new_item_regular_confirm(update, ctx, _ni_item, _ni_qty)
             return
 
     # ─── Extract reply context if replying to a message ────
@@ -4559,6 +4908,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # Give a direct answer instead of a promise
             chat_reply = "I don't have the data for that right now. Please check the Google Sheet directly or try asking in a different way."
             actions = []
+
+    chat_reply = _honesty_guard(chat_reply, actions)
 
     if chat_reply:
         _sent_reply = await update.message.reply_text(chat_reply)
@@ -5432,24 +5783,6 @@ async def scheduled_event_reminder(ctx: ContextTypes.DEFAULT_TYPE):
             )
 
 
-async def scheduled_oneoff_check(ctx: ContextTypes.DEFAULT_TYPE):
-    """Daily: check if any one-off items should be promoted to regular stock."""
-    if not config.OWNER_GROUP_ID:
-        return
-    frequent = store.get_frequent_oneoffs(threshold=3)
-    if not frequent:
-        return
-
-    lines = ["🔄 *One-off items bought frequently:*\n"]
-    for f in frequent:
-        lines.append(f"  • {f['item']} — bought {f['count']} times")
-    lines.append("\nConsider making these regular stock items!")
-
-    await ctx.bot.send_message(
-        config.OWNER_GROUP_ID, "\n".join(lines), parse_mode="Markdown",
-    )
-
-
 async def scheduled_holiday_refresh(ctx: ContextTypes.DEFAULT_TYPE):
     """Weekly: refresh holiday cache from Google Calendar + Calendarific."""
     try:
@@ -5730,14 +6063,6 @@ def main():
                 days=(0, 1, 2, 3, 4, 5, 6),
                 name=f"chaseup_{i}",
             )
-
-        # One-off items bought frequently — suggest promoting to regular stock
-        jq.run_daily(
-            scheduled_oneoff_check,
-            time=dtime(3, 30, tzinfo=TZ),
-            days=(0, 1, 2, 3, 4, 5, 6),
-            name="oneoff_check",
-        )
 
         # Holiday refresh — every Sunday at 3:00 AM MYT
         jq.run_daily(
