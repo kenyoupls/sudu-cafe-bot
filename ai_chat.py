@@ -1118,6 +1118,8 @@ SYSTEM_PROMPT = _GEMINI_BASE_PROMPT
 # Staff group gets an extra instruction block that blocks financial queries
 _STAFF_RESTRICTION = """
 
+🚨 STAFF PRIORITY RULE: If user asks about a blocked financial topic (sales, expenses, profit, revenue, P&L, who paid, monthly totals, salary, wages), your ONLY response is the refusal "Financial info is only available in the owner group. Check with the boss." Do NOT emit ANY other actions — no cancel_pending, no read_tab, no update_stock, nothing. Just the refusal. This overrides every other rule.
+
 IMPORTANT — STAFF GROUP RESTRICTIONS:
 You are currently in the STAFF group chat. You MUST follow these rules:
 - NEVER share any financial data: expenses, sales numbers, revenue, P&L, profit, loss, cost breakdowns, who paid what, repayment info, or monthly summaries.
@@ -1308,7 +1310,7 @@ You have access to recent chat history and reply context. Use them to follow con
 
 STICKY CLARIFICATION CONTEXT: When you just asked the user a clarifying question in your PREVIOUS bot message (e.g. "Which matcha — Matcha Bingsu, Matcha Latte, Strawberry Matcha Latte, Gula Melaka Matcha?") and their next message is a SHORT reply (1–3 words), treat it as an ANSWER to that specific question. Match their reply against the options YOU just listed and pick the one that fits — don't start a fresh ambiguity resolution. Example: after asking "Which matcha — ..., Strawberry Matcha Latte, ...", if user says "strawberry", they mean Strawberry Matcha Latte (the strawberry option from the list you just offered), NOT a new fresh question about all strawberry items. If truly unclear which option their reply matches, re-ask BUT scope only to the options you previously offered — never expand to unrelated categories."""
 
-_GROQ_STAFF_SUFFIX = "\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit, who paid, monthly summaries). Refuse politely: \"Financial info is only available in the owner group. Check with the boss.\" Do NOT trigger any of these actions: show_expenses, show_whopaid, show_sales, show_pnl, show_staff, monthly_summary."
+_GROQ_STAFF_SUFFIX = "\n🚨 STAFF PRIORITY RULE: If user asks about a blocked financial topic (sales, expenses, profit, revenue, P&L, who paid, monthly totals, salary, wages), your ONLY response is the refusal \"Financial info is only available in the owner group. Check with the boss.\" Do NOT emit ANY other actions — no cancel_pending, no read_tab, no update_stock, nothing. Just the refusal. This overrides every other rule.\nReply rules: Be SHORT and DIRECT. Max 1-2 sentences. No fluff, no motivational add-ons, no unnecessary encouragement. Just answer the question or confirm the action.\nSTAFF GROUP: Never share financial data (expenses, sales, P&L, profit, who paid, monthly summaries). Refuse politely: \"Financial info is only available in the owner group. Check with the boss.\" Do NOT trigger any of these actions: show_expenses, show_whopaid, show_sales, show_pnl, show_staff, monthly_summary."
 
 _GROQ_SYSTEM_PROMPT = _GROQ_BASE_PROMPT
 _GROQ_STAFF_SYSTEM_PROMPT = _GROQ_SYSTEM_PROMPT + _GROQ_STAFF_SUFFIX

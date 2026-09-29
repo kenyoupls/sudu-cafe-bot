@@ -234,6 +234,41 @@ def _is_staff_group(update: Update) -> bool:
     return update.effective_chat.id == config.STAFF_GROUP_ID
 
 
+_CANCEL_ACK_RE = re.compile(
+    r"\b(?:cancel(?:l?ed|ling)?|forget(?:ting)?|nvm|nevermind|ignor(?:e|ing|ed)|dismiss(?:ed|ing)?|drop(?:ped|ping)?|skip(?:ped|ping)?)\b",
+    re.IGNORECASE
+)
+
+
+def _should_suppress_chat_reply_for_cancel(chat_reply, actions) -> bool:
+    """True only if actions include cancel_pending AND chat_reply looks like a
+    short cancel acknowledgement (the code-side "OK — cancelled" replaces it)."""
+    return bool(
+        any(isinstance(a, dict) and a.get("action") == "cancel_pending" for a in (actions or []))
+        and chat_reply is not None
+        and len(chat_reply) <= 200
+        and _CANCEL_ACK_RE.search(chat_reply) is not None
+    )
+
+
+_STAFF_BLOCKED_KEYWORDS_RE = re.compile(
+    r"\b(?:sales?|expenses?|profits?|revenues?|costs?|earnings?|"
+    r"income|p&l|pnl|pl|salary|salaries|wages?|payroll|"
+    r"who paid|monthly summary|monthly total|monthly report|"
+    r"how much (?:did we|has|have|is|are).*(?:spent|earn|make|made|cost|paid)|"
+    r"finances?|financial)\b",
+    re.IGNORECASE
+)
+
+
+def _looks_like_staff_blocked_query(text: str) -> bool:
+    """Defense in depth: True if text mentions financial topics that staff
+    group must not see."""
+    if not text or len(text) < 3:
+        return False
+    return bool(_STAFF_BLOCKED_KEYWORDS_RE.search(text))
+
+
 def _get_chat_id(update: Update) -> int:
     """Get the chat ID for context isolation."""
     return update.effective_chat.id
@@ -2994,18 +3029,31 @@ _CLARIFY_PATTERNS = [
 ]
 
 
+_CLARIFY_GREETING_RE = re.compile(r"^\s*(?:hi|hello|hey)\b", re.IGNORECASE)
+_CLARIFY_VERB_RE = re.compile(
+    r"\b(?:can|do|does|will|help|should|would|how|what|want)\b", re.IGNORECASE
+)
+_CLARIFY_PRONOUN_RE = re.compile(r"\b(?:you|your|me|i)\b", re.IGNORECASE)
+
+
 def _extract_clarification_options(bot_reply: str) -> list:
     """From a bot reply like 'Which X — A, B, or C?', extract [A, B, C].
-    Returns [] if the reply doesn't look like a clarification question."""
+    Returns [] if the reply doesn't look like a genuine "pick one" question."""
     if not bot_reply or "?" not in bot_reply:
         return []
     # Only fire when the reply is short-ish (< 500 chars) — long paragraphs
     # aren't clarification questions.
     if len(bot_reply) > 500:
         return []
-    for pat in _CLARIFY_PATTERNS:
+    # Conversational greetings ("Hi Ken, how can I help?") are never clarifications.
+    if _CLARIFY_GREETING_RE.match(bot_reply):
+        return []
+    for idx, pat in enumerate(_CLARIFY_PATTERNS):
         m = pat.search(bot_reply)
         if not m:
+            continue
+        # Second (generic) pattern: real "pick one" questions contain "or".
+        if idx == 1 and not re.search(r"\bor\b", bot_reply, re.IGNORECASE):
             continue
         raw = m.group(1)
         # Split on ", " and " or ". Keep segments that look like real options.
@@ -3025,8 +3073,18 @@ def _extract_clarification_options(bot_reply: str) -> list:
             if 2 <= len(s) <= 80 and not s.lower().startswith(("do you", "please", "let me")):
                 opts.append(s)
         # Need 2+ options for it to be a real clarification
-        if len(opts) >= 2:
-            return opts
+        if len(opts) < 2:
+            continue
+        # Options must be short noun phrases, not clauses / sentence fragments.
+        if any(len(o) > 40 for o in opts):
+            continue
+        # Generic pattern only: options must start with a capital letter or
+        # digit (pattern 1 legitimately yields lowercase items like "full cream").
+        if idx == 1 and any(not (o[0].isupper() or o[0].isdigit()) for o in opts):
+            continue
+        if any(_CLARIFY_VERB_RE.search(o) or _CLARIFY_PRONOUN_RE.search(o) for o in opts):
+            continue
+        return opts
     return []
 
 
@@ -4513,6 +4571,13 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/"):
         return
 
+    # ─── Staff group: refuse financial questions in code, no AI round-trip ────
+    if _is_staff_group(update) and _looks_like_staff_blocked_query(text):
+        await update.message.reply_text(
+            "Financial info is only available in the owner group. Check with the boss.",
+        )
+        return
+
     # ─── Rehydrate pending tasks after a restart ────
     # If chat_data is empty (fresh process) but pending_store still has
     # tasks for this chat from before the restart, repopulate chat_data
@@ -5407,9 +5472,11 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # cancelled, so it wins; suppress the AI's text for this turn without
     # touching the `if chat_reply:` gate below (that gate still needs to
     # run so `actions`, including this very cancel_pending, get executed).
-    _suppress_chat_reply_for_cancel = any(
-        isinstance(a, dict) and a.get("action") == "cancel_pending"
-        for a in (actions or [])
+    # Bug F: only suppress when the AI's reply itself LOOKS like a cancel
+    # acknowledgement (short + cancel words). Substantive replies (refusals,
+    # answers, questions) are kept even if the AI also emitted cancel_pending.
+    _suppress_chat_reply_for_cancel = _should_suppress_chat_reply_for_cancel(
+        chat_reply, actions
     )
 
     if chat_reply:

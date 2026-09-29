@@ -11,8 +11,13 @@ Persists under the top-level ``pending_tasks`` key of the LocalJsonStore's
 ``self.data`` dict (i.e. ``data/cafe_data.json``).
 """
 
+import logging
+import re
 import uuid
 from datetime import datetime, timezone
+
+
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -59,6 +64,26 @@ class PendingTasksStore:
         self.store = store
         if "pending_tasks" not in self.store.data:
             self.store.data["pending_tasks"] = []
+        self._purge_stale_greetings()
+
+    def _purge_stale_greetings(self):
+        """One-time cleanup: remove clarification tasks that were false-positives
+        from the old _extract_clarification_options regex."""
+        _greeting_re = re.compile(
+            r'^Clarification needed:\s*(?:hi|hello|hey)\b', re.IGNORECASE
+        )
+        before = len(self.store.data.get("pending_tasks", []))
+        self.store.data["pending_tasks"] = [
+            t for t in self.store.data.get("pending_tasks", [])
+            if not (
+                t.get("type") == "clarification"
+                and _greeting_re.match(t.get("summary", ""))
+            )
+        ]
+        after = len(self.store.data.get("pending_tasks", []))
+        if before != after:
+            logger.info(f"Purged {before - after} stale greeting clarifications")
+            self._persist()
 
     # ─── internal helpers ──────────────────────────────────────
     @property
