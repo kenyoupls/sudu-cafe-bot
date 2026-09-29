@@ -237,16 +237,27 @@ with patch("time.time", clock):
     check("T5y: 'thanks, also oat please' does not end session",
           bot._get_active_override_session(ctx) is not None)
 
-    # ─── Test 6: END via AI final answer (silent) ───
+    # ─── Test 6: session STAYS OPEN on final answers (no "?" heuristic) ───
     ctx = make_ctx()
     tap(ctx, "Which milk type?")
     upd = make_msg_update("Full cream", reply_to_bot=True)
     bot.process_message = AsyncMock(return_value=("Full cream sales this month: RM1,200.", []))
     run(bot._handle_message_inner(upd, ctx))
-    check("T6a: final answer -> session closed", bot._get_active_override_session(ctx) is None
-          and "staff_override_session" not in ctx.chat_data)
-    check("T6b: silent close (only the AI reply sent)",
+    check("T6a: final answer -> session STAYS open", bot._get_active_override_session(ctx) is not None)
+    check("T6b: only the AI reply sent",
           sent_texts(upd) == ["Full cream sales this month: RM1,200."])
+    check("T6b2: last_bot_reply updated to the final answer",
+          ctx.chat_data["staff_override_session"].get("last_bot_reply") == "Full cream sales this month: RM1,200.")
+    # A follow-up after a final answer is still owner-mode with the topic injected
+    upd = make_msg_update("what about low fat", reply_to_bot=True)
+    bot.process_message = AsyncMock(return_value=("Low fat: RM80.", []))
+    run(bot._handle_message_inner(upd, ctx))
+    kw = bot.process_message.call_args.kwargs
+    rc = bot.process_message.call_args.args[2] if len(bot.process_message.call_args.args) > 2 else kw.get("reply_context")
+    check("T6b3: follow-up after final answer is owner-mode", kw.get("is_staff_group") is False)
+    check("T6b4: follow-up gets Original topic in reply_context", rc and f"Original topic: {QUERY}" in rc)
+    check("T6b5: follow-up gets bot's previous answer in reply_context",
+          rc and "Bot's previous answer: Full cream sales this month: RM1,200." in rc)
     # "let me check" promise keeps session open
     ctx = make_ctx()
     tap(ctx, "Which milk type?")
@@ -260,12 +271,15 @@ with patch("time.time", clock):
     ctx = make_ctx(); tap(ctx, "Which milk type?")
     check("T6d: helper: reply ending '?' -> stays open",
           bot._maybe_close_override_session(ctx, "Which size?", "big") is None)
-    check("T6e: helper: final reply -> 'final_answer'",
-          bot._maybe_close_override_session(ctx, "It is RM5.", "big") == "final_answer")
-    # Owner tap whose first answer is already final closes the session at once
+    check("T6e: helper: final reply -> stays open (no final_answer close)",
+          bot._maybe_close_override_session(ctx, "It is RM5.", "big") is None
+          and "staff_override_session" in ctx.chat_data)
+    check("T6e2: helper records last_bot_reply",
+          ctx.chat_data["staff_override_session"].get("last_bot_reply") == "It is RM5.")
+    # Owner tap whose first answer is already final keeps the session open
     ctx = make_ctx(); tap(ctx, "Sales: RM1000")
-    check("T6f: tap answered with final reply -> session closed immediately",
-          "staff_override_session" not in ctx.chat_data)
+    check("T6f: tap answered with final reply -> session stays open",
+          "staff_override_session" in ctx.chat_data)
 
     # ─── Test 7: END via idle timeout ───
     ctx = make_ctx()

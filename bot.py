@@ -4636,7 +4636,7 @@ def _maybe_close_override_session(ctx, chat_reply, user_text):
     """Close the staff-override session if a close condition holds.
 
     Call AFTER the AI reply is generated, BEFORE it is sent. Returns the close
-    reason ("explicit" | "expired" | "final_answer") or None if the session
+    reason ("explicit" | "expired") or None if the session
     stays open (or there was none). Logs INFO on close."""
     import time as _t_s
     sess = ctx.chat_data.get("staff_override_session")
@@ -4652,14 +4652,11 @@ def _maybe_close_override_session(ctx, chat_reply, user_text):
     elif now > sess.get("idle_expires_at", 0):
         reason = "expired"
     elif chat_reply:
-        stripped = chat_reply.strip()
-        is_promise = bool(_CHECK_PROMISE_RE.search(stripped)) and len(stripped) < 200
-        if not stripped.endswith("?") and not is_promise:
-            reason = "final_answer"
-        else:
-            # Still open: remember the bot's last message so a bare follow-up
-            # ("Full cream") keeps its context even though chat history is bypassed.
-            sess["last_bot_reply"] = stripped[:300]
+        # Session stays open on ANY reply (final answers included); it only
+        # closes on an explicit end phrase or idle/hard TTL expiry. Remember the
+        # bot's last message so a follow-up ("what about full cream") keeps its
+        # context even though chat history is bypassed.
+        sess["last_bot_reply"] = chat_reply.strip()[:300]
 
     if reason:
         sess["closed"] = True
@@ -4770,7 +4767,8 @@ async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             chat_reply = "I don't have the data for that right now. Please check the Google Sheet directly or try asking in a different way."
             actions = []
 
-    # A final answer (no follow-up question) closes the session right away.
+    # Session stays open after a final answer; this just records last_bot_reply
+    # (and closes only if the TTL already lapsed).
     _maybe_close_override_session(ctx, chat_reply, "")
 
     ov_update = _OverrideUpdate(query, original_text)
@@ -4846,7 +4844,7 @@ async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 _CHECK_PROMISE_RE.search(followup_reply) and len(followup_reply) < 200
             ):
                 followup_reply = "I couldn't retrieve the data. Please check the Google Sheet directly."
-            # The read_tab follow-up is the real answer; close on it if final.
+            # The read_tab follow-up is the real answer; remember it as last_bot_reply.
             _maybe_close_override_session(ctx, followup_reply, "")
             if followup_reply != chat_reply:
                 await query.message.reply_text(followup_reply)
@@ -5765,12 +5763,21 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # During an override session the chat is treated as owner-mode.
     is_staff = _is_staff_group(update) and not _override_active
     _bypass_hist = bool(_override_active)
-    if _override_active and not reply_context:
-        # History is bypassed, so give a bare follow-up ("Full cream") its anchor.
-        _ov_bits = [f"original question: {_override_active.get('original_query', '')}"]
-        if _override_active.get("last_bot_reply"):
-            _ov_bits.append(f"bot's last message: {_override_active['last_bot_reply']}")
-        reply_context = "Override session — " + " | ".join(_ov_bits)
+    if _override_active:
+        # History is bypassed, so ALWAYS anchor the follow-up ("what about full
+        # cream milk") to the session's original topic + the bot's last answer.
+        _orig = _override_active.get("original_query", "")
+        _last = _override_active.get("last_bot_reply", "")
+        _ctx_parts = []
+        if _orig:
+            _ctx_parts.append(f"Original topic: {_orig}")
+        if _last:
+            _ctx_parts.append(f"Bot's previous answer: {_last}")
+        if _ctx_parts:
+            if reply_context:
+                # Keep the explicit reply-to message the user quoted.
+                _ctx_parts.append(f"User is replying to: {reply_context}")
+            reply_context = " | ".join(_ctx_parts)
     chat_reply, actions = await process_message(
         text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
         _bypass_chat_history=_bypass_hist,
@@ -5805,7 +5812,7 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_reply = _honesty_guard(chat_reply, actions)
 
-    # Override session: close (silently) once the AI has given a final answer.
+    # Override session: close on explicit end phrase / TTL; otherwise refresh last_bot_reply.
     if _override_active:
         _maybe_close_override_session(ctx, chat_reply, text)
 
@@ -5940,7 +5947,7 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     extra_context=extra_ctx, _bypass_chat_history=_bypass_hist,
                 )
                 if _override_active:
-                    # The read_tab follow-up is the real answer; close on it if final.
+                    # The read_tab follow-up is the real answer; remember it as last_bot_reply.
                     _maybe_close_override_session(ctx, followup_reply, text)
                 if followup_reply and followup_reply != chat_reply:
                     await update.message.reply_text(followup_reply)
