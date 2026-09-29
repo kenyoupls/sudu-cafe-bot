@@ -4597,6 +4597,77 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 _STAFF_OVERRIDE_TTL = 300  # seconds an owner may tap "Show anyway"
 
 
+# "I'll check"-style promise (no real answer yet). Shared by the stall-guard in
+# _handle_message_inner and the override-session auto-close logic.
+_CHECK_PROMISE_RE = re.compile(
+    r"(?:let me (?:check|pull|verify|look|confirm)|i'?ll (?:check|pull|verify|look|grab|get|confirm)|check the (?:live|stock|sheet)|pull the (?:exact|latest|current))",
+    re.IGNORECASE,
+)
+
+
+def _get_active_override_session(ctx):
+    """Return the chat's staff-override session dict if it is still active
+    (present, not closed, inside both the hard and idle TTLs), else None.
+    A dead session (closed / expired) is dropped from chat_data."""
+    import time as _t_s
+    sess = ctx.chat_data.get("staff_override_session")
+    if not sess:
+        return None
+    now = _t_s.time()
+    if (
+        sess.get("closed")
+        or now > sess.get("hard_expires_at", 0)
+        or now > sess.get("idle_expires_at", 0)
+    ):
+        ctx.chat_data.pop("staff_override_session", None)
+        return None
+    return sess
+
+
+def _override_end_phrase(user_text: str) -> bool:
+    """True if user_text is (only) an explicit "close the session" phrase.
+    @mentions, case and surrounding punctuation are ignored."""
+    t = re.sub(r"@\w+", " ", user_text or "").lower()
+    t = re.sub(r"\s+", " ", t).strip(" \t.,!?;:-\u2014")
+    return bool(t) and t in config.STAFF_OVERRIDE_END_PHRASES
+
+
+def _maybe_close_override_session(ctx, chat_reply, user_text):
+    """Close the staff-override session if a close condition holds.
+
+    Call AFTER the AI reply is generated, BEFORE it is sent. Returns the close
+    reason ("explicit" | "expired" | "final_answer") or None if the session
+    stays open (or there was none). Logs INFO on close."""
+    import time as _t_s
+    sess = ctx.chat_data.get("staff_override_session")
+    if not sess or sess.get("closed"):
+        return None
+
+    reason = None
+    now = _t_s.time()
+    if _override_end_phrase(user_text):
+        reason = "explicit"
+    elif now > sess.get("hard_expires_at", 0):
+        reason = "expired"
+    elif now > sess.get("idle_expires_at", 0):
+        reason = "expired"
+    elif chat_reply:
+        stripped = chat_reply.strip()
+        is_promise = bool(_CHECK_PROMISE_RE.search(stripped)) and len(stripped) < 200
+        if not stripped.endswith("?") and not is_promise:
+            reason = "final_answer"
+        else:
+            # Still open: remember the bot's last message so a bare follow-up
+            # ("Full cream") keeps its context even though chat history is bypassed.
+            sess["last_bot_reply"] = stripped[:300]
+
+    if reason:
+        sess["closed"] = True
+        ctx.chat_data.pop("staff_override_session", None)
+        logger.info(f"Staff override session closed: {reason}")
+    return reason
+
+
 class _OverrideMessage:
     """Wraps the callback's message so _execute_actions (which expects
     update.message.text / .reply_text) works with the ORIGINAL query text."""
@@ -4666,10 +4737,23 @@ async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
     store.refresh_if_stale(cooldown=0)
+    # Open (or replace a stale) override session: follow-up messages in this
+    # chat are handled in owner-mode until the topic resolves / TTL expires.
+    _now_ov = _t_ov.time()
+    ctx.chat_data["staff_override_session"] = {
+        "owner_user_id": query.from_user.id,
+        "started_at": _now_ov,
+        "hard_expires_at": _now_ov + config.STAFF_OVERRIDE_SESSION_HARD_TTL,
+        "idle_expires_at": _now_ov + config.STAFF_OVERRIDE_SESSION_IDLE_TTL,
+        "original_query": original_text,
+        "closed": False,
+    }
     chat_reply, actions = await process_message(
         original_text, asker_name, None, chat_id=chat_id,
         is_staff_group=False, _bypass_chat_history=True,
     )
+    # A final answer (no follow-up question) closes the session right away.
+    _maybe_close_override_session(ctx, chat_reply, "")
 
     ov_update = _OverrideUpdate(query, original_text)
     if chat_reply:
@@ -4707,7 +4791,25 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # untagged staff chatter ("sales was low") must not make the bot butt in.
     # (_bot_is_tagged covers both the @mention and reply-to-bot cases.)
     _bot_addressed = _bot_is_tagged(update, ctx)
-    if _bot_addressed and _is_staff_group(update) and _looks_like_staff_blocked_query(text):
+
+    # ─── Staff override session: owner tapped "Show anyway" earlier ────
+    # While it is open, every message in this chat is handled in owner-mode
+    # (no staff block, no staff prompt, no chat-history poisoning).
+    _override_active = _get_active_override_session(ctx)
+    if _override_active:
+        import time as _t_idle
+        # Refresh idle timer on user activity
+        ctx.chat_data["staff_override_session"]["idle_expires_at"] = (
+            _t_idle.time() + config.STAFF_OVERRIDE_SESSION_IDLE_TTL
+        )
+        # Explicit "done"/"thanks"/... ends the session without another AI call.
+        # Only when the bot is addressed — untagged staff chatter ("thanks!")
+        # must not make the bot butt in.
+        if _bot_addressed and _maybe_close_override_session(ctx, "", text) == "explicit":
+            await update.message.reply_text("OK — override session closed.")
+            return
+
+    if not _override_active and _bot_addressed and _is_staff_group(update) and _looks_like_staff_blocked_query(text):
         import time as _t_ov
         query_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
         ctx.chat_data["pending_staff_override"] = {
@@ -4741,6 +4843,7 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # cancelled). Short-circuit here instead of calling the AI at all.
     if (
         len(text) <= 5
+        and not _override_active  # short follow-ups ("Oat") are answers in a session
         and not update.message.reply_to_message
         and not pending_store.get_for_chat(chat_id)
     ):
@@ -5576,17 +5679,23 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     store.refresh_if_stale(cooldown=0)
 
     # ─── Send to AI — get reply + actions ──────────────────
-    is_staff = _is_staff_group(update)
+    # During an override session the chat is treated as owner-mode.
+    is_staff = _is_staff_group(update) and not _override_active
+    _bypass_hist = bool(_override_active)
+    if _override_active and not reply_context:
+        # History is bypassed, so give a bare follow-up ("Full cream") its anchor.
+        _ov_bits = [f"original question: {_override_active.get('original_query', '')}"]
+        if _override_active.get("last_bot_reply"):
+            _ov_bits.append(f"bot's last message: {_override_active['last_bot_reply']}")
+        reply_context = "Override session — " + " | ".join(_ov_bits)
     chat_reply, actions = await process_message(
         text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
+        _bypass_chat_history=_bypass_hist,
     )
 
     # If AI reply is just a promise to check (no real answer), force refresh and re-ask
     import re as _re_bot
-    _CHECK_PHRASES = _re_bot.compile(
-        r"(?:let me (?:check|pull|verify|look|confirm)|i'?ll (?:check|pull|verify|look|grab|get|confirm)|check the (?:live|stock|sheet)|pull the (?:exact|latest|current))",
-        _re_bot.IGNORECASE,
-    )
+    _CHECK_PHRASES = _CHECK_PROMISE_RE
     # Only fire the stall-guard when the AI is NOT actually going to fetch.
     # If read_tab was emitted, "let me check" is the correct flow (the
     # read_tab safety net below re-invokes with the results).
@@ -5599,6 +5708,7 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.info(f"stock_current after refresh has {len(sc)} items")
         chat_reply2, actions2 = await process_message(
             text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
+            _bypass_chat_history=_bypass_hist,
         )
         logger.info(f"Re-ask reply: '{(chat_reply2 or '')[:100]}'")
         if chat_reply2 and not _CHECK_PHRASES.search(chat_reply2):
@@ -5611,6 +5721,10 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             actions = []
 
     chat_reply = _honesty_guard(chat_reply, actions)
+
+    # Override session: close (silently) once the AI has given a final answer.
+    if _override_active:
+        _maybe_close_override_session(ctx, chat_reply, text)
 
     # ─── Bug C: suppress redundant AI chat_reply on cancel_pending ────
     # _execute_actions() further below sends its own authoritative
@@ -5634,7 +5748,7 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # group (regex missed it), attach the owner-override button anyway.
             # (Code-side refusals return early above, so no double-attach.)
             _override_button_markup = None
-            if (_is_staff_group(update) and _bot_addressed
+            if (not _override_active and _is_staff_group(update) and _bot_addressed
                     and _REFUSAL_ECHO_RE.search(chat_reply)):
                 import time as _t_ov2
                 _qhash = hashlib.sha256(text.encode()).hexdigest()[:16]
@@ -5740,8 +5854,11 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     extra_ctx = "\n".join(lines)
                 followup_reply, _ = await process_message(
                     text, name, reply_context, chat_id=chat_id, is_staff_group=is_staff,
-                    extra_context=extra_ctx,
+                    extra_context=extra_ctx, _bypass_chat_history=_bypass_hist,
                 )
+                if _override_active:
+                    # The read_tab follow-up is the real answer; close on it if final.
+                    _maybe_close_override_session(ctx, followup_reply, text)
                 if followup_reply and followup_reply != chat_reply:
                     await update.message.reply_text(followup_reply)
     else:

@@ -29,6 +29,16 @@ for _uid in _raw.split(","):
     if _uid.isdigit():
         OWNER_USER_IDS.add(int(_uid))
 
+# Staff override "session" — after the owner taps "Show anyway", the chat stays
+# in owner-mode (no staff restrictions, no chat-history poisoning) until the
+# topic resolves or one of these TTLs runs out.
+STAFF_OVERRIDE_SESSION_HARD_TTL = int(os.getenv("STAFF_OVERRIDE_SESSION_HARD_TTL", "300"))  # absolute cap (s)
+STAFF_OVERRIDE_SESSION_IDLE_TTL = int(os.getenv("STAFF_OVERRIDE_SESSION_IDLE_TTL", "180"))  # bumped per message (s)
+STAFF_OVERRIDE_END_PHRASES = {
+    "done", "thanks", "thank you", "close", "no more", "ok done",
+    "that's all", "nothing else", "dismiss", "end",
+}
+
 # Commands blocked in staff group — anything financial, admin, or settings
 STAFF_BLOCKED_COMMANDS = {
     "staff", "addstaff", "removestaff",
