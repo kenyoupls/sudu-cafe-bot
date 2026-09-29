@@ -69,7 +69,10 @@ def make_cb_update(user_id, data, name="Boss"):
 
 
 def make_ctx():
-    return SimpleNamespace(chat_data={}, bot=MagicMock())
+    b = MagicMock()
+    b.id = 777
+    b.username = "testbot"
+    return SimpleNamespace(chat_data={}, bot=b)
 
 
 QUERY = "whats the sales for this month so far"
@@ -80,6 +83,8 @@ bot.process_message = AsyncMock(return_value=("Sales: RM1000", []))
 
 # ─── Test 1 & 2: refusal + button, pending saved ───
 upd = make_msg_update(QUERY)
+# Staff-block only fires when the bot is addressed: reply to a bot message.
+upd.message.reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=777))
 ctx = make_ctx()
 run(bot._handle_message_inner(upd, ctx))
 upd.message.reply_text.assert_called_once()

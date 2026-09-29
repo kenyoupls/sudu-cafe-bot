@@ -67,6 +67,12 @@ import re as _re_stale
 _STALE_BOT_REPORT_RE = _re_stale.compile(
     r"^(?:📦|✏️|🧹|🛒|🍰|📋|⚠️\s*LOW STOCK)"
 )
+# Staff-group financial refusals. If these stay in history the AI parrots them
+# back even when it should answer (e.g. after an owner override).
+_STAFF_REFUSAL_RE = _re_stale.compile(
+    r"Financial info is only available in the owner group",
+    _re_stale.IGNORECASE,
+)
 
 # ─── Timezone-aware now ────────────────────────────────────
 _TZ = ZoneInfo(config.TIMEZONE)
@@ -679,12 +685,13 @@ def _auto_summarise_week(week_label: str, daily_summaries: list) -> str:
     return " | ".join(parts)
 
 
-def get_memory_context(chat_id: int = 0) -> str:
+def get_memory_context(chat_id: int = 0, _bypass_chat_history: bool = False) -> str:
     """
     Build memory context for the AI:
     - Days within VERBATIM_DAYS (default 30) → verbatim messages (capped by RECENT_MESSAGES_FULL)
     - Days between VERBATIM_DAYS and WEEKLY_ROLLUP_DAYS (default 30-90) → one-line daily summaries
     - Days older than WEEKLY_ROLLUP_DAYS (default 90+) → grouped into weekly rollups
+    _bypass_chat_history=True omits the verbatim RECENT GROUP CHAT block.
     """
     _init_memory(chat_id)
     import re as _re_mem
@@ -723,6 +730,8 @@ def get_memory_context(chat_id: int = 0) -> str:
                     txt = (msg.get("text") or "").lstrip()
                     if _STALE_BOT_REPORT_RE.match(txt):
                         continue
+                    if _STAFF_REFUSAL_RE.search(txt):
+                        continue
                 if msg.get("important", True) or msg.get("type") in ("bot_response", "voice", "photo"):
                     recent_messages.append(msg)
         else:
@@ -759,7 +768,7 @@ def get_memory_context(chat_id: int = 0) -> str:
 
     # ── Verbatim (last 30 days, capped) ──
     recent_messages = recent_messages[-config.RECENT_MESSAGES_FULL:]
-    if recent_messages:
+    if not _bypass_chat_history and recent_messages:
         output.append(f"--- RECENT GROUP CHAT (last {verbatim_days} days, newest last) ---")
         for msg in recent_messages:
             time_str = msg.get("time", "")
@@ -1583,10 +1592,11 @@ def _build_context(is_staff_group: bool = False) -> str:
 
 def _full_context(user_name: str, user_message: str, reply_context: str = None,
                    chat_id: int = 0, is_staff_group: bool = False,
-                   extra_context: str = None) -> str:
+                   extra_context: str = None,
+                   _bypass_chat_history: bool = False) -> str:
     """Combine café data + memory + new message into one context block."""
     cafe_data = _build_context(is_staff_group=is_staff_group)
-    memory = get_memory_context(chat_id=chat_id)
+    memory = get_memory_context(chat_id=chat_id, _bypass_chat_history=_bypass_chat_history)
     now = _now().strftime("%A, %d %B %Y, %I:%M %p")
 
     parts = [
@@ -1612,9 +1622,14 @@ def _full_context(user_name: str, user_message: str, reply_context: str = None,
     return "\n\n".join(parts)
 
 
+class _SkipHistory(Exception):
+    """Internal control flow: skip the Groq chat-history block."""
+
+
 def _groq_context(user_name: str, user_message: str, reply_context: str = None,
                    chat_id: int = 0, is_staff_group: bool = False,
-                   extra_context: str = None) -> str:
+                   extra_context: str = None,
+                   _bypass_chat_history: bool = False) -> str:
     """Trimmed context for Groq — no memory/history, shorter café data."""
     store = get_store()
     store.refresh_if_stale(cooldown=60)
@@ -1694,13 +1709,18 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
         parts.append(pending_ctx)
 
     # Recent chat history (last 15 messages — enough to follow conversation threads)
+    # Skipped entirely when _bypass_chat_history (e.g. owner override).
     try:
+        if _bypass_chat_history:
+            raise _SkipHistory()
         _init_memory(chat_id)
         all_days = _get_all_recent_days(chat_id)
         recent_msgs = []
         for day_str in reversed(all_days):
             msgs = _load_day(day_str, chat_id)
             for msg in reversed(msgs):
+                if msg.get("type") == "bot_response" and _STAFF_REFUSAL_RE.search(msg.get("text") or ""):
+                    continue  # don't let the AI parrot old refusals
                 if msg.get("important", True) or msg.get("type") in ("bot_response", "voice", "photo"):
                     recent_msgs.append(msg)
                     if len(recent_msgs) >= 15:
@@ -1718,6 +1738,8 @@ def _groq_context(user_name: str, user_message: str, reply_context: str = None,
                 else:
                     chat_lines.append(f"{who}: {text}")
             parts.append("RECENT CHAT:\n" + "\n".join(chat_lines))
+    except _SkipHistory:
+        pass
     except Exception as e:
         logger.debug(f"Groq recent chat failed: {e}")
 
@@ -1816,7 +1838,8 @@ def _parse_actions(raw_text: str) -> tuple:
 
 async def process_message(user_message: str, user_name: str, reply_context: str = None,
                           chat_id: int = 0, is_staff_group: bool = False,
-                          extra_context: str = None) -> tuple:
+                          extra_context: str = None,
+                          _bypass_chat_history: bool = False) -> tuple:
     """
     Process a chat message through Gemini.
     Returns (chat_reply: str, actions: list[dict]).
@@ -1825,6 +1848,9 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     extra_context: optional block appended before the user message — used to
     feed back read_tab results on a follow-up call so the AI can answer
     from fresh sheet data.
+
+    _bypass_chat_history: skip the recent-group-chat block (used by the staff
+    override so old refusals can't poison the answer).
     """
     # Use staff-restricted prompt when in staff group
     groq_sys = _GROQ_STAFF_SYSTEM_PROMPT if is_staff_group else _GROQ_SYSTEM_PROMPT
@@ -1833,7 +1859,8 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     try:
         prompt = _groq_context(user_name, user_message, reply_context,
                                chat_id=chat_id, is_staff_group=is_staff_group,
-                               extra_context=extra_context)
+                               extra_context=extra_context,
+                               _bypass_chat_history=_bypass_chat_history)
         raw = await _groq_text(prompt, system=groq_sys, temperature=0.7, max_tokens=2000)
         if raw:
             chat_reply, actions, parse_failed = _parse_actions(raw)
@@ -1857,7 +1884,8 @@ async def process_message(user_message: str, user_name: str, reply_context: str 
     try:
         prompt = _full_context(user_name, user_message, reply_context,
                                chat_id=chat_id, is_staff_group=is_staff_group,
-                               extra_context=extra_context)
+                               extra_context=extra_context,
+                               _bypass_chat_history=_bypass_chat_history)
 
         response = client.models.generate_content(
             model="gemini-3.5-flash-lite",

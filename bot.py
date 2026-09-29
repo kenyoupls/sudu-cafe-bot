@@ -4647,7 +4647,8 @@ async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     store.refresh_if_stale(cooldown=0)
     chat_reply, actions = await process_message(
-        original_text, asker_name, None, chat_id=chat_id, is_staff_group=False,
+        original_text, asker_name, None, chat_id=chat_id,
+        is_staff_group=False, _bypass_chat_history=True,
     )
 
     ov_update = _OverrideUpdate(query, original_text)
@@ -4682,7 +4683,11 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ─── Staff group: refuse financial questions in code, no AI round-trip ────
-    if _is_staff_group(update) and _looks_like_staff_blocked_query(text):
+    # Only when the bot is addressed (@tagged or replying to a bot message) —
+    # untagged staff chatter ("sales was low") must not make the bot butt in.
+    # (_bot_is_tagged covers both the @mention and reply-to-bot cases.)
+    _bot_addressed = _bot_is_tagged(update, ctx)
+    if _bot_addressed and _is_staff_group(update) and _looks_like_staff_blocked_query(text):
         import time as _t_ov
         query_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
         ctx.chat_data["pending_staff_override"] = {
