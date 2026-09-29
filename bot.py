@@ -393,6 +393,25 @@ async def chatid_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def whoami_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reply with the caller's user ID and chat info. Deliberately NOT gated
+    by _group_gate so it works in any group (used to discover the owner's
+    user ID)."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if user is None or chat is None or update.effective_message is None:
+        return
+    username = f"@{user.username}" if user.username else "none"
+    chat_title = chat.title if chat.title else "private"
+    await update.effective_message.reply_text(
+        f"User ID: {user.id}\n"
+        f"Username: {username}\n"
+        f"Full name: {user.full_name}\n"
+        f"Chat ID: {chat.id}\n"
+        f"Chat title: {chat_title}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════
 #  /start & /help
 # ═══════════════════════════════════════════════════════════
@@ -6454,6 +6473,8 @@ def main():
     app.add_handler(CommandHandler("help", g(cmd_help)))
     # /chatid intentionally NOT wrapped in g(): must work in unknown groups
     app.add_handler(CommandHandler("chatid", chatid_command))
+    # /whoami also bypasses g(): works in any group
+    app.add_handler(CommandHandler("whoami", whoami_command))
 
     # Cleaning (allowed everywhere)
     app.add_handler(CommandHandler("clean", g(cmd_clean)))
