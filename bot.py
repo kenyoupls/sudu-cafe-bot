@@ -340,6 +340,25 @@ def owner_only(cmd_name: str):
 
 
 # ═══════════════════════════════════════════════════════════
+#  /chatid (bypasses group gate on purpose)
+# ═══════════════════════════════════════════════════════════
+
+async def chatid_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reply with the current chat's ID. Deliberately NOT gated by
+    _group_gate so it works in unknown groups (needed to find the ID
+    to add to ALLOWED_GROUP_IDS / STAFF_GROUP_ID)."""
+    chat = update.effective_chat
+    if chat is None or update.effective_message is None:
+        return
+    title = chat.title or chat.full_name or "(none)"
+    await update.effective_message.reply_text(
+        f"Chat ID: {chat.id}\n"
+        f"Chat type: {chat.type}\n"
+        f"Chat title: {title}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════
 #  /start & /help
 # ═══════════════════════════════════════════════════════════
 
@@ -6366,6 +6385,8 @@ def main():
 
     app.add_handler(CommandHandler("start", g(cmd_start)))
     app.add_handler(CommandHandler("help", g(cmd_help)))
+    # /chatid intentionally NOT wrapped in g(): must work in unknown groups
+    app.add_handler(CommandHandler("chatid", chatid_command))
 
     # Cleaning (allowed everywhere)
     app.add_handler(CommandHandler("clean", g(cmd_clean)))
