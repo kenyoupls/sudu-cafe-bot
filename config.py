@@ -20,6 +20,15 @@ OWNER_GROUP_ID = int(os.getenv("OWNER_GROUP_ID", "0")) or GROUP_CHAT_ID
 STAFF_GROUP_ID = int(os.getenv("STAFF_GROUP_ID", "0"))
 ALLOWED_GROUP_IDS = [gid for gid in [OWNER_GROUP_ID, STAFF_GROUP_ID] if gid]
 
+# Owner Telegram user IDs — get full override privileges in any group.
+# Comma-separated. E.g. OWNER_USER_IDS=834454829,other_id
+OWNER_USER_IDS = set()
+_raw = os.getenv("OWNER_USER_IDS", "")
+for _uid in _raw.split(","):
+    _uid = _uid.strip()
+    if _uid.isdigit():
+        OWNER_USER_IDS.add(int(_uid))
+
 # Commands blocked in staff group — anything financial, admin, or settings
 STAFF_BLOCKED_COMMANDS = {
     "staff", "addstaff", "removestaff",

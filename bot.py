@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 import functools
+import hashlib
 
 import config
 from storage import get_store, normalize_item_name, clean_item_name
@@ -4573,6 +4574,96 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _handle_message_inner(update, ctx)
 
 
+_STAFF_OVERRIDE_TTL = 300  # seconds an owner may tap "Show anyway"
+
+
+class _OverrideMessage:
+    """Wraps the callback's message so _execute_actions (which expects
+    update.message.text / .reply_text) works with the ORIGINAL query text."""
+
+    def __init__(self, real_msg, text):
+        self._real = real_msg
+        self.text = text
+        self.reply_to_message = None
+
+    def __getattr__(self, item):
+        return getattr(self._real, item)
+
+
+class _OverrideUpdate:
+    """Minimal Update stand-in for executing actions from a callback."""
+
+    def __init__(self, cq, text):
+        self.message = _OverrideMessage(cq.message, text)
+        self.effective_message = self.message
+        self.effective_chat = cq.message.chat
+        self.effective_user = cq.from_user
+        self.callback_query = cq
+
+
+async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner taps 'Show anyway' on a staff-group financial refusal.
+
+    Non-owners: silent no-op. Owners: re-process the saved query as an
+    owner-group call (is_staff_group=False) and post the answer."""
+    import time as _t_ov
+    query = update.callback_query
+    if query.from_user.id not in config.OWNER_USER_IDS:
+        await query.answer()  # dismiss spinner, nothing else
+        return
+
+    data = query.data or ""
+    query_hash = data.split(":", 1)[1] if ":" in data else ""
+    pending = ctx.chat_data.get("pending_staff_override")
+    if (
+        not pending
+        or pending.get("hash") != query_hash
+        or _t_ov.time() > pending.get("expires_at", 0)
+    ):
+        await query.answer("This override has expired — ask the question again.", show_alert=True)
+        return
+
+    # Single use: consume before doing any work so double-taps can't repeat it.
+    ctx.chat_data.pop("pending_staff_override", None)
+    await query.answer()
+
+    owner_name = query.from_user.full_name or query.from_user.username or str(query.from_user.id)
+    original_text = pending["query"]
+    asker_name = pending.get("name") or owner_name
+    chat_id = query.message.chat.id
+
+    # Remove the button and annotate the refusal message.
+    try:
+        await query.edit_message_text(
+            f"{query.message.text or ''}\n\n✅ Overridden by {owner_name}",
+            reply_markup=None,
+        )
+    except Exception as e:
+        logger.warning(f"staff override: could not edit refusal message: {e}")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    store.refresh_if_stale(cooldown=0)
+    chat_reply, actions = await process_message(
+        original_text, asker_name, None, chat_id=chat_id, is_staff_group=False,
+    )
+
+    ov_update = _OverrideUpdate(query, original_text)
+    if chat_reply:
+        await query.message.reply_text(chat_reply)
+    else:
+        await query.message.reply_text(
+            f"Sorry {owner_name}, I'm having trouble processing that. Try again in a moment."
+        )
+        return
+    if actions:  # owner call: no staff block list applied
+        feedback = await _execute_actions(actions, asker_name, ov_update, ctx)
+        if feedback:
+            await query.message.reply_text("\n".join(feedback))
+
+
 async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle all natural language messages — AI-driven, fully conversational."""
     if not update.message or not update.message.text:
@@ -4592,8 +4683,22 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ─── Staff group: refuse financial questions in code, no AI round-trip ────
     if _is_staff_group(update) and _looks_like_staff_blocked_query(text):
+        import time as _t_ov
+        query_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        ctx.chat_data["pending_staff_override"] = {
+            "query": text,
+            "hash": query_hash,
+            "name": name,
+            "expires_at": _t_ov.time() + _STAFF_OVERRIDE_TTL,
+        }
         await update.message.reply_text(
             "Financial info is only available in the owner group. Check with the boss.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🔓 Show anyway (owner only)",
+                    callback_data=f"staff_override:{query_hash}",
+                )
+            ]]),
         )
         return
 
@@ -6565,6 +6670,7 @@ def main():
     # New receipt item — regular vs one-off callback
     app.add_handler(CallbackQueryHandler(g(cb_newitem), pattern=r"^newitem:"))
     app.add_handler(CallbackQueryHandler(g(cb_rcpnew), pattern=r"^rcpnew:"))
+    app.add_handler(CallbackQueryHandler(g(cb_staff_override), pattern=r"^staff_override:"))
     app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern=r"^noop$"))
 
     # Voice note handler
