@@ -4786,6 +4786,71 @@ async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if feedback:
             await query.message.reply_text("\n".join(feedback))
 
+        # Safety net (mirrors _handle_message_inner): if AI triggered read_tab
+        # without a write action, feed the freshly-read tab data back to the
+        # AI so it answers from real sheet content instead of going silent
+        # after "Let me check...".
+        read_tab_actions = [a for a in actions if a.get("action") == "read_tab"]
+        write_actions = [a for a in actions if a.get("action") in ("append_row", "update_row")]
+        if read_tab_actions and not write_actions:
+            store.refresh_if_stale(cooldown=0)
+            extra_ctx = None
+            stashed = ctx.chat_data.pop("_read_tab_results", {}) if hasattr(ctx, "chat_data") else {}
+            if stashed:
+                # Filter rows by keywords in the owner's question so we don't
+                # dump 200 rows on the model and drown out the match.
+                kws = [w for w in re.findall(r"[A-Za-z]{3,}", original_text.lower())
+                       if w not in {"the", "and", "for", "how", "what", "with",
+                                    "make", "please", "recipe", "which", "one",
+                                    "you", "your", "our", "give", "want", "need",
+                                    "just", "some", "any", "this", "that",
+                                    "there", "here"}]
+                kws = list(dict.fromkeys(kws))[:8]  # dedupe, cap at 8
+                lines = ["── read_tab RESULTS (fresh from Google Sheet) ──"]
+                for tab_name, tab_data in stashed.items():
+                    headers = tab_data.get("headers", [])
+                    rows_all = tab_data.get("rows", [])
+                    filtered = []
+                    if kws:
+                        for row in rows_all:
+                            if isinstance(row, dict):
+                                blob = " ".join(str(v) for v in row.values()).lower()
+                            elif isinstance(row, (list, tuple)):
+                                blob = " ".join(str(c) for c in row).lower()
+                            else:
+                                blob = str(row).lower()
+                            if any(k in blob for k in kws):
+                                filtered.append(row)
+                    # If filtering was too aggressive (nothing left), show all
+                    rows = filtered if filtered else rows_all
+                    lines.append(f"\n### Tab: {tab_name} (showing {len(rows)} of {len(rows_all)} rows)")
+                    if headers:
+                        lines.append("Columns: " + " | ".join(headers))
+                    for row in rows:
+                        if isinstance(row, dict):
+                            lines.append("• " + ", ".join(f"{k}: {v}" for k, v in row.items() if v))
+                        elif isinstance(row, list):
+                            lines.append("• " + " | ".join(str(c) for c in row))
+                lines.append("\nUse this data to answer the user's original question exactly. Only use rows that match what they asked for.")
+                extra_ctx = "\n".join(lines)
+            try:
+                followup_reply, _ = await process_message(
+                    original_text, asker_name, None, chat_id=chat_id,
+                    is_staff_group=False, extra_context=extra_ctx,
+                    _bypass_chat_history=True,
+                )
+            except Exception as e:
+                logger.warning(f"Override: read_tab follow-up failed: {e}")
+                followup_reply = None
+            if not followup_reply or (
+                _CHECK_PROMISE_RE.search(followup_reply) and len(followup_reply) < 200
+            ):
+                followup_reply = "I couldn't retrieve the data. Please check the Google Sheet directly."
+            # The read_tab follow-up is the real answer; close on it if final.
+            _maybe_close_override_session(ctx, followup_reply, "")
+            if followup_reply != chat_reply:
+                await query.message.reply_text(followup_reply)
+
 
 async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle all natural language messages — AI-driven, fully conversational."""
