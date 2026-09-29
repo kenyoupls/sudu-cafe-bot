@@ -253,12 +253,32 @@ def _should_suppress_chat_reply_for_cancel(chat_reply, actions) -> bool:
 
 
 _STAFF_BLOCKED_KEYWORDS_RE = re.compile(
-    r"\b(?:sales?|expenses?|profits?|revenues?|costs?|earnings?|"
-    r"income|p&l|pnl|pl|salary|salaries|wages?|payroll|"
-    r"who paid|monthly summary|monthly total|monthly report|"
-    r"how much (?:did we|has|have|is|are).*(?:spent|earn|make|made|cost|paid)|"
-    r"finances?|financial)\b",
+    r"\b(?:"
+    # Financial nouns (any form)
+    r"sales?|expenses?|profits?|revenues?|incomes?|earnings?|budgets?|"
+    r"costs?|costed|costing|p&l|pnl|pl|"
+    r"salary|salaries|wages?|payroll|finances?|financial|"
+    # Verb forms: spend/spent/spending, earn/earned/earning
+    r"spen[dt]|spending|earn(?:s|ed)?|"
+    # Explicit phrases
+    r"who (?:paid|pays)|monthly (?:summary|total|report)|"
+    r"total (?:spent|spend|spending|expenses?|sales|income|revenue|cost)|"
+    r"money we|how much money|"
+    # "how much for X"
+    r"how much for|"
+    # "how much (did|do|does|has|have|is|are|...) ... <money verb>" — all tenses
+    r"how much\s+(?:money\s+)?(?:did|do|does|has|have|had|is|are|was|were|will|would|can|could)\b"
+    r".{0,60}?\b(?:mak(?:e|es|ing)|made|pa(?:y|ys|id|ying)|charg\w*|bill\w*)"
+    r")\b",
     re.IGNORECASE
+)
+
+# Safety net: AI's own staff-group refusal wording. If the AI refuses a
+# financial question the code-side regex missed, we still attach the
+# owner-override button to that reply.
+_REFUSAL_ECHO_RE = re.compile(
+    r"Financial info is only available in the owner group|only share.*in the owner group|check with the boss",
+    re.IGNORECASE,
 )
 
 
@@ -5610,7 +5630,29 @@ async def _handle_message_inner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if chat_reply:
         if not _suppress_chat_reply_for_cancel:
-            _sent_reply = await update.message.reply_text(chat_reply)
+            # Safety net: if the AI refused a financial question in the staff
+            # group (regex missed it), attach the owner-override button anyway.
+            # (Code-side refusals return early above, so no double-attach.)
+            _override_button_markup = None
+            if (_is_staff_group(update) and _bot_addressed
+                    and _REFUSAL_ECHO_RE.search(chat_reply)):
+                import time as _t_ov2
+                _qhash = hashlib.sha256(text.encode()).hexdigest()[:16]
+                ctx.chat_data["pending_staff_override"] = {
+                    "query": text,
+                    "hash": _qhash,
+                    "name": name,
+                    "expires_at": _t_ov2.time() + _STAFF_OVERRIDE_TTL,
+                }
+                _override_button_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🔓 Show anyway (owner only)",
+                        callback_data=f"staff_override:{_qhash}",
+                    )
+                ]])
+            _sent_reply = await update.message.reply_text(
+                chat_reply, reply_markup=_override_button_markup
+            )
         else:
             _sent_reply = None
         # ─── Save clarification state if this reply is a "which one?" question ───
