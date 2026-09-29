@@ -4752,6 +4752,24 @@ async def cb_staff_override(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         original_text, asker_name, None, chat_id=chat_id,
         is_staff_group=False, _bypass_chat_history=True,
     )
+
+    # Stall guard: if AI just promised to "check" without emitting read_tab,
+    # refresh data and re-ask once. If it stalls again, give up cleanly.
+    _read_tab_emitted = any(a.get("action") == "read_tab" for a in (actions or []))
+    if chat_reply and _CHECK_PROMISE_RE.search(chat_reply) and len(chat_reply) < 200 and not _read_tab_emitted:
+        logger.info(f"Override: AI stalled — refreshing and re-asking: '{chat_reply[:100]}'")
+        store.refresh_if_stale(cooldown=0)
+        chat_reply2, actions2 = await process_message(
+            original_text, asker_name, None, chat_id=chat_id,
+            is_staff_group=False, _bypass_chat_history=True,
+        )
+        if chat_reply2 and not _CHECK_PROMISE_RE.search(chat_reply2):
+            chat_reply = chat_reply2
+            actions = actions2
+        else:
+            chat_reply = "I don't have the data for that right now. Please check the Google Sheet directly or try asking in a different way."
+            actions = []
+
     # A final answer (no follow-up question) closes the session right away.
     _maybe_close_override_session(ctx, chat_reply, "")
 
