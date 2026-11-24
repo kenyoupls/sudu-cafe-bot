@@ -48,12 +48,26 @@ def test_strangers_are_ignored():
     assert bot.chat_allowed(upd(OWNER, OWNER, "private"))
 
 
+def test_memory_is_per_chat_and_trimmed():
+    staff, owners = SimpleNamespace(chat_data={}), SimpleNamespace(chat_data={})
+    bot.remember(owners, "Ken", "sales were RM2400 yesterday")
+    bot.remember(staff, "Ali", "milk is finished")
+    assert "RM2400" not in bot.memory_text(staff) and "milk" in bot.memory_text(staff)
+    for i in range(100):
+        bot.remember(staff, "Ali", f"msg {i}")
+    assert len(staff.chat_data["memory"]) == bot.MEMORY_MAX
+    old = {"t": bot.storage.now().timestamp() - 5 * 86400, "who": "x", "text": "old"}
+    staff.chat_data["memory"].insert(0, old)
+    bot.remember(staff, "Ali", "new")
+    assert old not in staff.chat_data["memory"]
+
+
 def test_staff_context_never_contains_money(monkeypatch):
     """The AI only ever receives money data when money is allowed."""
     import asyncio
     sent = {}
 
-    async def fake_answer(q, context, allowed):
+    async def fake_answer(q, context, allowed, history=""):
         sent.update(context=context, allowed=allowed)
         return "ok"
 

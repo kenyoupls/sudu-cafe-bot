@@ -216,8 +216,8 @@ async def parse_stock(text: str, known_items: list[str]) -> list[dict]:
     return out
 
 
-async def answer(question: str, context: str, money_allowed: bool) -> str:
-    """Answer a question using only the Sheet data we pass in."""
+async def answer(question: str, context: str, money_allowed: bool, history: str = "") -> str:
+    """Answer a question using only the Sheet data we pass in, plus this chat's recent messages."""
     rules = ("You may discuss sales, spending and money." if money_allowed else
              "You must NOT reveal or estimate any money figures (sales, spending, costs, profit). "
              "If asked, say politely that money questions are for the owners.")
@@ -228,7 +228,11 @@ async def answer(question: str, context: str, money_allowed: bool) -> str:
         "If the data doesn't contain the answer, say so in one line. "
         f"Amounts are in RM. Today is {storage.today()}. {rules}\n"
         "Reply in the same language as the question (English, Malay or Chinese).\n\n"
-        f"=== DATA ===\n{context}\n\n=== QUESTION ===\n{question}"
+        "Use the recent conversation to understand follow-ups (e.g. 'what about Friday?', 'and him?'), "
+        "but trust the DATA over anything said in chat.\n\n"
+        f"=== DATA ===\n{context}\n\n"
+        f"=== RECENT CONVERSATION IN THIS CHAT (oldest first) ===\n{history or '(none)'}\n\n"
+        f"=== QUESTION ===\n{question}"
     )
     data, _ = await _ask_json(prompt, {"answer": "str"}, groq_shape='{"answer": "..."}')
     return str(data.get("answer", "")).strip() or "Sorry, I couldn't work that out."

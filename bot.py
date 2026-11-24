@@ -599,17 +599,43 @@ async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not question:
         await reply(update, "Ask me something, e.g. <code>/ask how many scoops in a cendol bingsu?</code>")
         return
-    await _answer(update, question)
+    remember(ctx, who(update), question)
+    await _answer(update, question, ctx)
 
 
-async def _answer(update: Update, question: str):
+async def _answer(update: Update, question: str, ctx=None):
     await update.effective_chat.send_action("typing")
     allowed = money_allowed(update)
     context = await run_sync(sheet.reference_context)
     if allowed:
         context += "\n\n" + await run_sync(sheet.money_context, storage.parse_month(""))
-    text = await ai.answer(question, context, allowed)
+    history = memory_text(ctx) if ctx else ""
+    text = await ai.answer(question, context, allowed, history)
+    if ctx:
+        remember(ctx, config.CAFE_NAME + " bot", text)
     await reply(update, esc(text))
+
+
+# ─── Short memory per chat (so follow-up questions make sense) ──
+MEMORY_DAYS = 3
+MEMORY_MAX = 60
+
+
+def remember(ctx, speaker: str, text: str):
+    """Keep this chat's recent messages. Each chat has its own memory, so owners-chat
+    talk is never visible to the staff group."""
+    if ctx is None or ctx.chat_data is None or not text:
+        return
+    mem = ctx.chat_data.setdefault("memory", [])
+    mem.append({"t": storage.now().timestamp(), "who": speaker, "text": text[:500]})
+    cutoff = storage.now().timestamp() - MEMORY_DAYS * 86400
+    ctx.chat_data["memory"] = [m for m in mem if m["t"] >= cutoff][-MEMORY_MAX:]
+
+
+def memory_text(ctx, last: int = 30) -> str:
+    mem = (ctx.chat_data or {}).get("memory", [])[-last:]
+    from datetime import datetime
+    return "\n".join(f"[{datetime.fromtimestamp(m['t'], storage.TZ):%a %H:%M}] {m['who']}: {m['text']}" for m in mem)
 
 
 # ─── Owner reports ────────────────────────────────────────
@@ -683,6 +709,7 @@ async def cmd_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     text = (msg.text or "").strip()
+    remember(ctx, who(update), text)  # everything said in this chat, for follow-up questions
     if msg.reply_to_message:
         replied = msg.reply_to_message.message_id
         rid, p = _find_by_msg(pending(ctx, "receipts"), msg.chat_id, replied)
@@ -707,7 +734,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     is_private = update.effective_chat.type == ChatType.PRIVATE
     if is_private or _bot_mentioned(update, ctx):
-        await _answer(update, text)
+        await _answer(update, text, ctx)
 
 
 # ─── Start ────────────────────────────────────────────────
