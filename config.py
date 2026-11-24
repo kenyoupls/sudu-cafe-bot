@@ -53,7 +53,7 @@ AI_MODELS = [m.strip() for m in os.getenv(
 AI_CHECK_MODEL = os.getenv("AI_CHECK_MODEL", "gemini-3.5-flash")
 # Optional free backup (console.groq.com). Leave empty to skip.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
 AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "60"))
 
