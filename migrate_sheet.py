@@ -121,13 +121,17 @@ def build_receipts(expenses) -> tuple[list[list], list[list], list[str]]:
     return receipts, items, warnings
 
 
+SALES_FORMULA = (
+    "=IFERROR(QUERY({ARRAYFORMULA(IF('Daily Sales'!A2:A=\"\", \"\", TEXT('Daily Sales'!A2:A, \"yyyy-mm\"))), "
+    "'Daily Sales'!B2:B}, \"select Col1, sum(Col2) where Col2 is not null group by Col1 order by Col1 desc "
+    "label Col1 'Month', sum(Col2) 'Sales (RM)'\", 0), \"No sales saved yet\")"
+)
+
 SUMMARY = [
     ["Spending by month & category", "", "", "", "Sales by month", "", "", "Who paid (month, person)"],
     ["=QUERY('Receipt Items'!C:I, \"select C, F, sum(I) where C is not null group by C, F "
      "order by C desc label sum(I) 'Spent (RM)'\", 1)", "", "", "",
-     "=QUERY({ARRAYFORMULA(TEXT('Daily Sales'!A2:A, \"yyyy-mm\")), 'Daily Sales'!B2:B}, "
-     "\"select Col1, sum(Col2) where Col2 is not null group by Col1 order by Col1 desc "
-     "label Col1 'Month', sum(Col2) 'Sales (RM)'\", 0)", "", "",
+     SALES_FORMULA, "", "",
      "=QUERY(Receipts!C:F, \"select C, F, sum(E) where C is not null group by C, F "
      "order by C desc label sum(E) 'Paid (RM)'\", 1)"],
 ]
