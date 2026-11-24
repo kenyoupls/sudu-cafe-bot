@@ -351,16 +351,81 @@ def apply_edits(r: dict, edits: list[dict]) -> list[str]:
     return problems
 
 
+# ─── Money questions (refused in the staff group) ─────────
+
+MONEY_PATTERNS = [
+    r"\bsales?\b", r"\brevenue\b", r"\bprofits?\b", r"\bexpenses?\b", r"\bcosts?\b", r"\bearn(s|ed|ing|ings)?\b",
+    r"\bspen[dt]\b", r"\bspending\b", r"\bincome\b", r"\bbudget\b", r"\bsalar(y|ies)\b", r"\bwages?\b",
+    r"\bpayroll\b", r"\bgaji\b", r"\buntung\b", r"\bjualan\b", r"\bbelanja\b", r"\bwho paid\b", r"\bpayback\b",
+    r"\bmonthly totals?\b", r"\bfinancial\b", r"\bfinances?\b", r"\bp ?& ?l\b", r"\bpnl\b",
+    r"\bhow much (did|do|does|have|has|are|were|was) (we|i|you|they|the cafe|sudu)\b",
+    r"\bhours? worked\b", r"\bworking hours\b", r"\bwork(ed)? hours\b", r"\bovertime\b", r"\bjam kerja\b",
+    r"\bhours?\b.*\b(work|worked|working|shift|shifts)\b", r"\b(work|worked|shift)\b.*\bhours?\b",
+]
+REFUSAL = "Financial info is only available in the owner group. Check with the boss."
+
+
+def is_money_question(text: str) -> bool:
+    low = (text or "").lower()
+    return any(re.search(p, low) for p in MONEY_PATTERNS)
+
+
 # ─── Stock ────────────────────────────────────────────────
 
-def parse_stock_lines(text: str) -> list[tuple[str, float]]:
-    """Simple 'item qty' lines, e.g. 'full cream milk 120\\ncondensed milk: 17'."""
-    out = []
-    for part in re.split(r"[\n,;]+", text or ""):
-        m = re.match(r"^\s*(.+?)\s*[:=\-]?\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*$", part.strip(), re.I)
-        if m and clean_name(m.group(1)):
-            out.append((clean_name(m.group(1)), float(m.group(2))))
+OUT_WORDS = {"out", "oos", "habis", "nil", "none", "finish", "finished", "kosong", "empty", "zero", "0"}
+STATUS_WORDS = {"ok", "okay", "low", "yes", "no", "enough", "full", "ada", "sikit", "some", "many", "ya", "y", "n"}
+
+
+def parse_stock_sheet(text: str) -> dict:
+    """Read a stock count like Edwin's paper checklist, by code (no AI, nothing dropped).
+
+    'Full Cream Milk: 120' -> counted · 'Salt:' -> blank (ask, never assume 0) ·
+    'Lychee: habis/out/OOS/nil' -> 0 · 'Milk: OK/LOW' -> refused (needs a number)
+    Returns {'items': [(name, qty)], 'blanks': [name], 'invalid': [(name, word)], 'other': [line]}.
+    """
+    out = {"items": [], "blanks": [], "invalid": [], "other": []}
+    # one item per line, or several per line separated by , or ; (but not inside brackets)
+    lines = [p.strip() for p in re.split(r"\n|[,;](?![^()]*\))", text or "")]
+    for line in lines:
+        line = re.sub(r"^\s*(?:[-•*]|\d+[.)])\s+", "", line).strip()  # bullets / numbering
+        if not line:
+            continue
+        m = (re.match(r"^(.+?)\s*[:=]\s*(.*)$", line)                              # Name: value
+             or re.match(r"^(.+?)\s+(\d+(?:\.\d+)?(?:\s*[a-z.]+)*)\s*$", line, re.I)  # name 120 btl
+             or re.match(r"^(.+?)\s+(\S+)\s*$", line))                              # name habis
+        if not m:
+            out["other"].append(line)
+            continue
+        name, value = clean_name(m.group(1)), m.group(2).strip().lower()
+        if not name:
+            out["other"].append(line)
+            continue
+        if value == "":
+            out["blanks"].append(name)
+            continue
+        num = re.match(r"^(\d+(?:\.\d+)?)(?:\s*[a-z.]+)*$", value)
+        if num:
+            out["items"].append((name, float(num.group(1))))
+        elif value in OUT_WORDS:
+            out["items"].append((name, 0.0))
+        elif value in STATUS_WORDS:
+            out["invalid"].append((name, value.upper()))
+        else:
+            out["other"].append(line)
     return out
+
+
+def looks_like_stock_sheet(text: str) -> bool:
+    """Edwin-style list: 8+ 'Name: value' lines, or 4+ with a stock-check header."""
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    pairs = sum(1 for l in lines if re.match(r"^\s*(?:[-•*]|\d+[.)])?\s*[^:]{2,}:\s*\S*\s*$", l))
+    header = re.search(r"stock\s*check|checked\s*by|stock\s*count", (text or "").lower())
+    return pairs >= 8 or (pairs >= 4 and bool(header))
+
+
+def parse_stock_lines(text: str) -> list[tuple[str, float]]:
+    """Just the counted items, e.g. 'full cream milk 120\\ncondensed milk: 17'."""
+    return parse_stock_sheet(text)["items"]
 
 
 def stock_status(current, minimum) -> str:

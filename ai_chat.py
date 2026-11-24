@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import logging
 
 import config
@@ -140,12 +141,17 @@ async def _ask_json(prompt: str, spec, image: bytes | None = None,
     if _gemini():
         from google.genai import types
         parts = ([types.Part.from_bytes(data=image, mime_type="image/jpeg")] if image else []) + [prompt]
-        for model in models or config.AI_MODELS:
-            try:
-                return await asyncio.to_thread(_call_gemini, model, parts, spec), model
-            except Exception as e:  # busy / quota / timeout / bad JSON → next model
-                errors.append(f"{model}: {str(e)[:120]}")
-                log.warning("AI model %s failed: %s", model, str(e)[:200])
+        for attempt in range(2):  # Gemini "busy" spikes are short: one more round after a pause
+            if attempt:
+                if not any("503" in e or "UNAVAILABLE" in e or "timeout" in e.lower() for e in errors):
+                    break
+                await asyncio.sleep(4)
+            for model in models or config.AI_MODELS:
+                try:
+                    return await asyncio.to_thread(_call_gemini, model, parts, spec), model
+                except Exception as e:  # busy / quota / timeout / bad JSON → next model
+                    errors.append(f"{model}: {str(e)[:120]}")
+                    log.warning("AI model %s failed: %s", model, str(e)[:200])
     if config.GROQ_API_KEY and models is None:
         try:
             return await asyncio.to_thread(_call_groq, prompt + "\n" + groq_shape, image), "groq"
@@ -189,31 +195,175 @@ async def reread_receipt(image: bytes, caption: str, problem: str) -> dict | Non
         return None
 
 
-async def parse_stock(text: str, known_items: list[str]) -> list[dict]:
-    """'full cream 120, low fat 139, cond milk 17' → [{'typed','item','qty'}].
-    item is one of known_items when it clearly matches, else the typed name."""
-    quick = storage.parse_stock_lines(text)
-    matched = [(t, storage.match_name(t, known_items), q) for t, q in quick]
-    if quick and all(m for _, m, _ in matched):
-        return [{"typed": t, "item": m, "qty": q} for t, m, q in matched]
+MATCH_SPEC = {"matches": [{"typed": "str", "item": "str"}]}
+
+
+async def match_items(names: list[str], known_items: list[str]) -> dict[str, str]:
+    """AI only for names code couldn't match: 'FC milk' → 'Full Cream Milk'. Unknown stays ''."""
+    if not names:
+        return {}
     prompt = (
-        "Staff at a café typed a stock count. Extract each item and its counted quantity.\n"
-        "For 'item', use the EXACT name from this list when it clearly means that item; "
-        "otherwise repeat what they typed.\n"
-        f"Known items: {json.dumps(known_items, ensure_ascii=False)}\n\nMessage: {text}"
+        "Match each name typed by café staff to the EXACT item name from the stock list, "
+        "only when it clearly means that item (abbreviations, typos, Malay/English). "
+        "If it is not on the list, return an empty string for item.\n"
+        f"Stock list: {json.dumps(known_items, ensure_ascii=False)}\n"
+        f"Typed names: {json.dumps(names, ensure_ascii=False)}"
     )
     try:
-        data, _ = await _ask_json(prompt, STOCK_SPEC, groq_shape='{"updates":[{"typed","item","qty"}]}')
+        data, _ = await _ask_json(prompt, MATCH_SPEC, groq_shape='{"matches":[{"typed","item"}]}')
     except AIUnavailable:
-        return [{"typed": t, "item": m or t, "qty": q} for t, m, q in matched]
-    out = []
-    for u in data.get("updates", []):
-        qty = storage.to_number(u.get("qty"))
-        if qty is None:
-            continue
-        item = storage.match_name(u.get("item", ""), known_items) or storage.clean_name(u.get("typed") or u.get("item"))
-        out.append({"typed": storage.clean_name(u.get("typed")), "item": item, "qty": qty})
+        return {}
+    out = {}
+    for m in data.get("matches", []):
+        hit = storage.match_name(m.get("item", ""), known_items, cutoff=0.95) if m.get("item") else None
+        if hit:
+            out[storage.clean_name(m.get("typed"))] = hit
     return out
+
+
+async def read_stock(text: str, known_items: list[str]) -> dict:
+    """A stock count message → {'updates': [{'typed','item','qty','new'}], 'blanks', 'invalid', 'other'}.
+    Code reads the numbers (nothing dropped); AI only helps match unfamiliar names."""
+    sheet = storage.parse_stock_sheet(text)
+    rows = [(t, None, q) for t, q in sheet["items"]]  # (typed, AI's guess, qty)
+    other = [l for l in sheet["other"] if re.search(r"[a-z]", l, re.I)]
+    if other:  # lines code can't read ('FC milk eighty-eight lol') → AI reads only those
+        prompt = (
+            "Café staff typed stock counts. Extract each item and its counted quantity "
+            "(numbers may be in words; 'habis', 'out', 'OOS', 'nil' mean 0). Skip lines that are not counts "
+            "(headers, dates, names of who checked). For 'item', use the EXACT name from this list when it "
+            f"clearly means that item; otherwise repeat what they typed.\nKnown items: {json.dumps(known_items, ensure_ascii=False)}\n\n"
+            "Lines:\n" + "\n".join(other)
+        )
+        try:
+            data, _ = await _ask_json(prompt, STOCK_SPEC, groq_shape='{"updates":[{"typed","item","qty"}]}')
+            for u in data.get("updates", []):
+                qty = storage.to_number(u.get("qty"))
+                if qty is not None and (u.get("typed") or u.get("item")):
+                    rows.append((storage.clean_name(u.get("typed") or u.get("item")), u.get("item"), qty))
+        except AIUnavailable:
+            pass
+    found = [storage.match_name(t, known_items) or
+             (storage.match_name(guess, known_items, cutoff=0.95) if guess else None) for t, guess, _ in rows]
+    ai_matches = await match_items([t for (t, _, _), m in zip(rows, found) if not m], known_items)
+    updates = []
+    for (typed, _, qty), hit in zip(rows, found):
+        item = hit or ai_matches.get(typed)
+        updates.append({"typed": typed, "item": item or typed, "qty": qty, "new": not item})
+    blanks = [storage.match_name(b, known_items) or ai_matches.get(b) or b for b in sheet["blanks"]]
+    return {"updates": updates, "blanks": blanks, "invalid": sheet["invalid"], "other": sheet["other"]}
+
+
+async def parse_stock(text: str, known_items: list[str]) -> list[dict]:
+    """Compatibility: just the updates."""
+    return [{k: u[k] for k in ("typed", "item", "qty")} for u in (await read_stock(text, known_items))["updates"]]
+
+
+# ─── Understanding replies like a human ───────────────────
+
+REPLY_SPEC = {
+    "action": ("enum", ["edit", "save", "cancel", "unclear"]),
+    "edits?": [{"op": ("enum", ["item", "set", "delete", "add"]), "n?": "int",
+                "field?": ("enum", ["qty", "unit_price", "line_total", "name", "category", "date", "supplier",
+                                   "total", "discount", "rounding", "tax", "payment", "paid_by"]),
+                "value?": "str", "name?": "str", "qty?": "num", "unit_price?": "num"}],
+}
+_NUMERIC = {"qty", "unit_price", "line_total", "total", "discount", "rounding", "tax"}
+
+
+def reply_to_edits(data: dict) -> tuple[str, list[dict]]:
+    """Turn the AI's reading of a reply into storage.apply_edits() operations."""
+    action = data.get("action", "unclear")
+    edits = []
+    for e in data.get("edits") or []:
+        op, field, value = e.get("op"), e.get("field"), e.get("value")
+        if op == "delete" and e.get("n"):
+            edits.append({"op": "delete", "n": int(e["n"])})
+        elif op == "add" and e.get("name"):
+            edits.append({"op": "add", "name": storage.clean_name(e["name"]), "qty": float(e.get("qty") or 1),
+                          "unit_price": storage.to_number(e.get("unit_price")) or 0.0})
+        elif op in ("item", "set") and field and value not in (None, ""):
+            if field in _NUMERIC:
+                value = storage.to_number(value)
+                if value is None:
+                    continue
+                if field == "discount":
+                    value = abs(value)
+            elif field == "date":
+                value = storage.parse_date(value)
+                if not value:
+                    continue
+            elif field == "category":
+                value = next((c for c in config.CATEGORIES if c.lower() == str(value).lower()), "Other")
+            else:
+                value = storage.clean_name(value)
+            if op == "item" and e.get("n"):
+                edits.append({"op": "item", "n": int(e["n"]), "field": field, "value": value})
+            elif op == "set" and field not in ("qty", "unit_price", "line_total", "name", "category"):
+                edits.append({"op": "set", "field": field, "value": value})
+    return action, edits
+
+
+async def understand_receipt_reply(r: dict, text: str) -> tuple[str, list[dict]]:
+    """A free-form reply to a receipt summary → ('edit'|'save'|'cancel'|'unclear', edits)."""
+    numbered = [{"n": i, **{k: it[k] for k in ("name", "qty", "unit_price", "line_total", "category")}}
+                for i, it in enumerate(r["items"], 1)]
+    prompt = (
+        "A café staff member replied to a receipt the bot read. Work out what they want.\n"
+        "action: 'edit' (change something), 'save' (they confirm it's right), 'cancel' (don't save it / wrong photo), "
+        "or 'unclear'.\nFor edits: op 'item' changes field of item number n; 'set' changes a receipt field "
+        "(date YYYY-MM-DD, supplier, total, discount, payment, paid_by); 'delete' removes item n; 'add' adds an item.\n"
+        f"Receipt: {json.dumps({**{k: r[k] for k in ('supplier', 'date', 'total', 'discount', 'paid_by', 'payment')}, 'items': numbered}, ensure_ascii=False)}\n"
+        f"Reply: {text}"
+    )
+    try:
+        data, _ = await _ask_json(prompt, REPLY_SPEC, groq_shape='{"action":"edit|save|cancel|unclear","edits":[...]}')
+    except AIUnavailable:
+        return "unclear", []
+    return reply_to_edits(data)
+
+
+EXPENSE_SPEC = {
+    "bought": ("enum", ["yes", "no", "unclear"]),
+    "supplier?": "str", "date?": "str", "paid_by?": "str", "payment_method?": "str",
+    "items?": [{"name": "str", "qty?": "num", "line_total?": "num", "unit_price?": "num"}],
+    "total?": "num",
+}
+
+
+async def read_expense(text: str, items: list[dict], sender: str) -> dict | None:
+    """'yes RM15 FairPrice paid by me' for new items → a receipt dict ready to show, or None if 'no'."""
+    prompt = (
+        "Café staff just added new stock items. The bot asked whether they were bought and should be added to "
+        "expenses. Read their reply.\n"
+        "bought: 'no' if they say no/skip/not bought; 'yes' if they give purchase details or say yes; else 'unclear'.\n"
+        "Fill what they said: supplier (shop), date (YYYY-MM-DD, day-first if written like 12/11), paid_by "
+        f"('me'/'I' = {sender}), items with qty and price (line_total = price paid for that line), total.\n"
+        f"Today is {storage.today()}. New items: {json.dumps(items, ensure_ascii=False)}\nReply: {text}"
+    )
+    data, _ = await _ask_json(prompt, EXPENSE_SPEC, groq_shape='{"bought","supplier","date","paid_by","items":[...],"total"}')
+    if data.get("bought") == "no":
+        return None
+    if data.get("bought") != "yes":
+        return {"unclear": True}
+    lines = data.get("items") or []
+    if not lines:  # only a total given: put it on the item(s)
+        lines = [{"name": it["name"], "qty": it.get("qty") or 1} for it in items]
+        if len(lines) == 1 and data.get("total") is not None:
+            lines[0]["line_total"] = data["total"]
+    for line in lines:
+        line.setdefault("category", "Ingredients")
+        if line.get("qty") in (None, 0):
+            match = next((it for it in items if storage.name_key(it["name"]) == storage.name_key(line["name"])), None)
+            line["qty"] = (match or {}).get("qty") or 1
+    paid = data.get("paid_by") or sender
+    if storage.name_key(paid) in ("me", "i", "myself", "saya"):
+        paid = sender
+    total = data.get("total")
+    if total is None:
+        total = sum(storage.to_number(l.get("line_total")) or 0 for l in lines)
+    return {"supplier": data.get("supplier") or "Unknown shop", "date": data.get("date") or storage.today(),
+            "items": lines, "total": total, "paid_by": paid, "payment_method": data.get("payment_method") or "unknown"}
 
 
 async def answer(question: str, context: str, money_allowed: bool, history: str = "") -> str:
@@ -229,7 +379,12 @@ async def answer(question: str, context: str, money_allowed: bool, history: str 
         f"Amounts are in RM. Today is {storage.today()}. {rules}\n"
         "Reply in the same language as the question (English, Malay or Chinese).\n\n"
         "Use the recent conversation to understand follow-ups (e.g. 'what about Friday?', 'and him?'), "
-        "but trust the DATA over anything said in chat.\n\n"
+        "but trust the DATA over anything said in chat (old stock numbers in chat may be out of date).\n"
+        "HONESTY RULES: You cannot save, change or record anything yourself. Never say something was saved, "
+        "updated or added. If someone wants to record something, tell them how: send the receipt photo, "
+        "type 'stock milk 120', or 'buy ice'. Never invent where something is stored; if unsure say "
+        "'check the Google Sheet'. If the message is just 'ok', 'yes', 'no' or similar with nothing in the "
+        "recent conversation it could answer, ask them to say a bit more instead of guessing.\n\n"
         f"=== DATA ===\n{context}\n\n"
         f"=== RECENT CONVERSATION IN THIS CHAT (oldest first) ===\n{history or '(none)'}\n\n"
         f"=== QUESTION ===\n{question}"
