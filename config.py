@@ -1,339 +1,75 @@
 """
-Café Manager Bot — Configuration
-All settings in one place. Override via environment variables or .env file.
+Sudu Café Bot — settings.
+
+Everything private (keys, chat IDs, user IDs, the Sheet ID) comes from the
+server's `.env` file, which is never uploaded to GitHub. This file only holds
+names and sensible defaults, so the repo can stay public.
 """
 import os
-from datetime import time
+
 from dotenv import load_dotenv
 
-load_dotenv()  # Load .env file if present
+load_dotenv()
 
-# ─── Telegram ───────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # Legacy — kept for backward compat
-ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x]
 
-# ─── Multi-Group Setup ────────────────────────────────────
-# Owner group: full access to everything (financials, settings, staff mgmt)
-# Staff group: daily operations only (receipts, stock, cleaning, tasks, AI chat)
-OWNER_GROUP_ID = int(os.getenv("OWNER_GROUP_ID", "0")) or GROUP_CHAT_ID
-STAFF_GROUP_ID = int(os.getenv("STAFF_GROUP_ID", "0"))
-ALLOWED_GROUP_IDS = [gid for gid in [OWNER_GROUP_ID, STAFF_GROUP_ID] if gid]
+def _ids(name: str) -> set[int]:
+    """Read a comma-separated list of Telegram IDs from the environment."""
+    out = set()
+    for part in os.getenv(name, "").split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            out.add(int(part))
+    return out
 
-# Owner Telegram user IDs — get full override privileges in any group.
-# Comma-separated. E.g. OWNER_USER_IDS=834454829,other_id
-OWNER_USER_IDS = set()
-_raw = os.getenv("OWNER_USER_IDS", "")
-for _uid in _raw.split(","):
-    _uid = _uid.strip()
-    if _uid.isdigit():
-        OWNER_USER_IDS.add(int(_uid))
 
-# Staff override "session" — after the owner taps "Show anyway", the chat stays
-# in owner-mode (no staff restrictions, no chat-history poisoning) until the
-# topic resolves or one of these TTLs runs out.
-STAFF_OVERRIDE_SESSION_HARD_TTL = int(os.getenv("STAFF_OVERRIDE_SESSION_HARD_TTL", "300"))  # absolute cap (s)
-STAFF_OVERRIDE_SESSION_IDLE_TTL = int(os.getenv("STAFF_OVERRIDE_SESSION_IDLE_TTL", "180"))  # bumped per message (s)
-STAFF_OVERRIDE_END_PHRASES = {
-    "done", "thanks", "thank you", "close", "no more", "ok done",
-    "that's all", "nothing else", "dismiss", "end",
-}
+def _int(name: str) -> int:
+    value = os.getenv(name, "").strip()
+    return int(value) if value.lstrip("-").isdigit() else 0
 
-# Commands blocked in staff group — anything financial, admin, or settings
-STAFF_BLOCKED_COMMANDS = {
-    "staff", "addstaff", "removestaff",
-    "shifts", "addshift", "removeshift",
-    "hours", "sethours", "holiday", "holidays",
-    "analyze", "pl", "pnl", "data",
-    "setup", "settings",
-    "receipts", "expenses", "whopaid", "sales",
-}
 
-# AI actions blocked in staff group — financial reports
-STAFF_BLOCKED_ACTIONS = {
-    "show_expenses", "show_whopaid", "show_sales", "show_pnl",
-    "show_staff", "monthly_summary",
-}
+# ─── Telegram ─────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-# ─── Google Sheets (free database) ──────────────────────────
+# Owners chat: money questions are answered here (and to owners anywhere).
+# GROUP_CHAT_ID is the old name, still accepted.
+OWNER_GROUP_ID = _int("OWNER_GROUP_ID") or _int("GROUP_CHAT_ID")
+# Staff group: receipts, sales photos, stock, shopping, recipes. No money answers.
+STAFF_GROUP_ID = _int("STAFF_GROUP_ID")
+# Owners' personal Telegram user IDs (find yours with /whoami).
+OWNER_USER_IDS = _ids("OWNER_USER_IDS") | _ids("ADMIN_USER_IDS")
+
+# ─── Google Sheet ─────────────────────────────────────────
 GOOGLE_SHEETS_CREDS_FILE = os.getenv("GOOGLE_SHEETS_CREDS_FILE", "credentials.json")
-SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "SuduBot")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "SuduBot")  # used only if no ID
 
-# ─── Gemini AI (free tier — primary) ─────────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-
-# ─── Groq AI (free tier — fallback) ─────────────────────────
+# ─── AI ───────────────────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Tried in order. If one is busy or out of free quota, the next one is used.
+AI_MODELS = [m.strip() for m in os.getenv(
+    "AI_MODELS", "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash"
+).split(",") if m.strip()]
+# Stronger model used for a second look when a receipt's numbers don't add up.
+AI_CHECK_MODEL = os.getenv("AI_CHECK_MODEL", "gemini-3.5-flash")
+# Optional free backup (console.groq.com). Leave empty to skip.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-maverick-17b-128e-instruct")
+GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
+AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "60"))
 
-# ─── Timezone ───────────────────────────────────────────────
+# ─── Café ─────────────────────────────────────────────────
+CAFE_NAME = os.getenv("CAFE_NAME", "Sudu")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kuala_Lumpur")
+CURRENCY = "RM"
 
-# ─── Café Info ──────────────────────────────────────────────
-CAFE_NAME = os.getenv("CAFE_NAME", "My Café")
+# Receipt item categories (same names the Sheet already uses).
+#   Ingredients = food/drink that goes into the menu
+#   Consumables = used up regularly: cups, lids, tissue, soap, cleaning
+#   Equipment   = bought once: tools, machines, decor
+CATEGORIES = ["Ingredients", "Consumables", "Equipment", "Other"]
 
-# ─── Google Places API (for live café info from Google) ─────
-GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
-GOOGLE_PLACE_ID = os.getenv("GOOGLE_PLACE_ID", "")
+# How far a receipt's items may be from its printed total before we warn.
+TOTAL_TOLERANCE = 0.05
 
-# ─── Operating Hours (default — editable via bot) ───────────
-DEFAULT_HOURS = {
-    "mon": {"open": "08:00", "close": "22:00"},
-    "tue": {"open": "08:00", "close": "22:00"},
-    "wed": {"open": "08:00", "close": "22:00"},
-    "thu": {"open": "08:00", "close": "22:00"},
-    "fri": {"open": "08:00", "close": "23:00"},
-    "sat": {"open": "09:00", "close": "23:00"},
-    "sun": {"open": "09:00", "close": "21:00"},
-}
-
-# ─── Scheduled Task Times (24h format, SGT) ─────────────────
-OPENING_CHECKLIST_TIME = time(7, 30)   # 7:30 AM
-CLOSING_CHECKLIST_TIME = time(21, 0)   # 9:00 PM
-MORNING_STOCK_CHECK_TIME = time(8, 0)  # 8:00 AM
-CLEANING_REMINDER_TIMES = [
-    time(10, 0),   # 10 AM
-    time(13, 0),   # 1 PM
-    time(16, 0),   # 4 PM
-    time(19, 0),   # 7 PM
-]
-SHIFT_REMINDER_MINUTES_BEFORE = 30     # Remind 30 min before shift
-CONTENT_REMINDER_TIME = time(9, 0)     # 9 AM daily content nudge
-WEEKLY_REVIEW_DAY = 0                  # Monday
-WEEKLY_REVIEW_TIME = time(9, 0)
-
-# ─── Memory ────────────────────────────────────────────────
-MEMORY_RETENTION_DAYS = 0              # 0 = keep forever (no auto-delete)
-RECENT_MESSAGES_FULL = 1000            # Safety cap: max verbatim msgs even if 30-day window has more
-VERBATIM_DAYS = 30                     # Days within N days = verbatim in prompt
-SUMMARY_DAYS_START = 30                # Daily summaries kick in for days >= this age
-WEEKLY_ROLLUP_DAYS = 90                # After this age, roll daily summaries into weekly
-
-# ─── Chase-up / Action Items ──────────────────────────────
-CHASEUP_REMINDER_TIMES = [
-    time(10, 30),  # 10:30 AM
-    time(16, 0),   # 4:00 PM
-]
-CHASEUP_STALE_HOURS = 8               # Chase up if no update after 8 hours
-
-# ─── Cleaning Zones ─────────────────────────────────────────
-CLEANING_ZONES = [
-    "🚻 Toilets",
-    "🪑 Dining Area / Tables",
-    "☕ Bar / Counter",
-    "🍳 Kitchen",
-    "🗑️ Bins / Trash Area",
-    "🚪 Entrance / Outdoor",
-    "🧊 Fridge / Display",
-]
-
-# ─── Stock Categories ───────────────────────────────────────
-STOCK_CATEGORIES = [
-    "🍧 Bingsu Toppings",
-    "🥛 Milk & Dairy",
-    "🍓 Fruits & Fresh Items",
-    "🍵 Tea & Beverages",
-    "🧁 Pastries & Food",
-    "🥤 Cups & Packaging",
-    "🧴 Cleaning Supplies",
-    "🍬 Sugar / Syrups",
-    "🧊 Ice & Frozen Items",
-    "📦 Other Supplies",
-]
-
-# ─── Item Categories (for receipt items) ──────────────────
-ITEM_CATEGORIES = {
-    "ingredients":  "🧂 Ingredients",
-    "consumables":  "🧻 Consumables",
-    "one-off":      "🧪 One-off",
-    "equipment":    "🔧 Equipment",
-    "marketing":    "📢 Marketing",
-}
-DEFAULT_CATEGORY = "ingredients"
-
-# ─── Opening Checklist ──────────────────────────────────────
-OPENING_CHECKLIST = [
-    "Turn on lights & AC",
-    "Turn on coffee machine & grinder",
-    "Check fridge temperatures",
-    "Set up POS / register",
-    "Stock pastry display",
-    "Wipe down all tables & counters",
-    "Check toilet supplies (soap, tissue, towels)",
-    "Put out outdoor signage / menu board",
-    "Unlock front door",
-    "Post 'We're Open' on social media",
-]
-
-# ─── Closing Checklist ──────────────────────────────────────
-CLOSING_CHECKLIST = [
-    "Last call for orders",
-    "Clean & shut down coffee machine",
-    "Wipe all tables & counters",
-    "Mop floors",
-    "Take out trash / recycling",
-    "Restock cups, lids, straws for tomorrow",
-    "Count cash register / close POS",
-    "Lock fridge & check temperatures",
-    "Turn off AC, lights, signage",
-    "Lock all doors",
-    "Send closing report to group",
-]
-
-# ─── Holiday System ───────────────────────────────────────
-CALENDARIFIC_API_KEY = os.getenv("CALENDARIFIC_API_KEY", "")
-
-# Google Calendar public holiday calendar IDs
-HOLIDAY_CALENDAR_IDS = {
-    "MY": "en.malaysia#holiday@group.v.calendar.google.com",
-    "SG": "en.singapore#holiday@group.v.calendar.google.com",
-}
-
-# Calendarific country/state codes for state-level holidays
-CALENDARIFIC_LOCATIONS = [
-    {"country": "MY", "state": "MY-01"},  # Johor
-    {"country": "MY", "state": "MY-10"},  # Selangor (Klang Valley)
-    {"country": "MY", "state": "MY-04"},  # Melaka
-]
-
-# School holidays — hardcoded from MOE (Malaysia + Singapore)
-# Format: list of (start_date, end_date, label) tuples
-SCHOOL_HOLIDAYS_2026 = [
-    ("2026-03-14", "2026-03-22", "MY Term 1 Break"),
-    ("2026-05-23", "2026-06-07", "MY Mid-Year Break"),
-    ("2026-08-15", "2026-08-23", "MY Term 3 Break"),
-    ("2026-11-21", "2026-12-31", "MY Year-End Break"),
-    ("2026-03-14", "2026-03-22", "SG March School Holiday"),
-    ("2026-05-30", "2026-06-28", "SG June School Holiday"),
-    ("2026-09-05", "2026-09-13", "SG September School Holiday"),
-    ("2026-11-21", "2026-12-31", "SG Year-End Holiday"),
-]
-
-SCHOOL_HOLIDAYS_2027 = [
-    ("2027-03-13", "2027-03-21", "MY Term 1 Break"),
-    ("2027-05-22", "2027-06-06", "MY Mid-Year Break"),
-    ("2027-08-14", "2027-08-22", "MY Term 3 Break"),
-    ("2027-11-20", "2027-12-31", "MY Year-End Break"),
-    ("2027-03-13", "2027-03-21", "SG March School Holiday"),
-    ("2027-05-29", "2027-06-27", "SG June School Holiday"),
-    ("2027-09-04", "2027-09-12", "SG September School Holiday"),
-    ("2027-11-20", "2027-12-31", "SG Year-End Holiday"),
-]
-
-SCHOOL_HOLIDAY_REMINDER_MONTH = 10  # October — remind about upcoming year-end holidays
-
-# Malaysia federal public holidays — hardcoded from official calendar
-# Islamic dates are tentative (subject to JAKIM announcement)
-# Format: list of (date, holiday_name) tuples
-MY_PUBLIC_HOLIDAYS_2026 = [
-    ("2026-01-01", "New Year's Day"),
-    ("2026-02-01", "Thaipusam"),
-    ("2026-02-17", "Chinese New Year"),
-    ("2026-02-18", "Chinese New Year Holiday"),
-    ("2026-03-07", "Nuzul Al-Quran"),
-    ("2026-03-21", "Hari Raya Aidilfitri"),
-    ("2026-03-22", "Hari Raya Aidilfitri Day 2"),
-    ("2026-05-01", "Labour Day"),
-    ("2026-05-27", "Hari Raya Haji"),
-    ("2026-05-31", "Wesak Day"),
-    ("2026-06-01", "Agong's Birthday"),
-    ("2026-06-17", "Awal Muharram"),
-    ("2026-08-25", "Prophet Muhammad's Birthday"),
-    ("2026-08-31", "Merdeka Day"),
-    ("2026-09-16", "Malaysia Day"),
-    ("2026-11-08", "Deepavali"),
-    ("2026-12-25", "Christmas Day"),
-]
-
-MY_PUBLIC_HOLIDAYS_2027 = [
-    ("2027-01-01", "New Year's Day"),
-    ("2027-02-06", "Chinese New Year"),
-    ("2027-02-07", "Chinese New Year Holiday"),
-    ("2027-03-10", "Hari Raya Aidilfitri"),
-    ("2027-03-11", "Hari Raya Aidilfitri Day 2"),
-    ("2027-05-01", "Labour Day"),
-    ("2027-05-17", "Hari Raya Haji"),
-    ("2027-05-20", "Wesak Day"),
-    ("2027-06-06", "Awal Muharram"),
-    ("2027-06-07", "Agong's Birthday"),
-    ("2027-08-15", "Prophet Muhammad's Birthday"),
-    ("2027-08-31", "Merdeka Day"),
-    ("2027-09-16", "Malaysia Day"),
-    ("2027-10-28", "Deepavali"),
-    ("2027-12-25", "Christmas Day"),
-]
-
-MY_PUBLIC_HOLIDAYS_2028 = [
-    ("2028-01-01", "New Year's Day"),
-    ("2028-01-26", "Chinese New Year"),
-    ("2028-01-27", "Chinese New Year Holiday"),
-    ("2028-02-09", "Thaipusam"),
-    ("2028-02-27", "Hari Raya Aidilfitri"),
-    ("2028-02-28", "Hari Raya Aidilfitri Day 2"),
-    ("2028-05-01", "Labour Day"),
-    ("2028-05-05", "Hari Raya Haji"),
-    ("2028-05-09", "Wesak Day"),
-    ("2028-05-26", "Awal Muharram"),
-    ("2028-06-05", "Agong's Birthday"),
-    ("2028-08-04", "Prophet Muhammad's Birthday"),
-    ("2028-08-31", "Merdeka Day"),
-    ("2028-09-16", "Malaysia Day"),
-    ("2028-10-17", "Deepavali"),
-    ("2028-12-25", "Christmas Day"),
-]
-
-MY_PUBLIC_HOLIDAYS_2029 = [
-    ("2029-01-01", "New Year's Day"),
-    ("2029-02-13", "Chinese New Year"),
-    ("2029-02-14", "Chinese New Year Holiday"),
-    ("2029-02-15", "Hari Raya Aidilfitri"),
-    ("2029-02-16", "Hari Raya Aidilfitri Day 2"),
-    ("2029-04-24", "Hari Raya Haji"),
-    ("2029-05-01", "Labour Day"),
-    ("2029-05-15", "Awal Muharram"),
-    ("2029-05-28", "Wesak Day"),
-    ("2029-06-04", "Agong's Birthday"),
-    ("2029-07-24", "Prophet Muhammad's Birthday"),
-    ("2029-08-31", "Merdeka Day"),
-    ("2029-09-16", "Malaysia Day"),
-    ("2029-11-05", "Deepavali"),
-    ("2029-12-25", "Christmas Day"),
-]
-
-MY_PUBLIC_HOLIDAYS_2030 = [
-    ("2030-01-01", "New Year's Day"),
-    ("2030-01-22", "Nuzul Al-Quran"),
-    ("2030-02-03", "Chinese New Year"),
-    ("2030-02-04", "Chinese New Year Holiday"),
-    ("2030-02-05", "Hari Raya Aidilfitri"),
-    ("2030-02-06", "Hari Raya Aidilfitri Day 2"),
-    ("2030-04-14", "Hari Raya Haji"),
-    ("2030-05-01", "Labour Day"),
-    ("2030-05-02", "Wesak Day"),
-    ("2030-05-04", "Awal Muharram"),
-    ("2030-06-03", "Agong's Birthday"),
-    ("2030-07-13", "Prophet Muhammad's Birthday"),
-    ("2030-08-31", "Merdeka Day"),
-    ("2030-09-16", "Malaysia Day"),
-    ("2030-10-26", "Deepavali"),
-    ("2030-12-25", "Christmas Day"),
-]
-
-# ─── Content Ideas Pool ─────────────────────────────────────
-CONTENT_IDEAS = [
-    "📸 Behind-the-scenes: barista making latte art",
-    "🎥 Time-lapse of opening the café",
-    "📝 'Did you know?' post about coffee origin",
-    "🗳️ Poll: what new drink should we add?",
-    "🌅 Cozy morning ambience reel",
-    "🎂 Feature a customer birthday celebration",
-    "👨‍🍳 Spotlight: meet our team member",
-    "☕ Recipe share: our signature drink",
-    "📊 Fun fact Friday: how many cups we served this week",
-    "🎉 Announce upcoming event or promo",
-    "🍰 New item reveal / teaser",
-    "💬 Customer review / testimonial share",
-    "🌿 Sustainability post: our eco-friendly practices",
-    "📅 Weekly special announcement",
-    "🎵 Playlist of the week share",
-]
+# Where the bot keeps small working state (pending receipts) between restarts.
+DATA_DIR = os.getenv("DATA_DIR", "data")

@@ -9,6 +9,10 @@ __pycache__/
 
 # Data files (local to VM)
 data/
+backups/
+.pytest_cache/
+.venv/
+venv/
 *.json
 !requirements.txt
 

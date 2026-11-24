@@ -1,0 +1,4 @@
+#!/bin/sh
+# Blocks commits that contain keys. Enable once per computer with:
+#   git config core.hooksPath .githooks
+python check_secrets.py || python3 check_secrets.py

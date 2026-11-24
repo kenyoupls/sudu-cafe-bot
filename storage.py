@@ -1,2932 +1,418 @@
 """
-Café Manager Bot — Storage Layer (Google Sheets + Local JSON)
-Uses local JSON for fast reads, syncs to Google Sheets for visibility & backup.
+Data rules: the pure logic that keeps every record in one fixed format.
+
+No Telegram, no Google, no AI in here, so all of it is covered by tests.
+(The file keeps the name `storage.py` because the server's auto-update script
+checks this file name before restarting the bot.)
 """
-import json
-import os
-import shutil
-import logging
-import threading
-import time as _time
-from datetime import datetime, date
-from pathlib import Path
-from typing import Optional
+from __future__ import annotations
+
+import difflib
+import html
+import re
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-import re as _re
 import config
 
-_TZ = ZoneInfo(config.TIMEZONE)
+TZ = ZoneInfo(config.TIMEZONE)
 
 
-def _now():
-    """Current time in configured timezone (MYT)."""
-    return datetime.now(_TZ)
+# ─── Time ─────────────────────────────────────────────────
+
+def now() -> datetime:
+    return datetime.now(TZ)
 
 
-def _fmt_ts():
-    """Format current timestamp as '29/08/26-1425' style."""
-    return _now().strftime("%d/%m/%y-%H%M")
-
-logger = logging.getLogger(__name__)
+def today() -> str:
+    return now().date().isoformat()
 
 
-_BRAND_PREFIXES = [
-    "sm", "s&p", "cap", "nestle", "dutch lady", "f&n",
-    "ayam brand", "nutrifres", "dasani", "clorox", "ajax",
-    "dettol", "mr muscle", "marigold", "yeo's", "yeos",
-    "gardenia", "massimo", "sunshine", "goodday", "milo",
-    "nescafe", "maggi", "kara", "aroy-d", "aroy d",
-    "value", "topvalu", "tesco", "giant", "lotus",
-    "spray n wipe", "mr. muscle", "cif", "colgate",
-]
-_BRAND_PREFIX_RE = _re.compile(
-    r'^(?:' + '|'.join(_re.escape(p) for p in _BRAND_PREFIXES) + r')\b\s*',
-    _re.IGNORECASE,
-)
-_SIZE_SUFFIX_RE = _re.compile(
-    r'\b\d+(\.\d+)?\s*(kg|g|ml|l|pcs|pack|box|bag|btl|carton)\b',
-    _re.IGNORECASE,
-)
+def stamp() -> str:
+    """Timestamp written into 'Saved At' style columns."""
+    return now().strftime("%Y-%m-%d %H:%M")
 
 
-def normalize_item_name(name: str) -> str:
-    """Normalize item name so slight variations match.
-    'Coconut (Toasted, 100g)' and 'Coconut - Toasted, 100g' → same key."""
-    s = name.strip()
-    s = _BRAND_PREFIX_RE.sub('', s)          # Strip known brand prefixes
-    s = _SIZE_SUFFIX_RE.sub(' ', s)          # Strip size/weight suffixes
-    s = _re.sub(r'\([^)]*\)', ' ', s)       # Strip parenthesized annotations entirely
-    s = _re.sub(r'[{}[\]]', ' ', s)         # Remove remaining brackets
-    s = _re.sub(r'[-/\\.,;:]+', ' ', s)      # Dashes, slashes, dots → space
-    s = _re.sub(r'\s+', ' ', s).strip()      # Collapse whitespace
-    return s.lower()
+def month_of(day: str) -> str:
+    """'2026-11-12' -> '2026-11'."""
+    return (day or "")[:7]
 
 
-_LEADING_CODE_RE = _re.compile(
-    r'''^\s*
-        (?:
-            [A-Za-z]+-\d+[A-Za-z]*          # E-878, SM-123
-            |
-            [A-Za-z]{2,}\s*\d+(?:\.\d+)?"   # MAV 14"
-            |
-            [A-Za-z]{1,4}\d{2,}[A-Za-z0-9]* # SM123, AB99X
-        )
-        \s+
-    ''',
-    _re.VERBOSE,
-)
-_HASHTAG_WORD_RE = _re.compile(r'#\S+')
-_SIZE_KEEP_RE = _re.compile(
-    r'^\d+(\.\d+)?\s*(kg|g|ml|l|pcs|pack|box|bag|btl|carton)$',
-    _re.IGNORECASE,
-)
-_SIZE_TOKEN_RE = _re.compile(
-    r'\b(\d+(?:\.\d+)?)\s*(kg|g|ml|l|pcs|pack|box|bag|btl|carton)\b',
-    _re.IGNORECASE,
-)
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 
 
-def clean_item_name(raw: str) -> str:
-    """Clean up a raw/ugly receipt item name into a simple, readable name.
+def parse_date(text, default_year: int | None = None) -> str | None:
+    """Turn any date we meet into YYYY-MM-DD. Malaysian receipts are day-first.
 
-    - Strips leading product/model codes (e.g. "E-878", "MAV 14\"", "SM-123")
-    - Removes hashtag words (e.g. "#SOBBAR")
-    - Title-cases an ALL CAPS name
-    - Strips known brand prefixes (see _BRAND_PREFIXES)
-    - Keeps size info like "1.5L", "500ml", "250g"
-    - Collapses whitespace and removes duplicate trailing size-only words
+    Accepts 2026-11-12, 12/11/2026, 12/11/26, 12-11-2026, 12.11.26, 12/11,
+    12 Nov 2026, 12 November. Returns None if it can't be sure.
     """
-    if not raw:
-        return raw
+    if text is None:
+        return None
+    if isinstance(text, (date, datetime)):
+        return text.strftime("%Y-%m-%d")
+    s = str(text).strip().lower()
+    if not s:
+        return None
+    year_now = default_year or now().year
 
-    s = raw.strip()
+    def build(y, m, d):
+        y = int(y)
+        if y < 100:
+            y += 2000
+        try:
+            return date(y, int(m), int(d)).isoformat()
+        except ValueError:
+            return None
 
-    # 1. Strip leading product/model code
-    s = _LEADING_CODE_RE.sub('', s, count=1)
-
-    # 2. Remove hashtag words
-    s = _HASHTAG_WORD_RE.sub('', s)
-
-    # Collapse whitespace before further processing
-    s = _re.sub(r'\s+', ' ', s).strip()
-
-    # 3. If entire name is ALL CAPS, convert to Title Case
-    letters = [c for c in s if c.isalpha()]
-    if letters and all(c.isupper() for c in letters):
-        # Preserve size tokens' original casing (e.g. "1.5L" stays "1.5L",
-        # "400ML" becomes "400ml") — title-casing would otherwise mangle them.
-        sizes = {}
-        def _stash(m):
-            key = f'\x00SIZE{len(sizes)}\x00'
-            unit = m.group(2)
-            sizes[key] = m.group(1) + (unit if unit == 'L' else unit.lower())
-            return key
-        s = _SIZE_TOKEN_RE.sub(_stash, s)
-        s = s.title()
-        for key, val in sizes.items():
-            s = s.replace(key.title(), val)
-
-    # 4. Strip known brand prefixes
-    s = _BRAND_PREFIX_RE.sub('', s)
-
-    # Collapse whitespace again
-    s = _re.sub(r'\s+', ' ', s).strip()
-
-    # 7. Remove duplicate trailing size/unit-only words (e.g. "... Spoon Spoon")
-    words = s.split(' ')
-    while len(words) >= 2 and words[-1].lower() == words[-2].lower():
-        words.pop()
-    s = ' '.join(words)
-
-    return s.strip()
+    m = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        return build(m.group(1), m.group(2), m.group(3))
+    m = re.match(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})\b", s)
+    if m:
+        return build(m.group(3), m.group(2), m.group(1))
+    m = re.match(r"^(\d{1,2})[-/.](\d{1,2})$", s)
+    if m:
+        return build(year_now, m.group(2), m.group(1))
+    m = re.match(r"^(\d{1,2})\s*([a-z]{3})[a-z]*\.?,?\s*(\d{2,4})?$", s)
+    if m and m.group(2) in _MONTHS:
+        return build(m.group(3) or year_now, _MONTHS[m.group(2)], m.group(1))
+    return None
 
 
-def _words_prefix_match(words_a: list, words_b: list) -> bool:
-    """Check if two word lists match with allowance for truncated words.
-    E.g. ['pistachio', 'cru', 'pandan'] matches ['pistachio', 'crunch', 'pandan']
-    because 'cru' is a prefix of 'crunch'. At least 70% of words must match."""
-    shorter, longer = (words_a, words_b) if len(words_a) <= len(words_b) else (words_b, words_a)
-    if not shorter:
-        return False
-    matches = 0
-    used = set()
-    for sw in shorter:
-        for i, lw in enumerate(longer):
-            if i in used:
-                continue
-            if sw == lw or (len(sw) >= 3 and (lw.startswith(sw) or sw.startswith(lw))):
-                matches += 1
-                used.add(i)
-                break
-    ratio = matches / max(len(shorter), len(longer))
-    return ratio >= 0.7
+# ─── Numbers & names ──────────────────────────────────────
+
+def to_number(value) -> float | None:
+    """'RM 1,234.50' -> 1234.5 ; '-5.00' -> -5.0 ; '' / None / 'abc' -> None."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().lower().replace("rm", "").replace(",", "").replace(" ", "")
+    if s.startswith("(") and s.endswith(")"):  # accounting style (5.00)
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
 
-# ─── Try Google Sheets ─────────────────────────────────────
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    HAS_GSPREAD = True
-except ImportError:
-    HAS_GSPREAD = False
-    logger.info("gspread not installed — using local JSON storage only")
+def rm(value) -> str:
+    n = to_number(value) or 0
+    return f"{'-' if n < 0 else ''}{config.CURRENCY}{abs(n):,.2f}"
 
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+def tidy_caps(name: str) -> str:
+    """'DUTCH LADY F/CREAM MILK 1L' -> 'Dutch Lady F/Cream Milk 1L'. Leaves mixed case alone."""
+    if not name or name != name.upper():
+        return name
+    def word(w):
+        if any(ch.isdigit() for ch in w):
+            return w  # sizes/codes: 1L, 400ML, 10S
+        return re.sub(r"[A-Za-z]+", lambda m: m.group(0).capitalize(), w).replace("'S", "'s")
+    return " ".join(word(w) for w in name.split(" "))
 
 
-# ═══════════════════════════════════════════════════════════
-#  GOOGLE SHEETS SYNC
-# ═══════════════════════════════════════════════════════════
+def qty_text(q) -> str:
+    q = to_number(q) or 0
+    return str(int(q)) if q == int(q) else f"{q:g}"
 
-class SheetsSync:
-    """Mirrors key data to Google Sheets for visibility & backup."""
 
-    SCOPES = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+def clean_name(name) -> str:
+    """Tidy an item/supplier name: trim, single spaces, no trailing ':' or '-'."""
+    s = re.sub(r"\s+", " ", str(name or "")).strip()
+    return s.rstrip(":-–— ").strip()
 
-    # Worksheet definitions: name → column headers
-    # Only tabs managed by storage.py SheetsSync
-    # Other tabs (Expenses Detail, Expenses, Monthly Summary, Daily Sales,
-    # POS Reports) are managed by google_integration.py
-    WORKSHEETS = {
-        "Stock": ["Item"],  # Date columns added dynamically
-        "Shopping List": ["Item"],
-        "Events": ["Title", "Date", "Details", "Added By", "Status"],
-        "Bingsu Recipes": ["Flavor", "Batch Size", "Ingredient", "Quantity"],
-        "Other Recipes": ["Type", "Name", "Category", "Ingredient", "Quantity", "Method", "Step Number", "Step Text"],
-        "Stock Minimums": ["Item", "Min", "Unit", "Location"],
-        "Checklists": ["Checklist", "Step Number", "Task"],
-        "Inspection": ["Section", "Item"],
+
+def name_key(name) -> str:
+    """Matching key: lowercase letters/digits only. 'Full Cream Milk:' == 'full cream milk'."""
+    return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+
+
+def match_name(name: str, known: list[str], cutoff: float = 0.82) -> str | None:
+    """Find the existing item a typed name refers to, or None."""
+    key = name_key(name)
+    if not key:
+        return None
+    by_key = {name_key(k): k for k in known}
+    if key in by_key:
+        return by_key[key]
+    # 'milk' typed, only one known item contains it as a whole word
+    contains = [k for kk, k in by_key.items() if re.search(rf"\b{re.escape(key)}\b", kk)]
+    if len(contains) == 1:
+        return contains[0]
+    close = difflib.get_close_matches(key, list(by_key), n=1, cutoff=cutoff)
+    return by_key[close[0]] if close else None
+
+
+def esc(text) -> str:
+    """Escape text for Telegram HTML messages."""
+    return html.escape(str(text if text is not None else ""), quote=False)
+
+
+# ─── Receipts ─────────────────────────────────────────────
+
+def normalize_receipt(raw: dict, sender: str) -> dict:
+    """Put an AI reading into our fixed shape. Keeps what was printed;
+    only fills a gap when it is pure arithmetic (qty × unit price)."""
+    raw = raw or {}
+    items = []
+    for it in raw.get("items") or []:
+        name = tidy_caps(clean_name(it.get("name")))
+        if not name:
+            continue
+        qty = to_number(it.get("qty"))
+        unit = to_number(it.get("unit_price"))
+        line = to_number(it.get("line_total"))
+        if qty is None or qty <= 0:
+            qty = 1.0
+        if line is None and unit is not None:
+            line = round(qty * unit, 2)
+        if unit is None and line is not None:
+            unit = round(line / qty, 4)
+        cat = (it.get("category") or "").strip().capitalize()
+        items.append({
+            "name": name,
+            "qty": qty,
+            "unit_price": unit if unit is not None else 0.0,
+            "line_total": line if line is not None else 0.0,
+            "category": cat if cat in config.CATEGORIES else "Ingredients",
+        })
+    paid_by = clean_name(raw.get("paid_by")) or sender
+    if name_key(paid_by) in {"", "staff", "staff member", "unknown", "customer", "n a", "none", "cashier"}:
+        paid_by = sender
+    return {
+        "supplier": tidy_caps(clean_name(raw.get("supplier"))) or "Unknown shop",
+        "date": parse_date(raw.get("date")) or today(),
+        "items": items,
+        "discount": abs(to_number(raw.get("discount")) or 0.0),
+        "rounding": to_number(raw.get("rounding")) or 0.0,
+        "tax": to_number(raw.get("tax")) or 0.0,
+        "total": to_number(raw.get("total")),
+        "payment": clean_name(raw.get("payment_method")).lower() or "unknown",
+        "paid_by": paid_by,
     }
 
-    def __init__(self):
-        self.client = None
-        self.spreadsheet = None
-        self._worksheets = {}
-        self._connect()
 
-    def _connect(self):
-        """Connect to Google Sheets."""
-        try:
-            creds_file = config.GOOGLE_SHEETS_CREDS_FILE
-            if not os.path.exists(creds_file):
-                logger.warning(f"Sheets credentials file not found: {creds_file}")
-                return
+def check_receipt(r: dict) -> dict:
+    """Do the items add up to the printed total?"""
+    items_sum = round(sum(i["line_total"] for i in r["items"]), 2)
+    expected = round(items_sum - r["discount"] + r["rounding"] + r["tax"], 2)
+    total = r["total"]
+    if total is None:
+        return {"ok": False, "items_sum": items_sum, "expected": expected, "diff": None,
+                "reason": "no total found on the receipt"}
+    diff = round(total - expected, 2)
+    ok = abs(diff) <= config.TOTAL_TOLERANCE and bool(r["items"])
+    reason = "" if ok else ("no items found" if not r["items"]
+                            else f"items add up to {rm(expected)}, receipt says {rm(total)}")
+    return {"ok": ok, "items_sum": items_sum, "expected": expected, "diff": diff, "reason": reason}
 
-            creds = Credentials.from_service_account_file(creds_file, scopes=self.SCOPES)
-            self.client = gspread.authorize(creds)
 
-            # Open by ID if available, otherwise by name
-            sheet_id = getattr(config, "SPREADSHEET_ID", "")
-            if sheet_id:
-                self.spreadsheet = self.client.open_by_key(sheet_id)
+def receipt_key(r: dict) -> str:
+    """Same shop + same date + same total = the same receipt."""
+    return f"{r['date']}|{name_key(r['supplier'])}|{(to_number(r['total']) or 0):.2f}"
+
+
+def receipt_text(r: dict, check: dict, receipt_id: str) -> str:
+    """The message staff see before saving (Telegram HTML)."""
+    lines = [f"🧾 <b>{esc(r['supplier'])}</b>  ·  {esc(r['date'])}", ""]
+    for n, it in enumerate(r["items"], 1):
+        lines.append(f"{n}. {esc(it['name'])}\n"
+                     f"     {qty_text(it['qty'])} × {rm(it['unit_price'])} = <b>{rm(it['line_total'])}</b>"
+                     f"  <i>{esc(it['category'])}</i>")
+    lines.append("")
+    if r["discount"]:
+        lines.append(f"Discount: −{rm(r['discount'])}")
+    if r["rounding"]:
+        lines.append(f"Rounding: {rm(r['rounding'])}")
+    if r["tax"]:
+        lines.append(f"Tax: {rm(r['tax'])}")
+    lines.append(f"💰 <b>Total: {rm(r['total'])}</b>")
+    lines.append(f"👤 Paid by: {esc(r['paid_by'])}  ·  {esc(r['payment'])}")
+    lines.append("")
+    if check["ok"]:
+        lines.append("✅ Items add up to the total.")
+    else:
+        lines.append(f"⚠️ <b>Check this:</b> {esc(check['reason'])}.")
+    lines.append(f"\n<i>To fix, reply to this message, e.g. <code>2 qty 12</code>, "
+                 f"<code>2 price 7.29</code>, <code>paid by Ali</code>, <code>delete 3</code>. "
+                 f"Ref {esc(receipt_id)}</i>")
+    return "\n".join(lines)
+
+
+# ─── Receipt corrections typed by staff ───────────────────
+
+_FIELD_WORDS = {
+    "qty": "qty", "quantity": "qty", "x": "qty",
+    "price": "unit_price", "unit": "unit_price", "each": "unit_price", "@": "unit_price",
+    "total": "line_total", "amount": "line_total", "line": "line_total",
+    "name": "name", "cat": "category", "category": "category",
+}
+
+
+def parse_edits(text: str) -> list[dict]:
+    """Turn a reply like '2 qty 12; paid by Ali' into a list of edits.
+    Unknown lines come back as {'op': 'unknown', 'text': ...}."""
+    edits = []
+    for part in re.split(r"[\n;]+", text or ""):
+        p = part.strip()
+        if not p:
+            continue
+        low = p.lower()
+        m = re.match(r"^(?:delete|del|remove|rm)\s*#?(\d+)$", low)
+        if m:
+            edits.append({"op": "delete", "n": int(m.group(1))})
+            continue
+        m = re.match(r"^add\s+(.+?)\s+([\d.]+)\s*[x×*]\s*(?:rm)?\s*([\d.,]+)$", low)
+        if m:
+            name = p[4:4 + len(m.group(1))]
+            edits.append({"op": "add", "name": clean_name(name), "qty": float(m.group(2)),
+                          "unit_price": to_number(m.group(3))})
+            continue
+        m = re.match(r"^#?(\d+)\s+(qty|quantity|x|price|unit|each|@|total|amount|line|name|cat|category)\s*[:=]?\s*(.+)$", low)
+        if m:
+            field = _FIELD_WORDS[m.group(2)]
+            raw_value = p[len(p) - len(m.group(3)):].strip()
+            if field in ("qty", "unit_price", "line_total"):
+                value = to_number(raw_value)
+                if value is None:
+                    edits.append({"op": "unknown", "text": p})
+                    continue
+            elif field == "category":
+                value = next((c for c in config.CATEGORIES if c.lower().startswith(raw_value.lower()[:4])), None)
+                if value is None:
+                    edits.append({"op": "unknown", "text": p})
+                    continue
             else:
-                self.spreadsheet = self.client.open(config.SPREADSHEET_NAME)
-
-            logger.info(f"✅ Connected to Google Sheet: {self.spreadsheet.title}")
-            self._ensure_worksheets()
-
-        except Exception as e:
-            logger.error(f"Failed to connect to Google Sheets: {e}")
-            self.spreadsheet = None
-
-    def _ensure_worksheets(self):
-        """Create worksheets if they don't exist."""
-        if not self.spreadsheet:
-            return
-        try:
-            existing = {ws.title: ws for ws in self.spreadsheet.worksheets()}
-
-            for name, headers in self.WORKSHEETS.items():
-                if name in existing:
-                    self._worksheets[name] = existing[name]
-                else:
-                    ws = self.spreadsheet.add_worksheet(title=name, rows=100, cols=len(headers))
-                    ws.update("A1", [headers])
-                    # Bold header row
-                    ws.format("A1:Z1", {"textFormat": {"bold": True}})
-                    self._worksheets[name] = ws
-                    logger.info(f"  Created worksheet: {name}")
-
-            # Remove default Sheet1 if it exists and is empty
-            if "Sheet1" in existing:
-                try:
-                    self.spreadsheet.del_worksheet(existing["Sheet1"])
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logger.error(f"Error setting up worksheets: {e}")
-
-    def _get_ws(self, name: str):
-        """Get worksheet by name, reconnect if needed."""
-        if name not in self._worksheets:
-            if self.spreadsheet:
-                try:
-                    self._worksheets[name] = self.spreadsheet.worksheet(name)
-                except Exception:
-                    return None
-        return self._worksheets.get(name)
-
-    def sync_stock(self, stock_data: dict, stock_history: dict = None, stock_current: dict = None):
-        """Sync stock data to Sheets — MERGE only, never delete rows.
-        Sheet is source of truth. Updates existing rows in place, appends new items.
-        Uses stock_history {date: {item: qty}} and stock_current {item: qty}.
-        Column A = Item, Column B = Current Stock, columns C+ = date columns."""
-        ws = self._get_ws("Stock")
-        if not ws:
-            return
-        try:
-            stock_history = stock_history or {}
-            stock_current = stock_current or {}
-
-            if not stock_history and not stock_current:
-                return
-
-            existing = ws.get_all_values()
-
-            # If sheet is completely empty, create header
-            if not existing or not existing[0]:
-                ws.update("A1", [["Item", "Current Stock"]])
-                ws.format("A1:B1", {"textFormat": {"bold": True}})
-                existing = [["Item", "Current Stock"]]
-
-            header = list(existing[0])
-
-            # Ensure "Current Stock" occupies column B
-            has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
-            if not has_current_col:
-                ws.insert_cols([[""]], col=2)
-                ws.update_acell("B1", "Current Stock")
-                existing = ws.get_all_values()
-                header = list(existing[0]) if existing else []
-
-            # Build lookup: normalized item name → sheet row index (1-based, skipping header)
-            row_lookup = {}  # {norm_name: row_index}
-            for i, row in enumerate(existing[1:], 1):
-                if row and row[0].strip():
-                    norm = normalize_item_name(row[0])
-                    if norm not in row_lookup:  # first match wins
-                        row_lookup[norm] = i
-
-            # Helper: find row by exact match first, then normalized, then substring
-            def _find_row(item_name):
-                # Exact match wins (case-insensitive) so "(Cook)" vs "(Jelly)"
-                # don't collide when normalize_item_name strips both parens.
-                def _strip_edges(s):
-                    return s.strip().rstrip(':;,. ').strip().lower()
-                item_key = _strip_edges(item_name)
-                for i, row in enumerate(existing[1:], 1):
-                    if row and _strip_edges(row[0]) == item_key:
-                        return i
-                norm = normalize_item_name(item_name)
-                if norm in row_lookup:
-                    return row_lookup[norm]
-                # Substring fallback
-                if len(norm) >= 4:
-                    for existing_norm, idx in row_lookup.items():
-                        if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
-                            return idx
-                return None
-
-            # Track next available row for appending
-            next_row = len(existing) + 1
-
-            # Collect all cell updates: {(row, col): value}
-            cell_updates = {}
-
-            # Process stock_history: update date columns
-            for date_str, items in stock_history.items():
-                # Find or create date column
-                if date_str in header:
-                    col_idx = header.index(date_str)
-                else:
-                    # Add new date column at end of header
-                    header.append(date_str)
-                    col_idx = len(header) - 1
-                    cell_updates[(1, col_idx + 1)] = date_str
-
-                for item, qty in items.items():
-                    if str(qty).upper() == "OK":
-                        continue
-                    row_idx = _find_row(item)
-                    if row_idx is not None:
-                        cell_updates[(row_idx + 1, col_idx + 1)] = qty
-                    # Sheet is master list — don't append items not already on it
-
-            # Process stock_current: update column B
-            for item, val in stock_current.items():
-                row_idx = _find_row(item)
-                if row_idx is not None:
-                    cell_updates[(row_idx + 1, 2)] = val
-                # Sheet is master list — don't append items not already on it
-
-            # Apply all updates in batch
-            if cell_updates:
-                # gspread batch_update for efficiency
-                batch = []
-                for (row, col), val in cell_updates.items():
-                    cell_label = gspread.utils.rowcol_to_a1(row, col)
-                    batch.append({"range": cell_label, "values": [[val]]})
-                # batch_update accepts up to ~50k cells
-                if batch:
-                    ws.batch_update(batch, value_input_option="RAW")
-
-            ws.format("A1:Z1", {"textFormat": {"bold": True}})
-        except Exception as e:
-            logger.error(f"Sheets sync error (Stock): {e}")
-
-    def sync_shopping(self, shopping_data: list):
-        """Sync shopping list to Sheets — merge JSON items with existing sheet.
-        Keeps manually added items, adds JSON items not already present."""
-        ws = self._get_ws("Shopping List")
-        if not ws:
-            return
-        try:
-            # Read existing sheet items
-            existing = ws.get_all_values()
-
-            # Ensure header exists FIRST
-            if not existing or not existing[0] or existing[0][0].strip().lower() != "item":
-                ws.update("A1", [["Item"]])
-                ws.format("A1:A1", {"textFormat": {"bold": True}})
-                existing = ws.get_all_values()
-
-            sheet_items = []
-            if existing and len(existing) > 1:
-                for row in existing[1:]:
-                    if row and row[0].strip():
-                        sheet_items.append(row[0].strip())
-
-            sheet_norms = {normalize_item_name(i) for i in sheet_items}
-
-            # Add JSON items not already on sheet
-            json_items = [item.get("item", "") for item in shopping_data if item.get("item")]
-            new_items = []
-            for item in json_items:
-                if normalize_item_name(item) not in sheet_norms:
-                    new_items.append(item)
-
-            # Append new items (don't clear existing)
-            for item in new_items:
-                ws.append_row([item])
-
-            ws.format("A1:A1", {"textFormat": {"bold": True}})
-        except Exception as e:
-            logger.error(f"Sheets sync error (Shopping): {e}")
-
-    def sync_events(self, events_data: list):
-        """Sync events to Sheets."""
-        ws = self._get_ws("Events")
-        if not ws:
-            return
-        try:
-            rows = [["Title", "Date", "Details", "Added By", "Status"]]
-            for event in events_data:
-                rows.append([
-                    event.get("title", ""),
-                    event.get("date", ""),
-                    event.get("details", ""),
-                    event.get("added_by", ""),
-                    event.get("status", ""),
-                ])
-            ws.clear()
-            if rows:
-                ws.update("A1", rows)
-                ws.format("A1:E1", {"textFormat": {"bold": True}})
-        except Exception as e:
-            logger.error(f"Sheets sync error (Events): {e}")
-
-    # ─── Read from Sheet (reverse-sync: Sheet → JSON) ────────
-
-    def read_stock_from_sheet(self) -> tuple:
-        """Read Stock sheet → return (stock_dict, stock_history_dict, stock_current_dict).
-        Sheet is source of truth — this overwrites local JSON data.
-        Handles the "Item | Current Stock | date1 | date2 ..." layout — the
-        Current Stock column (B) is read separately and skipped when scanning
-        for date columns."""
-        ws = self._get_ws("Stock")
-        if not ws:
-            return None, None, None
-        try:
-            from datetime import datetime as _dt
-            existing = ws.get_all_values()
-            if not existing or not existing[0]:
-                return {}, {}, {}
-
-            header = existing[0]
-
-            # "Current Stock" occupies column B (index 1) when present
-            has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
-            date_start = 2 if has_current_col else 1
-
-            def is_date_col(s):
-                try:
-                    _dt.strptime(s, "%d/%m/%y")
-                    return True
-                except (ValueError, TypeError):
-                    return False
-
-            date_cols = [(i, h) for i, h in enumerate(header[date_start:], date_start) if is_date_col(h)]
-
-            # Parse dates for sorting (find latest per item)
-            def parse_d(d):
-                try:
-                    return _dt.strptime(d, "%d/%m/%y")
-                except ValueError:
-                    return _dt.min
-
-            stock = {}
-            history = {}
-            stock_current = {}
-
-            for row in existing[1:]:
-                if not row or not row[0]:
-                    continue
-                item = row[0].strip().rstrip(":;.,")
-                if not item:
-                    continue
-
-                if has_current_col:
-                    cur_val = (row[1] if len(row) > 1 else "").strip()
-                    if cur_val:
-                        try:
-                            stock_current[item] = int(float(cur_val))
-                        except (ValueError, TypeError):
-                            stock_current[item] = 0
-                    else:
-                        stock_current[item] = 0  # empty Column B = 0
-
-                latest_qty = ""
-                latest_date_parsed = _dt.min
-
-                for col_idx, d in date_cols:
-                    val = (row[col_idx] if col_idx < len(row) else "").strip()
-                    if val and val.upper() != "OK":
-                        # Add to history
-                        if d not in history:
-                            history[d] = {}
-                        history[d][item] = val
-                        # Track latest
-                        pd = parse_d(d)
-                        if pd > latest_date_parsed:
-                            latest_date_parsed = pd
-                            latest_qty = val
-
-                # Column B is source of truth for current stock.
-                # If Column B is empty, do NOT backfill from date columns —
-                # that's purchase history, not current count.
-
-                if latest_qty:
-                    stock[item] = {
-                        "qty": latest_qty,
-                        "updated_by": "sheet",
-                        "updated_at": _now().strftime("%d/%m/%y-%H%M"),
-                    }
-
-            logger.info(f"Read {len(stock)} stock items, {len(stock_current)} stock_current items from Sheet")
-            return stock, history, stock_current
-
-        except Exception as e:
-            logger.error(f"Error reading stock from Sheet: {e}")
-            return None, None, None
-
-    def read_shopping_from_sheet(self) -> list:
-        """Read Shopping List sheet → return shopping_list array."""
-        ws = self._get_ws("Shopping List")
-        if not ws:
-            return None
-        try:
-            existing = ws.get_all_values()
-            if not existing or len(existing) < 2:
-                return []
-
-            shopping = []
-            for row in existing[1:]:  # Skip header
-                if not row or not row[0]:
-                    continue
-                item_name = row[0].strip()
-                if not item_name:
-                    continue
-                shopping.append({"item": item_name})
-
-            logger.info(f"Read {len(shopping)} shopping items from Sheet")
-            return shopping
-
-        except Exception as e:
-            logger.error(f"Error reading shopping from Sheet: {e}")
-            return None
-
-    def read_events_from_sheet(self) -> list:
-        """Read Events sheet → return events array."""
-        ws = self._get_ws("Events")
-        if not ws:
-            return None
-        try:
-            existing = ws.get_all_values()
-            if not existing or len(existing) < 2:
-                return []
-
-            events = []
-            for row in existing[1:]:  # Skip header
-                if not row or not row[0]:
-                    continue
-                events.append({
-                    "title": row[0] if len(row) > 0 else "",
-                    "date": row[1] if len(row) > 1 else "",
-                    "details": row[2] if len(row) > 2 else "",
-                    "added_by": row[3] if len(row) > 3 else "",
-                    "status": row[4] if len(row) > 4 else "",
-                })
-
-            logger.info(f"Read {len(events)} events from Sheet")
-            return events
-
-        except Exception as e:
-            logger.error(f"Error reading events from Sheet: {e}")
-            return None
-
-    # ─── Direct writes to Sheet ──────────────────────────────
-
-    def write_stock_item(self, item: str, qty: str, date_str: str):
-        """Write a single stock item to the Sheet (update or add row/col)."""
-        import time as _time
-        max_retries = 4
-        for attempt in range(max_retries + 1):
-            ws = self._get_ws("Stock")
-            if not ws:
-                return False
-            try:
-                existing = ws.get_all_values()
-                logger.debug(f"[write_stock_item] attempt={attempt}, item={item!r}, qty={qty!r}, date_str={date_str!r}")
-                logger.debug(f"[write_stock_item] header={existing[0] if existing else 'EMPTY'}")
-
-                if not existing or not existing[0]:
-                    ws.update("A1", [["Item", "Current Stock", date_str], [item, "", qty]])
-                    ws.format("A1:C1", {"textFormat": {"bold": True}})
-                    return True
-
-                header = existing[0]
-
-                has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
-                if not has_current_col:
-                    ws.insert_cols([[""]], col=2)
-                    ws.update_acell("B1", "Current Stock")
-                    existing = ws.get_all_values()
-                    header = existing[0] if existing else []
-
-                # Find or create date column (date columns start at column C / index 2)
-                if date_str in header[2:]:
-                    col_idx = header.index(date_str, 2)
-                    logger.debug(f"[write_stock_item] Found existing date column at col_idx={col_idx}")
-                else:
-                    col_idx = 2
-                    ws.insert_cols([[""]], col=3)
-                    ws.update_acell("C1", date_str)
-                    existing = ws.get_all_values()
-                    header = existing[0] if existing else []
-                    logger.debug(f"[write_stock_item] Created new date column, col_idx={col_idx}, new header={header}")
-
-                # Find item row (by normalized name)
-                norm = normalize_item_name(item)
-                row_idx = None
-                for i, row in enumerate(existing[1:], 1):
-                    if row and normalize_item_name(row[0]) == norm:
-                        row_idx = i
-                        break
-
-                if row_idx is None and len(norm) >= 4:
-                    for i, row in enumerate(existing[1:], 1):
-                        if row:
-                            row_norm = normalize_item_name(row[0])
-                            if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
-                                row_idx = i
-                                break
-
-                logger.debug(f"[write_stock_item] norm={norm!r}, row_idx={row_idx}")
-
-                if row_idx is not None:
-                    cell = gspread.utils.rowcol_to_a1(row_idx + 1, col_idx + 1)
-                    ws.update_acell(cell, qty)
-                    logger.debug(f"[write_stock_item] Updated cell {cell} with {qty}")
-                else:
-                    new_row = [""] * len(header)
-                    new_row[0] = item
-                    new_row[col_idx] = qty
-                    ws.append_row(new_row)
-                    logger.debug(f"[write_stock_item] Appended new row for {item}")
-
-                ws.format("A1:Z1", {"textFormat": {"bold": True}})
-                return True  # success — exit the retry loop
-
-            except Exception as e:
-                is_rate_limit = "429" in str(e) or "Quota exceeded" in str(e)
-                if is_rate_limit and attempt < max_retries:
-                    wait = 3 * (2 ** attempt)  # 3s, 6s, 12s, 24s
-                    logger.warning(f"[write_stock_item] Rate limited (attempt {attempt}), retrying in {wait}s...")
-                    _time.sleep(wait)
-                    continue
-                logger.error(f"[write_stock_item] FAILED for item={item!r}, qty={qty!r}, date={date_str!r}: {e}", exc_info=True)
-                return False
-
-    def remove_stock_item(self, item: str):
-        """Remove a stock item row from the Sheet."""
-        ws = self._get_ws("Stock")
-        if not ws:
-            return
-        try:
-            existing = ws.get_all_values()
-            if not existing:
-                return
-            norm = normalize_item_name(item)
-            for i, row in enumerate(existing[1:], 2):  # Sheet rows are 1-indexed, +1 for header
-                if row and normalize_item_name(row[0]) == norm:
-                    ws.delete_rows(i)
-                    logger.info(f"Removed stock row from Sheet: {row[0]}")
-                    return
-        except Exception as e:
-            logger.error(f"Sheet remove error (stock): {e}")
-
-    def write_shopping_item(self, item_data: dict):
-        """Append a shopping item to the Sheet — single 'Item' column."""
-        ws = self._get_ws("Shopping List")
-        if not ws:
-            return
-        try:
-            ws.append_row([item_data.get("item", "")])
-        except Exception as e:
-            logger.error(f"Sheet write error (shopping): {e}")
-
-    def clear_shopping_list(self):
-        """Clear all rows from the Shopping List sheet, keeping only the header."""
-        ws = self._get_ws("Shopping List")
-        if not ws:
-            return
-        try:
-            ws.clear()
-            ws.update("A1", [["Item"]])
-            ws.format("A1:A1", {"textFormat": {"bold": True}})
-        except Exception as e:
-            logger.error(f"Sheet clear error (shopping): {e}")
-
-    def remove_shopping_item(self, item_name: str):
-        """Remove a single item from the Shopping List sheet by name."""
-        ws = self._get_ws("Shopping List")
-        if not ws:
-            return
-        try:
-            existing = ws.get_all_values()
-            if not existing:
-                return
-            norm = normalize_item_name(item_name)
-            for i, row in enumerate(existing[1:], 2):  # 2 = sheet row (1-indexed, skip header)
-                if row and normalize_item_name(row[0]) == norm:
-                    ws.delete_rows(i)
-                    return
-            # Substring fallback
-            if len(norm) >= 4:
-                for i, row in enumerate(existing[1:], 2):
-                    if row:
-                        row_norm = normalize_item_name(row[0])
-                        if len(row_norm) >= 4 and (norm in row_norm or row_norm in norm):
-                            ws.delete_rows(i)
-                            return
-        except Exception as e:
-            logger.error(f"Sheet remove error (shopping): {e}")
-
-    def write_event(self, event_data: dict):
-        """Append an event to the Sheet."""
-        ws = self._get_ws("Events")
-        if not ws:
-            return
-        try:
-            # Insert month separator if month changed
-            event_date = event_data.get("date", "")
-            self._event_month_separator(ws, event_date)
-            ws.append_row([
-                event_data.get("title", ""),
-                event_date,
-                event_data.get("details", ""),
-                event_data.get("added_by", ""),
-                event_data.get("status", "upcoming"),
-            ])
-        except Exception as e:
-            logger.error(f"Sheet write error (event): {e}")
-
-    def _event_month_separator(self, ws, new_date_str: str):
-        """Insert a month separator row in Events if month changed."""
-        try:
-            if not new_date_str or len(new_date_str) < 7:
-                return
-            # Extract month from YYYY-MM-DD
-            new_month = new_date_str[:7] if "-" in new_date_str else ""
-            if not new_month:
-                return
-            all_vals = ws.col_values(2)  # Column B = Date column in Events
-            if len(all_vals) <= 1:
-                return
-            last_date = ""
-            for val in reversed(all_vals[1:]):
-                val = str(val).strip()
-                if val and not val.startswith("═══"):
-                    last_date = val
-                    break
-            if not last_date:
-                return
-            last_month = last_date[:7] if "-" in last_date else ""
-            if not last_month or last_month == new_month:
-                return
-            from datetime import datetime as _dt
-            try:
-                month_label = _dt.strptime(new_month, "%Y-%m").strftime("%B %Y")
-            except ValueError:
-                month_label = new_month
-            ws.append_row([f"═══ {month_label} ═══", "", "", "", ""])
-            row_num = len(ws.col_values(1))
-            try:
-                ws.format(f"A{row_num}:E{row_num}", {
-                    "textFormat": {"bold": True},
-                    "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
-                })
-            except Exception:
-                pass
-        except Exception as e:
-            logger.debug(f"Event month separator failed: {e}")
-
-    # ─── Full sync (JSON → Sheet) ──────────────────────────
-
-    def sync_all(self, data: dict):
-        """Sync all data to Sheets with delays to avoid rate limits."""
-        if not self.spreadsheet:
-            return
-        syncs = [
-            ("Stock", lambda: self.sync_stock(data.get("stock", {}), data.get("stock_history", {}), data.get("stock_current", {}))),
-            ("Shopping", lambda: self.sync_shopping(data.get("shopping_list", []))),
-            ("Events", lambda: self.sync_events(data.get("events", []))),
-        ]
-        for name, sync_fn in syncs:
-            try:
-                sync_fn()
-                _time.sleep(3)  # 3s delay between worksheets to avoid rate limit
-            except Exception as e:
-                logger.error(f"Sheets sync error ({name}): {e}")
-
-    # ─── SOP data (recipes, minimums, checklists, inspection) ───
-
-    def _ws_row_count(self, name: str) -> int:
-        """Return number of data rows (excluding header) currently in a worksheet."""
-        ws = self._get_ws(name)
-        if not ws:
-            return 0
-        try:
-            values = ws.get_all_values()
-            return max(0, len(values) - 1)
-        except Exception as e:
-            logger.error(f"Error reading row count for {name}: {e}")
-            return 0
-
-
-    def read_sop_from_sheets(self) -> dict:
-        """Read all SOP data from the SOP worksheets and reconstruct it into the
-        same nested dict structures the hardcoded sop_data.py dicts used to have.
-        Returns a dict with keys: bingsu_recipes, foam_recipes, topping_recipes,
-        drinks_recipes, stock_minimums, ops_checklists, inspection_checklist.
-        Any tab that can't be read is returned as an empty dict for that key."""
-        result = {
-            "bingsu_recipes": {},
-            "foam_recipes": {},
-            "topping_recipes": {},
-            "drinks_recipes": {},
-            "stock_minimums": {},
-            "ops_checklists": {},
-            "inspection_checklist": {},
-        }
-
-        # ── Bingsu Recipes ──
-        try:
-            ws = self._get_ws("Bingsu Recipes")
-            if ws:
-                values = ws.get_all_values()
-                for row in values[1:]:
-                    if not row or not row[0]:
-                        continue
-                    flavor = row[0].strip()
-                    batch_size = (row[1] if len(row) > 1 else "").strip()
-                    ingredient = (row[2] if len(row) > 2 else "").strip()
-                    qty = (row[3] if len(row) > 3 else "").strip()
-                    if not flavor or not batch_size or not ingredient:
-                        continue
-                    result["bingsu_recipes"].setdefault(flavor, {}).setdefault(batch_size, {})[ingredient] = qty
-        except Exception as e:
-            logger.error(f"read_sop_from_sheets (Bingsu Recipes): {e}")
-
-        # ── Other Recipes (Foam / Topping / Drink) ──
-        try:
-            ws = self._get_ws("Other Recipes")
-            if ws:
-                values = ws.get_all_values()
-                # Preserve method for topping steps grouped by name (ordered)
-                topping_methods = {}  # name -> list of (step_num, text)
-                topping_ingredients = {}  # name -> ingredients str
-
-                for row in values[1:]:
-                    if not row or not row[0]:
-                        continue
-                    rtype = row[0].strip()
-                    name = (row[1] if len(row) > 1 else "").strip()
-                    category = (row[2] if len(row) > 2 else "").strip()
-                    ingredient = (row[3] if len(row) > 3 else "").strip()
-                    qty = (row[4] if len(row) > 4 else "").strip()
-                    method = (row[5] if len(row) > 5 else "").strip()
-                    step_num = (row[6] if len(row) > 6 else "").strip()
-                    step_text = (row[7] if len(row) > 7 else "").strip()
-
-                    if not name:
-                        continue
-
-                    if rtype == "Foam":
-                        entry = result["foam_recipes"].setdefault(name, {"ingredients": {}, "method": method})
-                        if ingredient:
-                            entry["ingredients"][ingredient] = qty
-                        if method:
-                            entry["method"] = method
-
-                    elif rtype == "Topping":
-                        if ingredient:
-                            topping_ingredients[name] = ingredient
-                        if step_text:
-                            try:
-                                sn = int(step_num) if step_num else len(topping_methods.get(name, [])) + 1
-                            except ValueError:
-                                sn = len(topping_methods.get(name, [])) + 1
-                            topping_methods.setdefault(name, []).append((sn, step_text))
-
-                    elif rtype == "Drink":
-                        cat_dict = result["drinks_recipes"].setdefault(category, {})
-                        entry = cat_dict.setdefault(name, {"ingredients": {}, "method": method})
-                        if ingredient:
-                            entry["ingredients"][ingredient] = qty
-                        if method:
-                            entry["method"] = method
-
-                # Build topping_recipes from accumulated steps/ingredients,
-                # preserving the order names were first seen in the sheet.
-                all_topping_names = list(dict.fromkeys(
-                    list(topping_ingredients.keys()) + list(topping_methods.keys())
-                ))
-                for name in all_topping_names:
-                    entry = {}
-                    if name in topping_ingredients:
-                        entry["ingredients"] = topping_ingredients[name]
-                    steps = sorted(topping_methods.get(name, []), key=lambda x: x[0])
-                    entry["method"] = [text for _, text in steps]
-                    result["topping_recipes"][name] = entry
-        except Exception as e:
-            logger.error(f"read_sop_from_sheets (Other Recipes): {e}")
-
-        # ── Stock Minimums ──
-        try:
-            result["stock_minimums"] = self.read_stock_minimums_from_sheet()
-        except Exception as e:
-            logger.error(f"read_sop_from_sheets (Stock Minimums): {e}")
-
-        # ── Checklists ──
-        try:
-            ws = self._get_ws("Checklists")
-            if ws:
-                values = ws.get_all_values()
-                grouped = {}  # checklist -> list of (step_num, task)
-                for row in values[1:]:
-                    if not row or not row[0]:
-                        continue
-                    checklist = row[0].strip()
-                    step_num = (row[1] if len(row) > 1 else "").strip()
-                    task = (row[2] if len(row) > 2 else "").strip()
-                    if not task:
-                        continue
-                    try:
-                        sn = int(step_num) if step_num else len(grouped.get(checklist, [])) + 1
-                    except ValueError:
-                        sn = len(grouped.get(checklist, [])) + 1
-                    grouped.setdefault(checklist, []).append((sn, task))
-                for checklist, items in grouped.items():
-                    items.sort(key=lambda x: x[0])
-                    result["ops_checklists"][checklist] = [t for _, t in items]
-        except Exception as e:
-            logger.error(f"read_sop_from_sheets (Checklists): {e}")
-
-        # ── Inspection ──
-        try:
-            ws = self._get_ws("Inspection")
-            if ws:
-                values = ws.get_all_values()
-                for row in values[1:]:
-                    if not row or not row[0]:
-                        continue
-                    section = row[0].strip()
-                    item = (row[1] if len(row) > 1 else "").strip()
-                    if not item:
-                        continue
-                    result["inspection_checklist"].setdefault(section, []).append(item)
-        except Exception as e:
-            logger.error(f"read_sop_from_sheets (Inspection): {e}")
-
-        return result
-
-    def read_stock_minimums_from_sheet(self) -> dict:
-        """Convenience method: read just the Stock Minimums tab and return
-        {item: {"min": int, "unit": str, "location": str}}."""
-        stock_minimums = {}
-        try:
-            ws = self._get_ws("Stock Minimums")
-            if not ws:
-                return stock_minimums
-            values = ws.get_all_values()
-            for row in values[1:]:
-                if not row or not row[0]:
-                    continue
-                item = row[0].strip()
-                min_str = (row[1] if len(row) > 1 else "").strip()
-                unit = (row[2] if len(row) > 2 else "").strip()
-                location = (row[3] if len(row) > 3 else "").strip()
-                if not item:
-                    continue
-                try:
-                    min_val = int(float(min_str)) if min_str else 0
-                except (ValueError, TypeError):
-                    min_val = 0
-                info = {"min": min_val, "location": location}
-                if unit:
-                    info["unit"] = unit
-                stock_minimums[item] = info
-        except Exception as e:
-            logger.error(f"read_stock_minimums_from_sheet: {e}")
-        return stock_minimums
-
-    def _fuzzy_tab_name(self, tab_name: str):
-        """Resolve a tab name even if the AI gets it slightly wrong.
-        Tries: exact → case-insensitive → startswith → substring."""
-        if not self.spreadsheet:
-            return tab_name
-        try:
-            all_tabs = [ws.title for ws in self.spreadsheet.worksheets()]
-        except Exception:
-            return tab_name
-        # Exact match
-        if tab_name in all_tabs:
-            return tab_name
-        # Case-insensitive
-        lower = tab_name.lower()
-        for t in all_tabs:
-            if t.lower() == lower:
-                return t
-        # Startswith (e.g. "Stock Minimum" → "Stock Minimums")
-        for t in all_tabs:
-            if t.lower().startswith(lower) or lower.startswith(t.lower()):
-                return t
-        # Substring
-        for t in all_tabs:
-            if lower in t.lower() or t.lower() in lower:
-                return t
-        return tab_name
-
-    def read_any_tab(self, tab_name: str, max_rows: int = 50) -> dict:
-        """Read any worksheet tab dynamically. Returns headers + rows."""
-        try:
-            tab_name = self._fuzzy_tab_name(tab_name)
-            ws = self._get_ws(tab_name)
-            if not ws:
-                return {}
-            values = ws.get_all_values()
-            if not values:
-                return {}
-            headers = values[0]
-            data_rows = values[1:]
-            # Filter out month separator rows (═══ Month Year ═══)
-            data_rows = [r for r in data_rows if not (r and str(r[0]).strip().startswith("═══"))]
-            total = len(data_rows)
-            # Return last max_rows to keep recent data
-            if len(data_rows) > max_rows:
-                data_rows = data_rows[-max_rows:]
-            rows = []
-            for row in data_rows:
-                row_dict = {}
-                for i, h in enumerate(headers):
-                    row_dict[h] = row[i] if i < len(row) else ""
-                rows.append(row_dict)
-            return {"headers": headers, "rows": rows, "total_rows": total}
-        except Exception as e:
-            logger.error(f"read_any_tab({tab_name}): {e}")
-            return {}
-
-    @staticmethod
-    def _fuzzy_col_match(data: dict, headers: list) -> dict:
-        """Match data keys to actual headers using fuzzy logic.
-        E.g. 'Minimum' → 'Min', 'Amount' → 'Amount (RM)'."""
-        matched = {}
-        header_lower = {h.lower(): h for h in headers}
-        for key, val in data.items():
-            if key in headers:
-                matched[key] = val
-            elif key.lower() in header_lower:
-                matched[header_lower[key.lower()]] = val
+                value = clean_name(raw_value)
+            edits.append({"op": "item", "n": int(m.group(1)), "field": field, "value": value})
+            continue
+        m = re.match(r"^paid\s*(?:by)?\s*[:=]?\s*(.+)$", low)
+        if m:
+            edits.append({"op": "set", "field": "paid_by", "value": clean_name(p[len(p) - len(m.group(1)):])})
+            continue
+        m = re.match(r"^(date|shop|supplier|store|total|discount|rounding|tax|payment|pay)\s*[:=]?\s*(.+)$", low)
+        if m:
+            key = {"shop": "supplier", "store": "supplier", "pay": "payment"}.get(m.group(1), m.group(1))
+            raw_value = p[len(p) - len(m.group(2)):].strip()
+            if key == "date":
+                value = parse_date(raw_value)
+            elif key in ("total", "discount", "rounding", "tax"):
+                value = to_number(raw_value)
+                if value is not None and key == "discount":
+                    value = abs(value)
+            elif key == "payment":
+                value = raw_value.lower()
             else:
-                # Substring: 'Minimum' matches 'Min', 'Amount' matches 'Amount (RM)'
-                kl = key.lower()
-                for h in headers:
-                    hl = h.lower()
-                    if kl in hl or hl in kl:
-                        matched[h] = val
-                        break
-        return matched
-
-    def append_row_to_tab(self, tab_name: str, data: dict) -> bool:
-        """Append a row to any worksheet tab. Fuzzy-matches data keys to headers."""
-        try:
-            tab_name = self._fuzzy_tab_name(tab_name)
-            ws = self._get_ws(tab_name)
-            if not ws:
-                return False
-            headers = ws.row_values(1)
-            if not headers:
-                return False
-            data = self._fuzzy_col_match(data, headers)
-            row_values = []
-            for h in headers:
-                row_values.append(str(data.get(h, "")))
-            ws.append_row(row_values, value_input_option='USER_ENTERED')
-            return True
-        except Exception as e:
-            logger.error(f"append_row_to_tab({tab_name}): {e}")
-            return False
-
-    def update_row_in_tab(self, tab_name: str, match_col: str, match_val: str, data: dict) -> str:
-        """Find a row where match_col == match_val and update it with data.
-        Returns: 'updated', 'not_found', or 'error'."""
-        try:
-            tab_name = self._fuzzy_tab_name(tab_name)
-            ws = self._get_ws(tab_name)
-            if not ws:
-                return "error"
-            headers = ws.row_values(1)
-            if not headers:
-                return "error"
-            # Fuzzy match the match_col name
-            resolved = self._fuzzy_col_match({match_col: ""}, headers)
-            if resolved:
-                match_col = list(resolved.keys())[0]
-            if match_col not in headers:
-                return "error"
-            col_idx = headers.index(match_col)
-            all_values = ws.get_all_values()
-            target_row = None
-            match_lower = match_val.strip().lower()
-            for i, row in enumerate(all_values[1:], start=2):  # row 2 onwards
-                cell_val = row[col_idx].strip().lower() if col_idx < len(row) else ""
-                if cell_val == match_lower:
-                    target_row = i
-                    break
-            if not target_row:
-                return "not_found"
-            # Fuzzy match data keys to actual headers, then build cell updates
-            data = self._fuzzy_col_match(data, headers)
-            cells_to_update = []
-            for key, val in data.items():
-                c = headers.index(key) + 1  # 1-indexed
-                cells_to_update.append(gspread.Cell(target_row, c, str(val)))
-            if cells_to_update:
-                ws.update_cells(cells_to_update, value_input_option='USER_ENTERED')
-            return "updated"
-        except Exception as e:
-            logger.error(f"update_row_in_tab({tab_name}): {e}")
-            return "error"
-
-
-# ═══════════════════════════════════════════════════════════
-#  LOCAL JSON STORE (with Sheets sync)
-# ═══════════════════════════════════════════════════════════
-
-class LocalJsonStore:
-    """JSON file storage — Google Sheets is the source of truth.
-    JSON is a fast local cache. On startup, Sheet data overwrites JSON.
-    Bot writes go to JSON first, then sync to Sheet."""
-
-    def __init__(self):
-        self.file = DATA_DIR / "cafe_data.json"
-        self.data = self._load()
-
-        # One-time cleanup: action_items system deprecated in favor of pending_tasks.
-        # Clear any accumulated junk from previous versions.
-        if self.data.get("action_items"):
-            logger.info(f"Purging {len(self.data['action_items'])} stale action_items (deprecated system)")
-            self.data["action_items"] = []
-            self._save_local_only()
-
-        self._sheets = None
-        self._pending_syncs = set()   # Collect changed categories
-        self._sync_timer = None       # Debounce timer
-        self._sync_lock = threading.Lock()
-        self._refresh_timer = None    # Periodic Sheet → JSON refresh
-        self._pending_stock_writes = []
-        self._pending_stock_writes = list(self.data.get("pending_stock_writes", []))
-
-        # Initialize Sheets sync
-        if HAS_GSPREAD:
-            try:
-                self._sheets = SheetsSync()
-                if self._sheets.spreadsheet:
-                    logger.info("Google Sheets sync enabled — code version 2024-09-04-v2 (no ws.clear)")
-                    # Read from Sheet (Sheet is source of truth)
-                    self._refresh_from_sheet()
-                    # Backfill current stock to sheet for items missing it
-                    self._backfill_current_stock_to_sheet()
-                    # Start periodic refresh (every 10 min)
-                    self._start_periodic_refresh()
-                else:
-                    self._sheets = None
-            except Exception as e:
-                logger.error(f"Sheets sync init failed: {e}")
-                self._sheets = None
-
-    def _refresh_from_sheet(self):
-        """Read Sheet → update local JSON cache. Sheet wins all conflicts."""
-        if not self._sheets:
-            return
-        try:
-            # Drain pending stock writes before refreshing (so sheet has our latest values)
-            if hasattr(self, '_pending_stock_writes') and self._pending_stock_writes:
-                pending = self._pending_stock_writes[:]
-                self._pending_stock_writes = []
-                for pw in pending:
-                    try:
-                        ok = self._sheets.write_stock_item(pw["item"], pw["qty"], pw["date"])
-                        if not ok:
-                            self._pending_stock_writes.append(pw)
-                            logger.warning(f"Pending stock write still failing: {pw['item']}={pw['qty']}")
-                        else:
-                            logger.info(f"Pending stock write succeeded: {pw['item']}={pw['qty']}")
-                    except Exception as e:
-                        self._pending_stock_writes.append(pw)
-                        logger.error(f"Pending stock write retry failed: {pw['item']}: {e}")
-                self.data["pending_stock_writes"] = self._pending_stock_writes
-                _time.sleep(1)  # Brief pause after retries before reading
-
-            # Stock
-            stock, history, stock_current = self._sheets.read_stock_from_sheet()
-            if stock is not None:
-                self.data["stock"] = stock
-            if history is not None:
-                self.data["stock_history"] = history
-            if stock_current is not None:
-                self.data["stock_current"] = stock_current
-
-            # Column B is source of truth — no backfill from date columns
-
-            _time.sleep(0.5)  # Small gap to avoid rate limit
-
-            # Shopping List
-            shopping = self._sheets.read_shopping_from_sheet()
-            if shopping is not None:
-                self.data["shopping_list"] = shopping
-
-            _time.sleep(0.5)
-
-            # Events
-            events = self._sheets.read_events_from_sheet()
-            if events is not None:
-                self.data["events"] = events
-
-            # Save updated cache to JSON (don't trigger sync back)
-            self._save_local_only()
-            logger.info("Sheet → JSON refresh complete (Sheet is source of truth)")
-
-            # Auto-update shopping list based on new stock levels
-            self._rebuild_shopping_list()
-
-        except Exception as e:
-            logger.error(f"Error refreshing from Sheet: {e}")
-
-    def refresh_if_stale(self, cooldown: int = 60) -> bool:
-        """Refresh from sheet if last refresh was more than `cooldown` seconds ago.
-        Returns True if a refresh was performed."""
-        import time as _t
-        now = _t.time()
-        if not hasattr(self, '_last_refresh_time'):
-            self._last_refresh_time = 0
-        if now - self._last_refresh_time < cooldown:
-            return False
-        self._last_refresh_time = now
-        self._refresh_from_sheet()
-        return True
-
-    def quick_refresh_stock(self):
-        """Fast stock-only refresh — reads just the Stock tab (no sleep, no other tabs).
-        Use this when bot gets tagged so it always has live stock data."""
-        if not self._sheets:
-            return
-        try:
-            stock, history, stock_current = self._sheets.read_stock_from_sheet()
-            if stock is not None:
-                self.data["stock"] = stock
-            if stock_current is not None:
-                self.data["stock_current"] = stock_current
-            # Don't save to JSON or rebuild shopping — keep it fast
-            logger.info(f"Quick stock refresh: {len(stock_current or {})} items")
-        except Exception as e:
-            logger.error(f"Quick stock refresh error: {e}")
-
-    def _atomic_write_json(self):
-        """Write self.data to self.file atomically: dump to a .tmp file, back up
-        the existing file (at most once per 60s), then os.replace() into place."""
-        if self.file.exists():
-            now = _time.time()
-            last_bak = getattr(self, "_last_bak", 0)
-            if now - last_bak >= 60:
-                try:
-                    shutil.copyfile(self.file, str(self.file) + ".bak")
-                    self._last_bak = now
-                except OSError as e:
-                    logger.error(f"Failed to write .bak backup: {e}")
-        tmp_path = str(self.file) + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(self.data, f, indent=2, default=str)
-        os.replace(tmp_path, self.file)
-
-    def _save_local_only(self):
-        """Save to JSON file WITHOUT triggering sync to Sheets."""
-        self._atomic_write_json()
-
-    def _start_periodic_refresh(self):
-        """Refresh from Sheet every 10 minutes to pick up manual edits."""
-        def _do_refresh():
-            try:
-                self._refresh_from_sheet()
-            except Exception as e:
-                logger.error(f"Periodic sheet refresh error: {e}")
-            finally:
-                # Schedule next refresh
-                self._refresh_timer = threading.Timer(300, _do_refresh)
-                self._refresh_timer.daemon = True
-                self._refresh_timer.start()
-
-        self._refresh_timer = threading.Timer(300, _do_refresh)
-        self._refresh_timer.daemon = True
-        self._refresh_timer.start()
-        logger.info("Periodic Sheet refresh scheduled (every 5 min)")
-
-    def _load(self) -> dict:
-        if self.file.exists():
-            try:
-                with open(self.file, "r") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                logger.error(f"cafe_data.json corrupt — restoring from .bak: {e}")
-                bak_path = Path(str(self.file) + ".bak")
-                if bak_path.exists():
-                    try:
-                        with open(bak_path, "r") as f:
-                            data = json.load(f)
-                    except (json.JSONDecodeError, OSError) as e2:
-                        logger.error(f"cafe_data.json.bak also corrupt/unreadable: {e2}")
-                        return self._default_data()
-                else:
-                    return self._default_data()
-            self._cleanup_ok_values(data)
-            return data
-        return self._default_data()
-
-    @staticmethod
-    def _cleanup_ok_values(data: dict):
-        """Remove any legacy 'OK' qty values from stock and stock_history."""
-        # Clean stock dict
-        stock = data.get("stock", {})
-        bad_keys = [k for k, v in stock.items()
-                    if str(v.get("qty", "")).upper() == "OK"]
-        for k in bad_keys:
-            del stock[k]
-            logger.info(f"Cleaned 'OK' stock entry: {k}")
-
-        # Clean stock_history
-        history = data.get("stock_history", {})
-        for date_str in list(history.keys()):
-            items = history[date_str]
-            bad = [k for k, v in items.items() if str(v).upper() == "OK"]
-            for k in bad:
-                del items[k]
-                logger.info(f"Cleaned 'OK' history entry: {date_str}/{k}")
-            if not items:
-                del history[date_str]
-
-    def _save(self, changed: str = "all"):
-        self._atomic_write_json()
-        # Sync to Sheets in background thread (non-blocking)
-        if self._sheets:
-            self._sync_to_sheets_bg(changed)
-
-    def _sync_to_sheets_bg(self, changed: str):
-        """Debounced sync — waits 5s for more changes, then syncs all at once."""
-        if changed == "all":
-            # Full sync runs immediately in background (with delays between worksheets)
-            def _do_full():
-                try:
-                    self._sheets.sync_all(self.data)
-                    logger.info("Sheets sync: initial full sync complete")
-                except Exception as e:
-                    logger.error(f"Background sheets full sync error: {e}")
-            thread = threading.Thread(target=_do_full, daemon=True)
-            thread.start()
-            return
-
-        # Debounced sync: collect changes, wait 5s, then sync batch
-        with self._sync_lock:
-            self._pending_syncs.add(changed)
-            # Cancel existing timer
-            if self._sync_timer:
-                self._sync_timer.cancel()
-            # Start new 5s timer
-            self._sync_timer = threading.Timer(5.0, self._flush_syncs)
-            self._sync_timer.daemon = True
-            self._sync_timer.start()
-
-    def _flush_syncs(self):
-        """Actually run the pending syncs after debounce delay."""
-        with self._sync_lock:
-            pending = self._pending_syncs.copy()
-            self._pending_syncs.clear()
-            self._sync_timer = None
-
-        if not pending:
-            return
-
-        sync_map = {
-            "stock": lambda: self._sheets.sync_stock(self.data.get("stock", {}), self.data.get("stock_history", {}), self.data.get("stock_current", {})),
-            "shopping": lambda: self._sheets.sync_shopping(self.data.get("shopping_list", [])),
-            "events": lambda: self._sheets.sync_events(self.data.get("events", [])),
-        }
-
-        def _do_batch():
-            for key in pending:
-                fn = sync_map.get(key)
-                if fn:
-                    try:
-                        fn()
-                        logger.info(f"Sheets synced: {key}")
-                        _time.sleep(2)  # 2s gap between worksheets
-                    except Exception as e:
-                        logger.error(f"Sheets sync error ({key}): {e}")
-
-        thread = threading.Thread(target=_do_batch, daemon=True)
-        thread.start()
-
-    def _default_data(self) -> dict:
-        return {
-            "stock": {},
-            "cleaning_log": [],
-            "checklist_log": [],
-            "shifts": {},
-            "hours": {},
-            "holiday_hours": {},
-            "events": [],
-            "shopping_list": [],
-            "content_log": [],
-            "content_calendar": [],
-            "staff": {},
-            "daily_reports": [],
-            "settings": {},
-            "action_items": [],
-            "custom_instructions": [],
-            "stock_history": {},  # {date_str: {item: qty, ...}}
-            "stock_current": {},        # {item_name: int} — running current stock count
-            "last_full_count": {},      # {item_name: {"qty": int, "date": "YYYY-MM-DD"}}
-            "oneoff_items": {},         # For Phase 7 later
-            "receipt_hashes": {},       # {hash_key: {supplier, date, total, item_count, recorded_by, recorded_at}}
-            "receipt_corrections": {},  # {normalized_or_exact_old_name: preferred_new_name}
-        }
-
-    # ─── Stock ──────────────────────────────────────────────
-    def get_stock(self) -> dict:
-        return self.data.get("stock", {})
-
-    def _find_existing_stock_name(self, new_name: str) -> str:
-        """Find an existing stock item that matches by normalized name or alias.
-        Returns the existing key if found, otherwise the new_name."""
-        new_norm = normalize_item_name(new_name)
-        # Exact (case-insensitive) match wins before any normalisation,
-        # so size variants like "X 1L" vs "X 500ml" never cross-resolve.
-        new_lower = new_name.strip().lower()
-        for existing in self.data.get("stock", {}):
-            if existing.strip().lower() == new_lower:
-                return existing
-        for existing in self.data.get("stock_current", {}):
-            if existing.strip().lower() == new_lower:
-                return existing
-        # Check direct normalized match first
-        for existing in self.data.get("stock", {}):
-            if normalize_item_name(existing) == new_norm:
-                return existing
-        # Also check stock_current keys
-        for existing in self.data.get("stock_current", {}):
-            if normalize_item_name(existing) == new_norm:
-                return existing
-        # Check alias store
-        alias_store = get_alias_store()
-        canonical = alias_store.resolve(new_name)
-        if canonical != new_name:
-            # Found an alias — check if canonical exists in stock
-            for existing in self.data.get("stock", {}):
-                if normalize_item_name(existing) == normalize_item_name(canonical):
-                    return existing
-        # Fuzzy fallback: word-level prefix match (handles AI truncation like "CRU" → "CRUNCH")
-        new_words = new_norm.split()
-        if len(new_words) >= 2:
-            for existing in self.data.get("stock", {}):
-                existing_norm = normalize_item_name(existing)
-                existing_words = existing_norm.split()
-                if len(existing_words) >= 2 and _words_prefix_match(new_words, existing_words):
-                    return existing
-        # Substring fallback: "coconut milk" matches "coconut milk 400ml" and vice versa
-        if len(new_norm) >= 4:  # avoid matching very short strings
-            for existing in self.data.get("stock", {}):
-                existing_norm = normalize_item_name(existing)
-                if len(existing_norm) >= 4 and (new_norm in existing_norm or existing_norm in new_norm):
-                    return existing
-            for existing in self.data.get("stock_current", {}):
-                existing_norm = normalize_item_name(existing)
-                if len(existing_norm) >= 4 and (new_norm in existing_norm or existing_norm in new_norm):
-                    return existing
-        return new_name
-
-    def _queue_stock_write(self, item, qty, date):
-        """Queue a failed sheet write for retry. Replaces any older queued write for the same item so a stale value can never overwrite a newer one."""
-        self._pending_stock_writes = [pw for pw in self._pending_stock_writes if pw.get("item") != item]
-        self._pending_stock_writes.append({"item": item, "qty": qty, "date": date})
-        self.data["pending_stock_writes"] = self._pending_stock_writes
-        self._save_local_only()
-
-    def _drop_queued_write(self, item):
-        """A direct write for this item just succeeded — drop any stale queued retry."""
-        before = len(self._pending_stock_writes)
-        self._pending_stock_writes = [pw for pw in self._pending_stock_writes if pw.get("item") != item]
-        if len(self._pending_stock_writes) != before:
-            self.data["pending_stock_writes"] = self._pending_stock_writes
-            self._save_local_only()
-
-    def update_stock(self, item: str, qty: str, updated_by: str):
-        # Deduplicate first so we can inspect current qty for the canonical name
-        item = self._find_existing_stock_name(item)
-        # Sanitize word-based qty values to numbers
-        qty_upper = str(qty).strip().upper()
-        if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
-            qty = "0"
-        elif qty_upper in ("OK", "YES", "ADA", "LOW"):
-            # SCHEMA VIOLATION: the AI is only supposed to emit a number or "OUT".
-            # If we see status words here, the AI ignored its prompt. Safety net:
-            # never clobber a real count. Log ERROR so we notice slippage.
-            current = self.data.get("stock_current", {}).get(item)
-            try:
-                current_n = int(current) if current is not None else None
-            except (ValueError, TypeError):
-                current_n = None
-            logger.error(
-                f"update_stock SCHEMA VIOLATION: AI sent qty='{qty_upper}' for {item} "
-                f"(current={current_n}). Skipping write. AI should ask user for a number instead."
-            )
-            if current_n is not None and current_n > 0:
-                return True  # preserve the real count; not a failure
-            # No count yet — fall back to conservative default
-            qty = "1" if qty_upper in ("OK", "YES", "ADA") else "0"
-        today = _now().strftime("%d/%m/%y")
-
-        # 1. Write to Sheet FIRST (source of truth)
-        sheet_ok = True
-        if self._sheets:
-            try:
-                sheet_ok = self._sheets.write_stock_item(item, qty, today)
-                if not sheet_ok:
-                    sheet_ok = False
-            except Exception as e:
-                logger.error(f"Direct sheet write failed (stock): {e}")
-                sheet_ok = False
-
-        # 2. Update local JSON cache
-        self.data["stock"][item] = {
-            "qty": qty,
-            "updated_by": updated_by,
-            "updated_at": _fmt_ts(),
-        }
-        if "stock_history" not in self.data:
-            self.data["stock_history"] = {}
-        if today not in self.data["stock_history"]:
-            self.data["stock_history"][today] = {}
-        self.data["stock_history"][today][item] = qty
-
-        # Keep stock_current in sync
-        if "stock_current" not in self.data:
-            self.data["stock_current"] = {}
-        try:
-            self.data["stock_current"][item] = int(qty)
-        except (ValueError, TypeError):
-            pass
-
-        self._sync_current_stock_to_sheet(item)
-        self._save_local_only()
-        self._rebuild_shopping_list()
-
-        if not sheet_ok:
-            self._queue_stock_write(item, qty, today)
-            logger.warning(f"Queued pending stock write: {item}={qty} (sheet write failed)")
-        else:
-            self._drop_queued_write(item)
-        return sheet_ok
-
-    def remove_stock(self, item: str) -> bool:
-        """Remove a stock item from Sheet + JSON cache. Returns True if found."""
-        norm = normalize_item_name(item)
-        removed = False
-
-        # 1. Remove from Sheet FIRST
-        if self._sheets:
-            try:
-                self._sheets.remove_stock_item(item)
-            except Exception as e:
-                logger.error(f"Sheet remove failed (stock): {e}")
-
-        # 2. Remove from JSON cache
-        to_del = [k for k in self.data.get("stock", {})
-                  if normalize_item_name(k) == norm]
-        for k in to_del:
-            del self.data["stock"][k]
-            removed = True
-
-        for date_str in list(self.data.get("stock_history", {}).keys()):
-            items_on_date = self.data["stock_history"][date_str]
-            to_del = [k for k in items_on_date if normalize_item_name(k) == norm]
-            for k in to_del:
-                del items_on_date[k]
-                removed = True
-            if not items_on_date:
-                del self.data["stock_history"][date_str]
-
-        # Also clear from stock_current and last_full_count
-        to_del_current = [k for k in self.data.get("stock_current", {})
-                          if normalize_item_name(k) == norm]
-        for k in to_del_current:
-            del self.data["stock_current"][k]
-            removed = True
-
-        to_del_lfc = [k for k in self.data.get("last_full_count", {})
-                      if normalize_item_name(k) == norm]
-        for k in to_del_lfc:
-            del self.data["last_full_count"][k]
-
-        if removed:
-            self._save_local_only()
-            self._rebuild_shopping_list()
-            logger.info(f"Removed stock item: {item}")
-        return removed
-
-    def check_duplicate_receipt(self, supplier: str, receipt_date: str, total: float, items: list) -> dict | None:
-        """Check if a receipt with same supplier+date+total+items was already logged.
-        Returns the existing receipt info dict if duplicate found, None otherwise."""
-        key = self._receipt_hash_key(supplier, receipt_date, total, items)
-        hashes = self.data.get("receipt_hashes", {})
-        return hashes.get(key)
-
-    def record_receipt_hash(self, supplier: str, receipt_date: str, total: float, items: list, recorded_by: str = ""):
-        """Record a receipt's hash after successful save."""
-        key = self._receipt_hash_key(supplier, receipt_date, total, items)
-        if "receipt_hashes" not in self.data:
-            self.data["receipt_hashes"] = {}
-        self.data["receipt_hashes"][key] = {
-            "supplier": supplier,
-            "date": receipt_date,
-            "total": total,
-            "item_count": len(items),
-            "recorded_by": recorded_by,
-            "recorded_at": _now().strftime("%d/%m/%y-%H%M"),
-        }
-        self._save_local_only()
-
-    def _receipt_hash_key(self, supplier: str, receipt_date: str, total: float, items: list) -> str:
-        """Generate a hash key for duplicate detection.
-        Uses supplier + normalized date only (total excluded — user edits change it)."""
-        import hashlib
-        from google_integration import _normalize_date
-        norm_supplier = normalize_item_name(supplier)
-        norm_date = _normalize_date(receipt_date)
-        raw = f"{norm_supplier}|{norm_date}"
-        return hashlib.md5(raw.encode()).hexdigest()[:16]
-
-    def record_oneoff_item(self, item: str):
-        """Record an item as one-off purchase (not tracked in regular stock)."""
-        if "oneoff_items" not in self.data:
-            self.data["oneoff_items"] = {}
-        norm = normalize_item_name(item)
-        now_str = _fmt_ts()
-        if norm in self.data["oneoff_items"]:
-            self.data["oneoff_items"][norm]["count"] = self.data["oneoff_items"][norm].get("count", 0) + 1
-            self.data["oneoff_items"][norm]["last_purchased"] = now_str
-            self.data["oneoff_items"][norm]["display_name"] = item
-        else:
-            self.data["oneoff_items"][norm] = {
-                "display_name": item,
-                "count": 1,
-                "first_purchased": now_str,
-                "last_purchased": now_str,
-            }
-        self._save_local_only()
-
-    def save_receipt_correction(self, old_name: str, new_name: str):
-        """Save a receipt item name correction for future auto-apply.
-        Stored as normalized_old → preferred_new_name."""
-        if "receipt_corrections" not in self.data:
-            self.data["receipt_corrections"] = {}
-        # Normalize the old name for fuzzy matching
-        norm_old = normalize_item_name(old_name)
-        if not norm_old or not new_name.strip():
-            return
-        self.data["receipt_corrections"][norm_old] = new_name.strip()
-        # Also store exact lowercase for direct match
-        exact_old = old_name.strip().lower()
-        if exact_old != norm_old:
-            self.data["receipt_corrections"][exact_old] = new_name.strip()
-        self._save_local_only()
-
-    def apply_receipt_corrections(self, items: list) -> list:
-        """Auto-apply saved corrections to receipt item names.
-        Returns the items list (modified in place) and a list of corrections made."""
-        corrections = self.data.get("receipt_corrections", {})
-        if not corrections:
-            return []
-        applied = []
-        for item in items:
-            name = item.get("name", "")
-            if not name:
-                continue
-            # Try exact lowercase match first
-            exact_key = name.strip().lower()
-            if exact_key in corrections:
-                old = name
-                item["name"] = corrections[exact_key]
-                applied.append((old, item["name"]))
-                continue
-            # Try normalized match
-            norm_key = normalize_item_name(name)
-            if norm_key in corrections:
-                old = name
-                item["name"] = corrections[norm_key]
-                applied.append((old, item["name"]))
-        return applied
-
-    def clear_receipt_corrections(self):
-        """Clear all saved receipt corrections."""
-        self.data["receipt_corrections"] = {}
-        self._save_local_only()
-
-    def get_receipt_corrections(self) -> dict:
-        """Return the current receipt corrections dictionary."""
-        return dict(self.data.get("receipt_corrections", {}))
-
-    def remove_receipt_correction(self, key: str):
-        """Remove a single receipt correction by key."""
-        corrections = self.data.get("receipt_corrections", {})
-        # Try exact key, then lowercase
-        removed = corrections.pop(key, None)
-        if removed is None:
-            corrections.pop(key.lower(), None)
-        self._save_local_only()
-
-    def is_known_oneoff(self, item: str) -> bool:
-        """Check if item was previously marked as one-off."""
-        norm = normalize_item_name(item)
-        return norm in self.data.get("oneoff_items", {})
-
-    def get_frequent_oneoffs(self, threshold: int = 3) -> list:
-        """Get one-off items bought >= threshold times — candidates for promotion to regular."""
-        result = []
-        for norm, info in self.data.get("oneoff_items", {}).items():
-            if info.get("count", 0) >= threshold:
-                result.append({
-                    "item": info.get("display_name", norm),
-                    "count": info["count"],
-                    "first": info.get("first_purchased", ""),
-                    "last": info.get("last_purchased", ""),
-                })
-        return result
-
-    def promote_oneoff_to_regular(self, item: str) -> bool:
-        """Remove item from oneoff_items (it stays in stock as regular)."""
-        norm = normalize_item_name(item)
-        if norm in self.data.get("oneoff_items", {}):
-            del self.data["oneoff_items"][norm]
-            self._save_local_only()
-            return True
-        return False
-
-    def update_stock_bulk(self, items: list, stock_date: str = None):
-        """Update multiple stock items under a specific date.
-        Uses batch_update for efficiency — one API call instead of per-item."""
-        if not stock_date:
-            stock_date = _now().strftime("%d/%m/%y")
-
-        if "stock_history" not in self.data:
-            self.data["stock_history"] = {}
-        if stock_date not in self.data["stock_history"]:
-            self.data["stock_history"][stock_date] = {}
-
-        # --- Sheet batch update ---
-        sheet_ok = True
-        sanitised = []
-        if self._sheets:
-            try:
-                ws = self._sheets._get_ws("Stock")
-                if ws:
-                    existing = ws.get_all_values()
-
-                    # If sheet is empty, create header
-                    if not existing or not existing[0]:
-                        ws.update("A1", [["Item", "Current Stock"]])
-                        ws.format("A1:B1", {"textFormat": {"bold": True}})
-                        existing = [["Item", "Current Stock"]]
-
-                    header = list(existing[0])
-
-                    # Ensure "Current Stock" occupies column B
-                    has_current_col = len(header) > 1 and header[1].strip() == "Current Stock"
-                    if not has_current_col:
-                        ws.insert_cols([[""]], col=2)
-                        ws.update_acell("B1", "Current Stock")
-                        existing = ws.get_all_values()
-                        header = list(existing[0]) if existing else []
-
-                    # Find or create date column
-                    if stock_date in header[2:]:
-                        col_idx = header.index(stock_date, 2)
-                    else:
-                        # Insert as column C (newest date first)
-                        col_idx = 2
-                        ws.insert_cols([[""]], col=3)
-                        ws.update_acell("C1", stock_date)
-                        existing = ws.get_all_values()
-                        header = list(existing[0]) if existing else []
-
-                    # Build lookup: normalized item name → sheet row index
-                    row_lookup = {}
-                    for i, row in enumerate(existing[1:], 1):
-                        if row and row[0].strip():
-                            norm = normalize_item_name(row[0])
-                            if norm not in row_lookup:
-                                row_lookup[norm] = i
-
-                    # Helper: find row by exact match first, then normalized, then substring
-                    def _find_row(item_name):
-                        # Exact match wins (case-insensitive) so "(Cook)" vs
-                        # "(Jelly)" don't collide when normalize_item_name strips
-                        # both parenthesised suffixes.
-                        def _strip_edges(s):
-                            return s.strip().rstrip(':;,. ').strip().lower()
-                        item_key = _strip_edges(item_name)
-                        for i, row in enumerate(existing[1:], 1):
-                            if row and _strip_edges(row[0]) == item_key:
-                                return i
-                        norm = normalize_item_name(item_name)
-                        if norm in row_lookup:
-                            return row_lookup[norm]
-                        if len(norm) >= 4:
-                            for existing_norm, idx in row_lookup.items():
-                                if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
-                                    return idx
-                        return None
-
-                    # Build batch updates
-                    cell_updates = {}
-                    unmatched = []  # Items not on the sheet yet
-
-                    for entry in items:
-                        item_name = entry.get("item", "")
-                        qty = entry.get("qty", "—")
-                        # Sanitize: AI sometimes sends words instead of numbers
-                        qty_upper = str(qty).strip().upper()
-                        if qty_upper in ("OUT", "OOS", "HABIS", "NONE", "NIL"):
-                            qty = 0
-                        elif qty_upper in ("OK", "YES", "ADA", "LOW"):
-                            # SCHEMA VIOLATION: bulk should only get numbers.
-                            # Log ERROR and skip the row rather than clobber.
-                            canonical = self._find_existing_stock_name(item_name)
-                            current = self.data.get("stock_current", {}).get(canonical)
-                            try:
-                                current_n = int(current) if current is not None else None
-                            except (ValueError, TypeError):
-                                current_n = None
-                            logger.error(
-                                f"update_stock_bulk SCHEMA VIOLATION: qty='{qty_upper}' for "
-                                f"{canonical} (current={current_n}). Skipping row."
-                            )
-                            if current_n is not None and current_n > 0:
-                                continue
-                            qty = 1 if qty_upper in ("OK", "YES", "ADA") else 0
-                        else:
-                            try:
-                                qty = int(float(str(qty)))
-                            except (ValueError, TypeError):
-                                pass  # Keep original string (e.g. "—") if not convertible
-                        if not item_name:
-                            continue
-                        sanitised.append((item_name, qty))
-                        row_idx = _find_row(item_name)
-                        if row_idx is not None:
-                            # Date column
-                            cell_updates[(row_idx + 1, col_idx + 1)] = qty
-                            # Current Stock column B
-                            try:
-                                cell_updates[(row_idx + 1, 2)] = int(qty)
-                            except (ValueError, TypeError):
-                                pass
-                        else:
-                            unmatched.append((item_name, qty))
-
-                    # Apply batch update
-                    if cell_updates:
-                        batch = []
-                        for (row, col), val in cell_updates.items():
-                            cell_label = gspread.utils.rowcol_to_a1(row, col)
-                            batch.append({"range": cell_label, "values": [[val]]})
-                        ws.batch_update(batch, value_input_option="RAW")
-
-                    # Append unmatched items (real-time user update — CAN add new rows)
-                    for item_name, qty in unmatched:
-                        new_row = [""] * len(header)
-                        new_row[0] = item_name
-                        new_row[col_idx] = qty
-                        try:
-                            new_row[1] = int(qty)  # Current Stock
-                        except (ValueError, TypeError):
-                            pass
-                        ws.append_row(new_row)
-
-                    ws.format("A1:Z1", {"textFormat": {"bold": True}})
-            except Exception as e:
-                logger.error(f"Sheet batch write failed (stock bulk): {e}")
-                sheet_ok = False
-                if sanitised:
-                    for item_name, qty in sanitised:
-                        if item_name:
-                            self._queue_stock_write(item_name, qty, stock_date)
-                else:
-                    for entry in items:
-                        item_name = entry.get("item", "")
-                        if item_name:
-                            self._queue_stock_write(item_name, entry.get("qty"), stock_date)
-
-        # --- Update JSON cache ---
-        for entry in items:
-            item_name = entry.get("item", "")
-            qty = entry.get("qty", "—")
-            if item_name:
-                self.data["stock"][item_name] = {
-                    "qty": qty,
-                    "updated_by": entry.get("checked_by", ""),
-                    "updated_at": _fmt_ts(),
-                }
-                self.data["stock_history"][stock_date][item_name] = qty
-
-                if "stock_current" not in self.data:
-                    self.data["stock_current"] = {}
-                try:
-                    self.data["stock_current"][item_name] = int(qty)
-                except (ValueError, TypeError):
-                    pass
-
-        self._save_local_only()
-        self._rebuild_shopping_list()
-
-        return sheet_ok
-
-    def add_receipt_to_stock(self, item: str, qty: int, receipt_date: str = None):
-        """Add received quantity to running current stock (from a receipt),
-        and also record the new total in stock_history under a date column
-        on the Stock sheet."""
-        item = self._find_existing_stock_name(clean_item_name(item))
-
-        if "stock_current" not in self.data:
-            self.data["stock_current"] = {}
-        try:
-            qty = int(qty)
-        except (ValueError, TypeError):
-            qty = 0
-
-        current = self.data["stock_current"].get(item, 0)
-        try:
-            current = int(current)
-        except (ValueError, TypeError):
-            current = 0
-        new_total = current + qty
-        self.data["stock_current"][item] = new_total
-
-        # Backward compat: update the stock dict with current qty
-        self.data["stock"][item] = {
-            "qty": str(new_total),
-            "updated_by": self.data.get("stock", {}).get(item, {}).get("updated_by", "Receipt"),
-            "updated_at": _fmt_ts(),
-        }
-
-        # Also record in stock_history + sheet date column
-        date_col = receipt_date or _now().strftime("%d/%m/%y")
-        if "stock_history" not in self.data:
-            self.data["stock_history"] = {}
-        if date_col not in self.data["stock_history"]:
-            self.data["stock_history"][date_col] = {}
-        self.data["stock_history"][date_col][item] = new_total
-
-        # Write to sheet date column
-        if self._sheets:
-            try:
-                self._sheets.write_stock_item(item, str(new_total), date_col)
-            except Exception as e:
-                logger.error(f"Direct sheet write failed (receipt_to_stock): {e}")
-
-        self._sync_current_stock_to_sheet(item)
-        self._save_local_only()
-        self._rebuild_shopping_list()
-
-    def full_stock_count(self, items: dict, counted_by: str):
-        """Record a full physical stock count.
-        items: {item_name: qty_int} from physical count.
-        Items not present carry forward their existing stock_current value."""
-        if "stock_current" not in self.data:
-            self.data["stock_current"] = {}
-        if "last_full_count" not in self.data:
-            self.data["last_full_count"] = {}
-        if "stock_history" not in self.data:
-            self.data["stock_history"] = {}
-
-        today_iso = _now().strftime("%Y-%m-%d")
-        today_sheet = _now().strftime("%d/%m/%y")
-
-        if today_sheet not in self.data["stock_history"]:
-            self.data["stock_history"][today_sheet] = {}
-
-        for item, qty in items.items():
-            item = self._find_existing_stock_name(item)
-            try:
-                qty = int(qty)
-            except (ValueError, TypeError):
-                continue
-
-            self.data["stock_current"][item] = qty
-            self.data["last_full_count"][item] = {"qty": qty, "date": today_iso}
-            self.data["stock_history"][today_sheet][item] = qty
-
-            # Backward compat
-            self.data["stock"][item] = {
-                "qty": str(qty),
-                "updated_by": counted_by,
-                "updated_at": _fmt_ts(),
-            }
-
-            # Write to Sheet
-            if self._sheets:
-                try:
-                    self._sheets.write_stock_item(item, str(qty), today_sheet)
-                except Exception as e:
-                    logger.error(f"Direct sheet write failed (full_stock_count): {e}")
-            self._sync_current_stock_to_sheet(item)
-
-        self._save_local_only()
-        self._rebuild_shopping_list()
-
-    def _backfill_current_stock_to_sheet(self):
-        """On startup, ensure all stock items have a Current Stock value on the sheet."""
-        if not self._sheets:
-            return
-        try:
-            stock_current = self.data.get("stock_current", {})
-            if not stock_current:
-                return
-            self._sync_current_stock_to_sheet()
-            logger.info(f"Backfilled Current Stock for {len(stock_current)} items")
-        except Exception as e:
-            logger.error(f"Current stock backfill error: {e}")
-
-    def _sync_current_stock_to_sheet(self, item: str = None):
-        """Update the Current Stock (column B) values on the Stock sheet.
-        If item is given, only that item's row is updated; otherwise all items.
-        Uses batch_update for efficiency."""
-        import time as _time
-        if not self._sheets:
-            return False
-        ws = self._sheets._get_ws("Stock")
-        if not ws:
-            return False
-
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            try:
-                existing = ws.get_all_values()
-                if not existing or not existing[0]:
-                    return False
-
-                header = existing[0]
-
-                # Ensure "Current Stock" is column B; insert it if missing
-                if len(header) < 2 or header[1] != "Current Stock":
-                    ws.insert_cols([[""]], col=2)
-                    ws.update_acell("B1", "Current Stock")
-                    existing = ws.get_all_values()
-                    header = existing[0] if existing else []
-
-                stock_current = self.data.get("stock_current", {})
-
-                if item is not None:
-                    items_to_sync = {item: stock_current.get(item, 0)}
-                else:
-                    items_to_sync = stock_current
-
-                # Build row lookup
-                row_lookup = {}
-                for i, row in enumerate(existing[1:], 1):
-                    if row and row[0].strip():
-                        norm = normalize_item_name(row[0])
-                        if norm not in row_lookup:
-                            row_lookup[norm] = i
-
-                # Build batch updates for column B
-                cell_updates = {}
-                for it, qty in items_to_sync.items():
-                    norm = normalize_item_name(it)
-                    row_idx = row_lookup.get(norm)
-
-                    # Substring fallback if exact match fails
-                    if row_idx is None and len(norm) >= 4:
-                        for existing_norm, idx in row_lookup.items():
-                            if len(existing_norm) >= 4 and (norm in existing_norm or existing_norm in norm):
-                                row_idx = idx
-                                break
-
-                    if row_idx is not None:
-                        cell_updates[(row_idx + 1, 2)] = qty
-                    # Sheet is master list — don't append items not already on it
-
-                # Apply batch update
-                if cell_updates:
-                    batch = []
-                    for (row, col), val in cell_updates.items():
-                        cell_label = gspread.utils.rowcol_to_a1(row, col)
-                        batch.append({"range": cell_label, "values": [[val]]})
-                    ws.batch_update(batch, value_input_option="RAW")
-
-                ws.format("A1:Z1", {"textFormat": {"bold": True}})
-                return True
-
-            except Exception as e:
-                is_rate_limit = "429" in str(e) or "Quota exceeded" in str(e)
-                if is_rate_limit and attempt < max_retries:
-                    wait = 3 * (attempt + 1)
-                    logger.warning(f"[_sync_current_stock_to_sheet] Rate limited (attempt {attempt}), retrying in {wait}s...")
-                    _time.sleep(wait)
-                    continue
-                logger.error(f"Sheet sync error (current stock): {e}")
-                return False
-
-    def correct_stock_entry(self, item: str, new_qty: int, corrected_by: str):
-        """Overwrite an item's current stock and today's history entry."""
-        item = self._find_existing_stock_name(item)
-        try:
-            new_qty = int(new_qty)
-        except (ValueError, TypeError):
-            new_qty = 0
-
-        today_sheet = _now().strftime("%d/%m/%y")
-
-        if "stock_current" not in self.data:
-            self.data["stock_current"] = {}
-        self.data["stock_current"][item] = new_qty
-
-        if "stock_history" not in self.data:
-            self.data["stock_history"] = {}
-        if today_sheet not in self.data["stock_history"]:
-            self.data["stock_history"][today_sheet] = {}
-        self.data["stock_history"][today_sheet][item] = new_qty
-
-        self.data["stock"][item] = {
-            "qty": str(new_qty),
-            "updated_by": corrected_by,
-            "updated_at": _fmt_ts(),
-        }
-
-        sheet_ok = True
-        if self._sheets:
-            try:
-                sheet_ok = self._sheets.write_stock_item(item, str(new_qty), today_sheet)
-                if not sheet_ok:
-                    sheet_ok = False
-            except Exception as e:
-                logger.error(f"Direct sheet write failed (correct_stock_entry): {e}")
-                sheet_ok = False
-        self._sync_current_stock_to_sheet(item)
-
-        self._save_local_only()
-        self._rebuild_shopping_list()
-
-        if not sheet_ok:
-            self._queue_stock_write(item, str(new_qty), today_sheet)
-            logger.warning(f"Queued pending stock write: {item}={new_qty} (sheet write failed)")
-        else:
-            self._drop_queued_write(item)
-        return sheet_ok
-
-    def undo_last_stock_update(self, item: str) -> bool:
-        """Undo the most recent stock_history entry for an item.
-        Restores stock_current to the previous date's value (or removes if none).
-        Returns True if an undo was performed, False if there was nothing to undo."""
-        item = self._find_existing_stock_name(item)
-        history = self.data.get("stock_history", {})
-
-        # Collect all (date, qty) entries for this item, sorted by date desc
-        norm = normalize_item_name(item)
-
-        def parse_d(d):
-            try:
-                return datetime.strptime(d, "%d/%m/%y")
-            except (ValueError, TypeError):
-                return datetime.min
-
-        entries = []
-        for date_str, items_on_date in history.items():
-            for k, v in items_on_date.items():
-                if normalize_item_name(k) == norm:
-                    entries.append((date_str, k, v))
-
-        if not entries:
-            return False
-
-        entries.sort(key=lambda e: parse_d(e[0]), reverse=True)
-        latest_date, latest_key, _latest_qty = entries[0]
-
-        # Remove the latest entry
-        del history[latest_date][latest_key]
-        if not history[latest_date]:
-            del history[latest_date]
-
-        # Find previous entry (next most recent) to restore stock_current
-        if len(entries) > 1:
-            _, _, prev_qty = entries[1]
-            try:
-                prev_qty_val = int(prev_qty)
-            except (ValueError, TypeError):
-                prev_qty_val = prev_qty
-            if "stock_current" not in self.data:
-                self.data["stock_current"] = {}
-            self.data["stock_current"][item] = prev_qty_val
-            self.data["stock"][item] = {
-                "qty": str(prev_qty_val),
-                "updated_by": self.data.get("stock", {}).get(item, {}).get("updated_by", ""),
-                "updated_at": _fmt_ts(),
-            }
-        else:
-            # No previous entry — remove current stock tracking for this item
-            self.data.get("stock_current", {}).pop(item, None)
-            self.data.get("stock", {}).pop(item, None)
-
-        self._sync_current_stock_to_sheet(item)
-        self._save_local_only()
-        self._rebuild_shopping_list()
-        return True
-
-    def _get_stock_minimums(self) -> dict:
-        """Read stock minimums from Google Sheets — the ONLY source of truth.
-        Returns an empty dict on failure; callers must handle that (no
-        low-stock alerts fire when the sheet is unreachable)."""
-        if self._sheets:
-            try:
-                minimums = self._sheets.read_stock_minimums_from_sheet()
-                if minimums:
-                    return minimums
-            except Exception as e:
-                logger.error(f"_get_stock_minimums: sheet read failed: {e}")
-        logger.warning("_get_stock_minimums: no sheet data available — returning empty")
-        return {}
-
-    def _get_ops_checklists(self) -> dict:
-        """Read ops checklists from Google Sheets — the ONLY source of truth.
-        Returns an empty dict on failure."""
-        if self._sheets:
-            try:
-                sop = self._sheets.read_sop_from_sheets()
-                checklists = sop.get("ops_checklists") or {}
-                if checklists:
-                    return checklists
-            except Exception as e:
-                logger.error(f"_get_ops_checklists: sheet read failed: {e}")
-        logger.warning("_get_ops_checklists: no sheet data available — returning empty")
-        return {}
-
-    def check_low_stock(self, items_updated: list = None) -> list:
-        """Check stock against SOP minimums. Returns list of {item, qty, min} for low items.
-        If items_updated is provided, only checks those items."""
-        STOCK_MINIMUMS = self._get_stock_minimums()
-        import re
-
-        low_items = []
-        stock = self.data.get("stock", {})
-        stock_current = self.data.get("stock_current", {})
-
-        items_to_check = items_updated if items_updated else stock.keys()
-
-        for item_name in items_to_check:
-            # Find matching minimum first (fuzzy match via normalize_item_name),
-            # so an item not counted yet but present in minimums is still checked.
-            min_info = None
-            item_norm = normalize_item_name(item_name)
-            for min_name, min_data in STOCK_MINIMUMS.items():
-                if normalize_item_name(min_name) == item_norm:
-                    min_info = min_data
-                    break
-            if not min_info:
-                # Try partial match
-                for min_name, min_data in STOCK_MINIMUMS.items():
-                    mn = normalize_item_name(min_name)
-                    if mn in item_norm or item_norm in mn:
-                        min_info = min_data
-                        break
-
-            if not min_info:
-                continue
-
-            if item_name in stock:
-                info = stock.get(item_name, {})
-                qty_str = str(info.get("qty", "")).strip()
-            elif item_name in stock_current:
-                qty_str = str(stock_current.get(item_name, "")).strip()
+                value = clean_name(raw_value)
+            if value is None or value == "":
+                edits.append({"op": "unknown", "text": p})
             else:
-                # Not counted anywhere but present in minimums — treat as 0,
-                # same rule as get_low_stock (empty Column B = 0).
-                qty_str = "0"
+                edits.append({"op": "set", "field": key, "value": value})
+            continue
+        edits.append({"op": "unknown", "text": p})
+    return edits
 
-            # Extract numeric value from qty
-            nums = re.findall(r'[\d.]+', qty_str)
-            if not nums:
-                # Non-numeric qty like "OK", "LOW", "OUT"
-                if qty_str.upper() in ("LOW", "OUT", "0"):
-                    low_items.append({
-                        "item": item_name,
-                        "qty": qty_str,
-                        "min": min_info["min"],
-                        "unit": min_info.get("unit", ""),
-                    })
+
+def apply_edits(r: dict, edits: list[dict]) -> list[str]:
+    """Apply edits in place. Returns problems to tell the user (empty = all good)."""
+    problems = []
+    # deletes last, highest number first, so numbers in other edits stay valid
+    ordered = [e for e in edits if e["op"] != "delete"] + sorted(
+        [e for e in edits if e["op"] == "delete"], key=lambda e: -e["n"])
+    for e in ordered:
+        if e["op"] == "unknown":
+            problems.append(f"didn't understand “{e['text']}”")
+        elif e["op"] == "set":
+            r[e["field"]] = e["value"]
+        elif e["op"] == "add":
+            unit = e["unit_price"] or 0.0
+            r["items"].append({"name": e["name"], "qty": e["qty"], "unit_price": unit,
+                               "line_total": round(e["qty"] * unit, 2), "category": "Ingredients"})
+        elif e["op"] in ("item", "delete"):
+            n = e["n"]
+            if not 1 <= n <= len(r["items"]):
+                problems.append(f"there is no item {n}")
                 continue
-
-            qty_num = float(nums[0])
-            if qty_num <= min_info["min"]:
-                low_items.append({
-                    "item": item_name,
-                    "qty": qty_str,
-                    "min": min_info["min"],
-                    "unit": min_info.get("unit", ""),
-                })
-
-        return low_items
-
-    def get_low_stock(self) -> list:
-        # Only use stock_current (Column B) — date-column history is not current stock
-        result = []
-        STOCK_MINIMUMS = self._get_stock_minimums()
-        stock_current = self.data.get("stock_current", {})
-        seen_names = set()  # use original names (lowered), not normalized — avoids collision
-
-        # 1. Check items in stock_current
-        for item_name, qty in stock_current.items():
-            item_norm = normalize_item_name(item_name)
-            item_key = item_name.strip().lower()
-            if item_key in seen_names:
+            if e["op"] == "delete":
+                r["items"].pop(n - 1)
                 continue
-            # Check if qty is a low/out string
-            if str(qty).upper() in ("LOW", "OUT", "0"):
-                result.append((item_name, {"qty": str(qty)}))
-                seen_names.add(item_key)
-                continue
-            # Check against minimums
-            for min_name, min_data in STOCK_MINIMUMS.items():
-                if normalize_item_name(min_name) == item_norm:
-                    try:
-                        if int(qty) <= min_data.get("min", 0):
-                            result.append((item_name, {"qty": str(qty)}))
-                            seen_names.add(item_key)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-
-        # 2. Check items in Stock Minimums but MISSING from stock_current (empty Column B = 0)
-        for min_name, min_data in STOCK_MINIMUMS.items():
-            min_norm = normalize_item_name(min_name)
-            min_key = min_name.strip().lower()
-            if min_key in seen_names:
-                continue
-            # Not in stock_current = empty Column B = 0
-            if not any(normalize_item_name(k) == min_norm for k in stock_current):
-                min_qty = min_data.get("min", 0)
-                if min_qty > 0:  # 0 stock is below any positive minimum
-                    result.append((min_name, {"qty": "0"}))
-                    seen_names.add(min_key)
-
-        return result
-
-    # ─── Operations Checklists ─────────────────────────────
-    def get_ops_checklist_status(self, checklist_type: str, date_str: str = None) -> dict:
-        """Get completion status for a checklist today (or specified date).
-        Returns {items: [...], completed: [...], remaining: [...]}"""
-        OPS_CHECKLISTS = self._get_ops_checklists()
-
-        if not date_str:
-            date_str = _now().strftime("%Y-%m-%d")
-
-        all_items = OPS_CHECKLISTS.get(checklist_type, [])
-        completed = self.data.get("ops_checklists", {}).get(date_str, {}).get(checklist_type, [])
-
-        return {
-            "items": all_items,
-            "completed": completed,
-            "remaining": [item for item in all_items if item not in completed],
-        }
-
-    def mark_checklist_done(self, checklist_type: str, items: list, done_by: str) -> dict:
-        """Mark checklist items as done. items=["all"] marks everything.
-        Returns {completed_count, total, newly_done}"""
-        OPS_CHECKLISTS = self._get_ops_checklists()
-
-        date_str = _now().strftime("%Y-%m-%d")
-        all_items = OPS_CHECKLISTS.get(checklist_type, [])
-
-        if "ops_checklists" not in self.data:
-            self.data["ops_checklists"] = {}
-        if date_str not in self.data["ops_checklists"]:
-            self.data["ops_checklists"][date_str] = {}
-        if checklist_type not in self.data["ops_checklists"][date_str]:
-            self.data["ops_checklists"][date_str][checklist_type] = []
-
-        completed = self.data["ops_checklists"][date_str][checklist_type]
-        newly_done = []
-
-        if items == ["all"]:
-            newly_done = [item for item in all_items if item not in completed]
-            completed.extend(newly_done)
-        else:
-            for item in items:
-                # Fuzzy match against checklist items
-                matched = None
-                for ci in all_items:
-                    if item.lower() in ci.lower() or ci.lower() in item.lower():
-                        matched = ci
-                        break
-                if matched and matched not in completed:
-                    completed.append(matched)
-                    newly_done.append(matched)
-
-        self.data["ops_checklists"][date_str][checklist_type] = completed
-        self._save("ops_checklists")
-
-        return {
-            "completed_count": len(completed),
-            "total": len(all_items),
-            "newly_done": newly_done,
-        }
-
-    # ─── Cleaning ───────────────────────────────────────────
-    def log_cleaning(self, zone: str, done_by: str):
-        self.data["cleaning_log"].append({
-            "zone": zone,
-            "done_by": done_by,
-            "done_at": _fmt_ts(),
-        })
-        self._save("cleaning")
-
-    def get_cleaning_today(self) -> list:
-        today = date.today().isoformat()
-        return [
-            e for e in self.data.get("cleaning_log", [])
-            if e.get("done_at", "").startswith(today)
-        ]
-
-    # ─── Checklists ─────────────────────────────────────────
-    def log_checklist(self, checklist_type: str, items_done: list, done_by: str):
-        self.data["checklist_log"].append({
-            "type": checklist_type,
-            "items_done": items_done,
-            "done_by": done_by,
-            "done_at": _fmt_ts(),
-        })
-        self._save()
-
-    def get_checklist_today(self, checklist_type: str) -> Optional[dict]:
-        today = date.today().isoformat()
-        for entry in reversed(self.data.get("checklist_log", [])):
-            if (entry.get("type") == checklist_type and
-                entry.get("done_at", "").startswith(today)):
-                return entry
-        return None
-
-    # ─── Shifts ─────────────────────────────────────────────
-    def get_shifts(self, day: str = None) -> dict:
-        if day:
-            return self.data.get("shifts", {}).get(day, {})
-        return self.data.get("shifts", {})
-
-    def set_shift(self, day: str, staff_name: str, start: str, end: str):
-        if day not in self.data["shifts"]:
-            self.data["shifts"][day] = {}
-        self.data["shifts"][day][staff_name] = {"start": start, "end": end}
-        self._save("shifts")
-
-    def remove_shift(self, day: str, staff_name: str):
-        if day in self.data.get("shifts", {}) and staff_name in self.data["shifts"][day]:
-            del self.data["shifts"][day][staff_name]
-            self._save("shifts")
-
-    # ─── Operating Hours ────────────────────────────────────
-    def get_hours(self) -> dict:
-        return self.data.get("hours", {})
-
-    def set_hours(self, day: str, open_time: str, close_time: str):
-        self.data["hours"][day] = {"open": open_time, "close": close_time}
-        self._save()
-
-    def set_holiday_hours(self, date_str: str, open_time: str, close_time: str, label: str = ""):
-        self.data["holiday_hours"][date_str] = {
-            "open": open_time, "close": close_time, "label": label
-        }
-        self._save()
-
-    def get_holiday_hours(self) -> dict:
-        return self.data.get("holiday_hours", {})
-
-    # ─── Events ─────────────────────────────────────────────
-    def add_event(self, title: str, event_date: str, details: str, added_by: str):
-        entry = {
-            "title": title,
-            "date": event_date,
-            "details": details,
-            "added_by": added_by,
-            "added_at": _fmt_ts(),
-            "status": "upcoming",
-        }
-        # 1. Write to Sheet FIRST
-        if self._sheets:
-            try:
-                self._sheets.write_event(entry)
-            except Exception as e:
-                logger.error(f"Direct sheet write failed (event): {e}")
-
-        # 2. Update JSON cache
-        self.data["events"].append(entry)
-        self._save_local_only()
-
-    def get_events(self, upcoming_only: bool = True) -> list:
-        events = self.data.get("events", [])
-        if upcoming_only:
-            today = date.today().isoformat()
-            events = [e for e in events if e.get("date", "") >= today]
-        return sorted(events, key=lambda e: e.get("date", ""))
-
-    def complete_event(self, index: int):
-        if 0 <= index < len(self.data["events"]):
-            self.data["events"][index]["status"] = "done"
-            # Full re-sync events to Sheet
-            if self._sheets:
-                try:
-                    self._sheets.sync_events(self.data.get("events", []))
-                except Exception as e:
-                    logger.error(f"Sheet sync failed (complete_event): {e}")
-            self._save_local_only()
-
-    # ─── Shopping / To-Buy List ──────────────────────────────
-    # Auto-generated from low stock — see _rebuild_shopping_list().
-    def add_shopping_item(self, item: str, added_by: str = "", urgency: str = "normal"):
-        item = clean_item_name(item)
-        # Skip if already on the list
-        existing = {normalize_item_name(s["item"]) for s in self.data.get("shopping_list", [])}
-        if normalize_item_name(item) in existing:
-            return
-        entry = {"item": item}
-        # 1. Write to Sheet FIRST
-        if self._sheets:
-            try:
-                self._sheets.write_shopping_item(entry)
-            except Exception as e:
-                logger.error(f"Direct sheet write failed (shopping): {e}")
-
-        # 2. Update JSON cache
-        self.data["shopping_list"].append(entry)
-        self._save_local_only()
-
-    def get_shopping_list(self) -> list:
-        return self.data.get("shopping_list", [])
-
-    def mark_bought(self, index: int):
-        """Remove an item from the shopping list (JSON + Sheet), then rebuild.
-        Works for both auto-added (low stock) and manually added items."""
-        items = self.data.get("shopping_list", [])
-        if 0 <= index < len(items):
-            removed_item = items[index].get("item", "")
-            del items[index]
-            self._save_local_only()
-            # Also remove from sheet so _rebuild_shopping_list doesn't re-add it
-            if self._sheets and removed_item:
-                try:
-                    self._sheets.remove_shopping_item(removed_item)
-                except Exception as e:
-                    logger.error(f"Sheet remove shopping item failed: {e}")
-        self._rebuild_shopping_list()
-
-    def clear_bought(self):
-        """No-op kept for backward compat — list is always rebuilt from stock."""
-        self._rebuild_shopping_list()
-
-    def _rebuild_shopping_list(self):
-        """Smart-merge the Shopping List based on stock levels.
-        - ADD items that are below stock minimum and not already listed
-        - REMOVE items that are tracked (in Stock Minimums) and now above minimum
-        - KEEP items manually added by humans (not in Stock Minimums)
-        Sheet is respected — never wipe manually added items."""
-        STOCK_MINIMUMS = self._get_stock_minimums()
-        if not STOCK_MINIMUMS:
-            logger.error("_rebuild_shopping_list: no stock minimums available")
-            return
-
-        stock_current = self.data.get("stock_current", {})
-        logger.info(f"_rebuild_shopping_list: {len(STOCK_MINIMUMS)} minimums, {len(stock_current)} stock_current items")
-
-        # Pre-build normalized lookup for stock_current
-        stock_norm_map = {}  # normalized_name → qty
-        for item_name, qty in stock_current.items():
-            stock_norm_map[normalize_item_name(item_name)] = qty
-
-        # Classify each tracked item as low or OK
-        low_norms = set()   # normalized names of items below minimum
-        ok_norms = set()    # normalized names of items at/above minimum
-
-        for min_name, min_data in STOCK_MINIMUMS.items():
-            min_qty = min_data.get("min", 0)
-
-            # Find matching current-stock entry via normalize_item_name
-            min_norm = normalize_item_name(min_name)
-            current_qty = stock_norm_map.get(min_norm)
-
-            # Empty Column B (None) = 0 stock, not "unknown"
-            if current_qty is None:
-                current_qty = 0
-            else:
-                try:
-                    current_qty = int(current_qty)
-                except (ValueError, TypeError):
-                    current_qty = 0
-
-            if current_qty <= min_qty:
-                low_norms.add(min_norm)
-                logger.info(f"_rebuild_shopping_list: LOW — {min_name}: {current_qty} < {min_qty}")
-            else:
-                ok_norms.add(min_norm)
-
-        # Build list of (norm, display_name) for low items — list not dict,
-        # because multiple items can share the same normalized name
-        # (e.g. "Brown Boba (Jelly)" and "Brown Boba (Cook)" both → "brown boba")
-        low_display = []
-        for min_name in STOCK_MINIMUMS:
-            norm = normalize_item_name(min_name)
-            if norm in low_norms:
-                low_display.append((norm, min_name))
-
-        # Read existing items from sheet (or JSON cache if no sheets)
-        existing_items = []
-        if self._sheets:
-            try:
-                sheet_items = self._sheets.read_shopping_from_sheet()
-                if sheet_items is not None:
-                    existing_items = [s["item"] for s in sheet_items]
-            except Exception as e:
-                logger.error(f"Shopping list read failed: {e}")
-                existing_items = [s["item"] for s in self.data.get("shopping_list", [])]
-        else:
-            existing_items = [s["item"] for s in self.data.get("shopping_list", [])]
-
-        # Filter existing: remove restocked trackable items, keep everything else
-        final_items = []
-        for item in existing_items:
-            norm = normalize_item_name(item)
-            if norm in ok_norms:
-                continue  # restocked above minimum — remove
-            final_items.append(item)
-
-        # Add low-stock items not already present (use original names to dedup,
-        # not normalized — so "Brown Boba (Jelly)" and "Brown Boba (Cook)" both appear)
-        final_names_lower = {i.strip().lower() for i in final_items}
-        for norm, display in low_display:
-            if display.strip().lower() not in final_names_lower:
-                final_items.append(display)
-                final_names_lower.add(display.strip().lower())
-
-        logger.info(f"_rebuild_shopping_list: {len(low_norms)} low, {len(ok_norms)} ok, final list: {final_items}")
-
-        # Update JSON cache
-        self.data["shopping_list"] = [{"item": name} for name in final_items]
-
-        # Write merged list to sheet — header + all items in one call
-        if self._sheets:
-            try:
-                ws = self._sheets._get_ws("Shopping List")
-                if ws:
-                    ws.clear()
-                    rows = [["Item"]] + [[name] for name in final_items]
-                    ws.update("A1", rows)
-                    ws.format("A1:A1", {"textFormat": {"bold": True}})
-            except Exception as e:
-                logger.error(f"Sheet rebuild failed (shopping list): {e}")
-
-        self._save_local_only()
-
-    # ─── Staff Registry ─────────────────────────────────────
-    def add_staff(self, name: str, telegram_id: int, role: str = "staff"):
-        self.data["staff"][name] = {
-            "telegram_id": telegram_id,
-            "role": role,
-            "added_at": _fmt_ts(),
-        }
-        self._save("staff")
-
-    def get_staff(self) -> dict:
-        return self.data.get("staff", {})
-
-    def read_tab(self, tab_name: str, max_rows: int = 50) -> dict:
-        """Read any Google Sheets tab dynamically."""
-        if self._sheets:
-            return self._sheets.read_any_tab(tab_name, max_rows)
-        return {}
-
-    def read_tab_filtered(self, tab_name: str, keywords: list, max_rows: int = 500) -> dict:
-        """Read a tab and filter rows to those containing ANY of the keywords
-        (case-insensitive substring match on any cell). Used by the read_tab
-        feedback loop so the AI only sees rows relevant to what the user asked."""
-        data = self.read_tab(tab_name, max_rows=max_rows)
-        if not data or not keywords:
-            return data
-        kws = [k.strip().lower() for k in keywords if k and k.strip()]
-        if not kws:
-            return data
-        rows = data.get("rows", [])
-        filtered = []
-        for row in rows:
-            if isinstance(row, dict):
-                blob = " ".join(str(v) for v in row.values()).lower()
-            elif isinstance(row, (list, tuple)):
-                blob = " ".join(str(c) for c in row).lower()
-            else:
-                blob = str(row).lower()
-            if any(kw in blob for kw in kws):
-                filtered.append(row)
-        return {"headers": data.get("headers", []), "rows": filtered, "total_rows": data.get("total_rows", 0)}
-
-    def update_in_tab(self, tab_name: str, match_col: str, match_val: str, data: dict) -> str:
-        """Update a row in any Google Sheets tab. Returns 'updated', 'not_found', or 'error'."""
-        if self._sheets:
-            return self._sheets.update_row_in_tab(tab_name, match_col, match_val, data)
-        return "error"
-
-    def append_to_tab(self, tab_name: str, data: dict) -> bool:
-        """Append a row to any Google Sheets tab."""
-        if self._sheets:
-            return self._sheets.append_row_to_tab(tab_name, data)
-        return False
-
-    def remove_staff(self, name: str):
-        if name in self.data.get("staff", {}):
-            del self.data["staff"][name]
-            self._save("staff")
-
-    # ─── Content Log ────────────────────────────────────────
-    def log_content(self, idea: str, posted_by: str):
-        self.data["content_log"].append({
-            "idea": idea,
-            "posted_by": posted_by,
-            "posted_at": _fmt_ts(),
-        })
-        self._save()
-
-    def get_content_log(self, days: int = 30) -> list:
-        return self.data.get("content_log", [])[-days:]
-
-    # ─── Content Calendar ──────────────────────────────────
-    def add_content_plan(self, title: str, content_type: str, planned_date: str,
-                         assigned_to: str, added_by: str, notes: str = ""):
-        if "content_calendar" not in self.data:
-            self.data["content_calendar"] = []
-        self.data["content_calendar"].append({
-            "title": title,
-            "type": content_type,
-            "planned_date": planned_date,
-            "assigned_to": assigned_to,
-            "added_by": added_by,
-            "notes": notes,
-            "status": "planned",
-            "created_at": _fmt_ts(),
-            "completed_at": None,
-        })
-        self._save()
-
-    def get_content_calendar(self, upcoming_only: bool = True) -> list:
-        items = self.data.get("content_calendar", [])
-        if upcoming_only:
-            today = date.today().isoformat()
-            items = [c for c in items
-                     if c.get("status") in ("planned", "in_progress")
-                     or c.get("planned_date", "") >= today]
-        return sorted(items, key=lambda c: c.get("planned_date", ""))
-
-    def get_content_today(self) -> list:
-        today = date.today().isoformat()
-        return [c for c in self.data.get("content_calendar", [])
-                if c.get("planned_date") == today
-                and c.get("status") in ("planned", "in_progress")]
-
-    def update_content_status(self, index: int, status: str, completed_by: str = ""):
-        cal = self.data.get("content_calendar", [])
-        if 0 <= index < len(cal):
-            cal[index]["status"] = status
-            if status == "done":
-                cal[index]["completed_at"] = _fmt_ts()
-                cal[index]["completed_by"] = completed_by
-            self._save()
-
-    def complete_content_by_title(self, title_search: str, completed_by: str = "") -> bool:
-        search = title_search.lower()
-        for item in self.data.get("content_calendar", []):
-            if (search in item.get("title", "").lower()
-                    and item.get("status") in ("planned", "in_progress")):
-                item["status"] = "done"
-                item["completed_at"] = _fmt_ts()
-                item["completed_by"] = completed_by
-                self._save()
-                return True
-        return False
-
-    # ─── Daily Reports ──────────────────────────────────────
-    def save_daily_report(self, report: dict):
-        self.data["daily_reports"].append(report)
-        self._save()
-
-    def get_daily_reports(self, days: int = 7) -> list:
-        return self.data.get("daily_reports", [])[-days:]
-
-    # ─── Action Items (legacy — DEPRECATED, replaced by PendingTasksStore) ──
-    # DEPRECATED: replaced by PendingTasksStore. These are kept as no-ops so
-    # any lingering call site doesn't crash. Do not add new callers.
-    def add_action_item(self, task: str, assigned_to: str, mentioned_by: str,
-                        source_msg: str = "", urgency: str = "normal"):
-        # DEPRECATED: replaced by PendingTasksStore
-        return None
-
-    def get_action_items(self, status: str = "pending") -> list:
-        # DEPRECATED: replaced by PendingTasksStore
-        return []
-
-    def complete_action_item(self, index: int, completed_by: str = ""):
-        # DEPRECATED: replaced by PendingTasksStore
-        return None
-
-    def mark_action_chased(self, index: int):
-        # DEPRECATED: replaced by PendingTasksStore
-        return None
-
-    def dismiss_action_item(self, index: int):
-        # DEPRECATED: replaced by PendingTasksStore
-        return None
-
-    # ─── Custom Instructions ──────────────────────────────────
-    def add_custom_instruction(self, instruction: str, added_by: str):
-        if "custom_instructions" not in self.data:
-            self.data["custom_instructions"] = []
-        self.data["custom_instructions"].append({
-            "instruction": instruction,
-            "added_by": added_by,
-            "date": _now().strftime("%Y-%m-%d %H:%M"),
-        })
-        self._save("instructions")
-
-    def get_custom_instructions(self) -> list:
-        return self.data.get("custom_instructions", [])
-
-    def remove_custom_instruction(self, index: int):
-        instructions = self.data.get("custom_instructions", [])
-        if 0 <= index < len(instructions):
-            instructions.pop(index)
-            self._save("instructions")
-
-    # ─── Settings ───────────────────────────────────────────
-    def get_setting(self, key: str, default=None):
-        return self.data.get("settings", {}).get(key, default)
-
-    def set_setting(self, key: str, value):
-        self.data["settings"][key] = value
-        self._save()
-
-
-class AliasStore:
-    """Persistent alias mappings for stock item names.
-    Maps alternative names → canonical stock names."""
-
-    _instance = None
-    FILE = DATA_DIR / "aliases.json"
-
-    def __init__(self):
-        self._data = {}  # {alias_normalized: canonical_name}
-        self._load()
-
-    def _load(self):
-        if self.FILE.exists():
-            try:
-                with open(self.FILE) as f:
-                    self._data = json.load(f)
-            except Exception:
-                self._data = {}
-
-    def _save(self):
-        with open(self.FILE, "w") as f:
-            json.dump(self._data, f, indent=2)
-
-    def add_alias(self, canonical: str, alias: str):
-        """Map alias → canonical name."""
-        norm = normalize_item_name(alias)
-        self._data[norm] = canonical
-        self._save()
-
-    def resolve(self, name: str) -> str:
-        """Return canonical name if alias exists, else the input name."""
-        norm = normalize_item_name(name)
-        return self._data.get(norm, name)
-
-    def find_match(self, name: str) -> str:
-        """Try alias store first, then return input."""
-        return self.resolve(name)
-
-    def get_all(self) -> dict:
-        return dict(self._data)
-
-
-def get_alias_store() -> AliasStore:
-    if AliasStore._instance is None:
-        AliasStore._instance = AliasStore()
-    return AliasStore._instance
-
-
-# ─── Factory (singleton) ─────────────────────────────────────
-_store_instance: Optional[LocalJsonStore] = None
-
-def get_store() -> LocalJsonStore:
-    """Returns the singleton storage backend with Google Sheets sync."""
-    global _store_instance
-    if _store_instance is None:
-        _store_instance = LocalJsonStore()
-    return _store_instance
+            it = r["items"][n - 1]
+            it[e["field"]] = e["value"]
+            # keep the line consistent with what was just corrected
+            if e["field"] == "qty":
+                it["line_total"] = round(it["qty"] * it["unit_price"], 2)
+            elif e["field"] == "unit_price":
+                it["line_total"] = round(it["qty"] * it["unit_price"], 2)
+            elif e["field"] == "line_total" and it["qty"]:
+                it["unit_price"] = round(it["line_total"] / it["qty"], 4)
+    return problems
+
+
+# ─── Stock ────────────────────────────────────────────────
+
+def parse_stock_lines(text: str) -> list[tuple[str, float]]:
+    """Simple 'item qty' lines, e.g. 'full cream milk 120\\ncondensed milk: 17'."""
+    out = []
+    for part in re.split(r"[\n,;]+", text or ""):
+        m = re.match(r"^\s*(.+?)\s*[:=\-]?\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*$", part.strip(), re.I)
+        if m and clean_name(m.group(1)):
+            out.append((clean_name(m.group(1)), float(m.group(2))))
+    return out
+
+
+def stock_status(current, minimum) -> str:
+    cur, mn = to_number(current), to_number(minimum)
+    if cur is None:
+        return "unknown"
+    if cur <= 0:
+        return "out"
+    if mn is not None and cur < mn:
+        return "low"
+    return "ok"
+
+
+# ─── Money reports (owners only) ──────────────────────────
+
+def payback(receipts: list[dict], month: str) -> dict[str, float]:
+    """How much each person paid for supplies in a month (from the Receipts tab)."""
+    out: dict[str, float] = {}
+    for row in receipts:
+        if month_of(parse_date(row.get("Date")) or "") != month:
+            continue
+        who = clean_name(row.get("Paid By")) or "Unknown"
+        out[who] = round(out.get(who, 0.0) + (to_number(row.get("Total (RM)")) or 0.0), 2)
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+def sum_by(rows: list[dict], month: str, key: str, amount: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for row in rows:
+        if month_of(parse_date(row.get("Date")) or "") != month:
+            continue
+        k = clean_name(row.get(key)) or "Other"
+        out[k] = round(out.get(k, 0.0) + (to_number(row.get(amount)) or 0.0), 2)
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+def parse_month(text: str | None) -> str:
+    """'' -> this month; '2026-10', '10/2026', 'oct', 'october 2026', 'last' -> YYYY-MM."""
+    s = (text or "").strip().lower()
+    n = now()
+    if not s or s in ("this", "this month", "now"):
+        return n.strftime("%Y-%m")
+    if s in ("last", "last month", "prev", "previous"):
+        y, m = (n.year, n.month - 1) if n.month > 1 else (n.year - 1, 12)
+        return f"{y}-{m:02d}"
+    m = re.match(r"^(\d{4})-(\d{1,2})$", s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    m = re.match(r"^(\d{1,2})[/-](\d{4})$", s)
+    if m:
+        return f"{m.group(2)}-{int(m.group(1)):02d}"
+    m = re.match(r"^([a-z]{3})[a-z]*\s*(\d{4})?$", s)
+    if m and m.group(1) in _MONTHS:
+        return f"{m.group(2) or n.year}-{_MONTHS[m.group(1)]:02d}"
+    return n.strftime("%Y-%m")

@@ -1,1705 +1,313 @@
 """
-Café Manager Bot — Google Integration (Sheets + Drive)
-Free cloud storage for P&L tracking and receipt archiving.
+Google Sheet: the one place all café records live.
 
-Setup:
-  1. Go to console.cloud.google.com (free)
-  2. Create project → Enable "Google Sheets API" + "Google Drive API"
-  3. Create Service Account → Download JSON key → save as credentials.json
-  4. Share your Google Sheet with the service account email
-  5. Share your Google Drive folder with the service account email
-
-All free — no credit card needed.
+Rules this file follows, so the Sheet never gets messy:
+- Every tab has FIXED columns (TABS below). The bot refuses to write to a tab
+  whose header row is different, and tells you to run migrate_sheet.py.
+- The bot only ADDS rows or updates single cells. It never clears a tab,
+  never adds columns, never deletes or renames tabs.
+- Numbers go in as numbers, dates as YYYY-MM-DD.
 """
-import json
+from __future__ import annotations
+
 import logging
-from datetime import datetime, date
+import threading
 from pathlib import Path
-from typing import Optional
-from zoneinfo import ZoneInfo
 
 import config
+import storage
 
-_TZ = ZoneInfo(config.TIMEZONE)
+log = logging.getLogger(__name__)
 
+TABS: dict[str, list[str]] = {
+    "Receipts": ["Receipt ID", "Date", "Month", "Supplier", "Total (RM)", "Paid By", "Payment",
+                 "Items", "Photo", "Submitted By", "Saved At", "Photo Hash"],
+    "Receipt Items": ["Receipt ID", "Date", "Month", "Supplier", "Item", "Category", "Qty",
+                      "Unit Price (RM)", "Line Total (RM)", "Paid By"],
+    "Daily Sales": ["Date", "Total Sales (RM)", "Bills", "Pax", "Cash (RM)", "Card (RM)",
+                    "DuitNow (RM)", "TnG (RM)", "GrabPay (RM)", "Other (RM)", "Discount (RM)",
+                    "Void (RM)", "Refund (RM)", "Cashier", "Recorded By", "Notes", "Created At"],
+    "Stock": ["Item", "Current", "Min", "Unit", "Location", "Updated At", "Updated By"],
+    "Shopping List": ["Item", "Note", "Added By", "Added At", "Status", "Done By", "Done At"],
+}
+# How each column is displayed (applied when the bot or migration creates a tab).
+FORMATS = {
+    "Receipts": {"B": "DATE", "E": "MONEY"},
+    "Receipt Items": {"B": "DATE", "G": "QTY", "H": "MONEY", "I": "MONEY"},
+    "Daily Sales": {"A": "DATE", **{c: "MONEY" for c in "BEFGHIJKLM"}},
+    "Stock": {"B": "QTY", "C": "QTY"},
+}
+# Read-only reference tabs staff can ask about.
+REFERENCE_TABS = ["Bingsu Recipes", "Other Recipes", "Checklists", "Inspection"]
 
-def _now():
-    """Current time in configured timezone (MYT)."""
-    return datetime.now(_TZ)
-
-
-def _fmt_ts():
-    """Format current timestamp as '29/08/26-1425' style."""
-    return _now().strftime("%d/%m/%y-%H%M")
-
-logger = logging.getLogger(__name__)
-
-
-def _normalize_date(date_str: str) -> str:
-    """Normalize any date format to dd/mm/yyyy (Malaysia standard).
-    Handles: YYYY-MM-DD, dd/mm/yy, dd/mm/yyyy, mm/dd/yy (with sanity check).
-
-    The AI prompt asks for dd/mm/yyyy but sometimes returns ISO (YYYY-MM-DD).
-    When ISO is detected, we sanity-check by comparing with today's date —
-    if swapping month/day gives a date closer to today, we swap.
-    """
-    date_str = str(date_str).strip()
-    if not date_str:
-        return ""
-    # YYYY-MM-DD (ISO)
-    if "-" in date_str and date_str[:4].isdigit() and len(date_str) >= 10:
-        try:
-            dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
-            # Sanity check: try swapped version (YYYY-DD-MM) if day <= 12
-            month_val = dt.month
-            day_val = dt.day
-            if day_val <= 12 and month_val != day_val:
-                dt_swapped = datetime(dt.year, day_val, month_val)
-                today = datetime.now()
-                # Pick whichever is closer to today
-                if abs((dt_swapped - today).days) < abs((dt - today).days):
-                    dt = dt_swapped
-            return dt.strftime("%d/%m/%Y")
-        except ValueError:
-            pass
-    # dd/mm/yy or dd/mm/yyyy or possibly mm/dd/yy
-    if "/" in date_str:
-        parts = date_str.split("/")
-        if len(parts) == 3:
-            dd, mm, yy = parts[0], parts[1], parts[2]
-            if len(yy) == 2:
-                yy = "20" + yy
-            # Sanity: if dd > 12, it's definitely dd/mm. If mm > 12, swap (it was mm/dd).
-            try:
-                d, m = int(dd), int(mm)
-                if m > 12 and d <= 12:
-                    dd, mm = mm, dd  # was mm/dd, swap to dd/mm
-                return f"{int(dd):02d}/{int(mm):02d}/{yy}"
-            except ValueError:
-                pass
-    return date_str  # return as-is if unparseable
+NEED, DONE = "Need to buy", "Bought"
 
 
-def _parse_month_from_date(date_str: str) -> str:
-    """Extract YYYY-MM from various date formats."""
-    normalized = _normalize_date(date_str)
-    if not normalized or len(normalized) < 8:
-        return ""
-    # normalized is dd/mm/yyyy
-    if "/" in normalized:
-        parts = normalized.split("/")
-        if len(parts) == 3 and len(parts[2]) == 4:
-            return f"{parts[2]}-{parts[1]}"  # YYYY-MM
-    # fallback for ISO format (if _normalize_date returned as-is)
-    if "-" in normalized and normalized[:4].isdigit():
-        return normalized[:7]
-    return ""
+class SheetLayoutError(Exception):
+    """A tab's columns are not what the bot expects."""
 
 
-def _maybe_insert_month_separator(ws, new_date_str: str, col_count: int):
-    """Insert a month separator row if the new row's month differs from the last row.
-    Checks the last non-empty row's first cell for its month."""
-    new_month = _parse_month_from_date(new_date_str)
-    if not new_month:
-        return
-    try:
-        all_vals = ws.col_values(1)  # Column A — dates
-        if len(all_vals) <= 1:
-            return  # only header or empty
-        # Find last non-separator row (skip rows starting with ═══)
-        last_date = ""
-        for val in reversed(all_vals[1:]):  # skip header
-            val = str(val).strip()
-            if val and not val.startswith("═══"):
-                last_date = val
-                break
-        if not last_date:
-            return
-        last_month = _parse_month_from_date(last_date)
-        if not last_month or last_month == new_month:
-            return  # same month, no separator needed
-        # Different month — insert separator
-        try:
-            month_label = datetime.strptime(new_month, "%Y-%m").strftime("%B %Y")
-        except ValueError:
-            month_label = new_month
-        separator = [f"═══ {month_label} ═══"] + [""] * (col_count - 1)
-        ws.append_row(separator, value_input_option="USER_ENTERED")
-        # Bold + grey background for the separator
-        row_num = len(ws.col_values(1))
-        try:
-            ws.format(f"A{row_num}:{chr(64 + min(col_count, 26))}{row_num}", {
-                "textFormat": {"bold": True},
-                "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
-            })
-        except Exception:
-            pass  # formatting is non-critical
-    except Exception as e:
-        logger.debug(f"Month separator check failed: {e}")
+class SheetNotConfigured(Exception):
+    pass
 
 
-# ─── Lazy imports (don't crash if not configured) ──────────
-_sheets_client = None
-_drive_service = None
-_spreadsheet = None
+_lock = threading.Lock()
+_ss = None
+_checked: set[str] = set()
 
 
-def _get_credentials():
-    """Load Google service account credentials."""
-    creds_file = config.GOOGLE_SHEETS_CREDS_FILE
-    if not creds_file or not Path(creds_file).exists():
-        logger.info("Google credentials not found — Google integration disabled")
-        return None
-    try:
-        from google.oauth2.service_account import Credentials
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/calendar.readonly",
-        ]
-        return Credentials.from_service_account_file(creds_file, scopes=scopes)
-    except Exception as e:
-        logger.error(f"Failed to load Google credentials: {e}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════
-#  📊 GOOGLE SHEETS — P&L + Transaction Tracking
-# ═══════════════════════════════════════════════════════════
-
-def _get_spreadsheet():
-    """Lazy-init: get or create the spreadsheet."""
-    global _spreadsheet
-    if _spreadsheet is not None:
-        return _spreadsheet
-
-    creds = _get_credentials()
-    if creds is None:
-        return None
-
-    try:
+def _spreadsheet():
+    global _ss
+    if _ss is None:
+        if not Path(config.GOOGLE_SHEETS_CREDS_FILE).exists():
+            raise SheetNotConfigured("credentials.json not found")
         import gspread
-        gc = gspread.authorize(creds)
-
-        try:
-            _spreadsheet = gc.open(config.SPREADSHEET_NAME)
-            logger.info(f"Connected to Google Sheet: {config.SPREADSHEET_NAME}")
-        except gspread.SpreadsheetNotFound:
-            _spreadsheet = gc.create(config.SPREADSHEET_NAME)
-            logger.info(f"Created new Google Sheet: {config.SPREADSHEET_NAME}")
-
-        # Ensure required worksheets exist
-        _ensure_worksheets(_spreadsheet)
-        return _spreadsheet
-
-    except Exception as e:
-        logger.error(f"Google Sheets error: {e}")
-        return None
+        gc = gspread.service_account(filename=config.GOOGLE_SHEETS_CREDS_FILE)
+        _ss = gc.open_by_key(config.SPREADSHEET_ID) if config.SPREADSHEET_ID else gc.open(config.SPREADSHEET_NAME)
+    return _ss
 
 
-def _ensure_worksheets(spreadsheet):
-    """Create required worksheets if they don't exist.
-    Tab order: Stock, Shopping List, Expenses, Expenses Detail,
-               Monthly Summary, Daily Sales, POS Reports, Events
-    Stock, Shopping List, Events are managed by storage.py SheetsSync.
-    """
-    existing = [ws.title for ws in spreadsheet.worksheets()]
-
-    # --- Delete old/removed tabs ---
-    OLD_TABS = [
-        "Transactions", "Stock Ledger", "Cleaning Log",
-        "Shifts", "Custom Instructions", "Action Items", "Staff",
+def format_requests(sheet_id: int, tab: str) -> list[dict]:
+    """Bold frozen header + number formats for a tab (Sheets API batchUpdate requests)."""
+    patterns = {"DATE": ("DATE", "yyyy-mm-dd"), "MONEY": ("NUMBER", "#,##0.00"), "QTY": ("NUMBER", "0.##")}
+    reqs = [
+        {"repeatCell": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat.bold"}},
+        {"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+                                   "fields": "gridProperties.frozenRowCount"}},
     ]
-    for old_tab in OLD_TABS:
-        if old_tab in existing:
-            try:
-                spreadsheet.del_worksheet(spreadsheet.worksheet(old_tab))
-                logger.info(f"Deleted old worksheet: {old_tab}")
-            except Exception as e:
-                logger.warning(f"Could not delete old worksheet {old_tab}: {e}")
-
-    # Refresh existing list after deletions
-    existing = [ws.title for ws in spreadsheet.worksheets()]
-
-    # --- Tabs managed by google_integration.py ---
-
-    # Expenses Detail sheet (every individual item from receipts)
-    if "Expenses Detail" not in existing:
-        ws = spreadsheet.add_worksheet("Expenses Detail", rows=5000, cols=12)
-        ws.append_row([
-            "Date", "Item", "Qty", "Amount (RM)",
-            "Total (RM)", "Category", "Supplier", "Paid By",
-            "Created At"
-        ])
-        logger.info("Created Expenses Detail worksheet")
-
-    # Expenses sheet (monthly aggregation of purchases by item)
-    if "Expenses" not in existing:
-        ws = spreadsheet.add_worksheet("Expenses", rows=500, cols=6)
-        ws.append_row([
-            "Month", "Item", "Total Qty", "Total Spent (RM)",
-            "Category", "Updated At"
-        ])
-        logger.info("Created Expenses worksheet")
-
-    # Monthly Summary sheet
-    if "Monthly Summary" not in existing:
-        ws = spreadsheet.add_worksheet("Monthly Summary", rows=100, cols=10)
-        ws.append_row([
-            "Month", "Total Expenses (RM)", "Total Revenue (RM)",
-            "Gross Profit (RM)", "Margin %", "Transaction Count",
-            "Top Supplier", "Top Category", "Notes", "Generated At"
-        ])
-        logger.info("Created Monthly Summary worksheet")
-
-    # Daily Sales sheet (per-day POS close-up data)
-    if "Daily Sales" not in existing:
-        ws = spreadsheet.add_worksheet("Daily Sales", rows=1000, cols=15)
-        ws.append_row([
-            "Date", "Total Sales (RM)", "Bills", "Pax",
-            "Cash (RM)", "Card (RM)", "DuitNow (RM)", "TnG (RM)",
-            "GrabPay (RM)", "Other (RM)",
-            "Discount (RM)", "Void (RM)", "Refund (RM)",
-            "Cashier", "Recorded By", "Notes", "Created At"
-        ])
-        logger.info("Created Daily Sales worksheet")
-
-    # POS Reports sheet (detailed POS data — best sellers, items, toppings, etc.)
-    if "POS Reports" not in existing:
-        ws = spreadsheet.add_worksheet("POS Reports", rows=500, cols=10)
-        ws.append_row([
-            "Month", "Total Sales (RM)", "Transaction Count",
-            "Avg Transaction (RM)", "Top Items", "Peak Hours",
-            "Notes", "Analysis", "File Link", "Uploaded At"
-        ])
-        logger.info("Created POS Reports worksheet")
-
-    # Remove default Sheet1 if other sheets exist
-    if "Sheet1" in existing and len(existing) > 1:
-        try:
-            spreadsheet.del_worksheet(spreadsheet.worksheet("Sheet1"))
-        except Exception:
-            pass
+    for col, kind in FORMATS.get(tab, {}).items():
+        idx = ord(col) - ord("A")
+        ftype, pattern = patterns[kind]
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": idx, "endColumnIndex": idx + 1},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": ftype, "pattern": pattern}}},
+            "fields": "userEnteredFormat.numberFormat"}})
+    return reqs
 
 
-
-def log_expense_detail(
-    expense_date: str,
-    supplier: str,
-    item_name: str,
-    qty: int = 1,
-    unit_price: float = 0,
-    amount: float = None,
-    category: str = "ingredients",
-    paid_by: str = "",
-    receipt_link: str = "",
-    recorded_by: str = "",
-    notes: str = "",
-    receipt_id: str = "",
-) -> bool:
-    """Log a single expense item to the Expenses Detail sheet.
-
-    amount = actual total paid for this line (after discount proration).
-             If not provided, falls back to qty * unit_price.
-    """
-    ss = _get_spreadsheet()
-    if ss is None:
-        return False
-
-    from storage import clean_item_name
-    item_name = clean_item_name(item_name)
-
-    # Normalise category
-    from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
-    cat = category.lower().strip() if category else DEFAULT_CATEGORY
-    if cat == "useables":          # backward compat rename
-        cat = "consumables"
-    if cat not in ITEM_CATEGORIES:
-        cat = DEFAULT_CATEGORY
-
-    # Use the pre-calculated amount (discount-adjusted) if provided
-    total = amount if amount is not None else qty * unit_price
-    # Unit price: use passed value, or derive from total/qty
-    if unit_price and unit_price > 0:
-        display_unit_price = unit_price
-    elif total > 0 and qty > 0:
-        display_unit_price = total / qty
-    else:
-        display_unit_price = 0
-
+def ws(tab: str):
+    """Get a tab, creating it (with header + formats) if missing; check its header."""
+    import gspread
+    ss = _spreadsheet()
+    headers = TABS[tab]
     try:
-        ws = ss.worksheet("Expenses Detail")
-        # Ensure Receipt ID header exists in column J
-        try:
-            headers = ws.row_values(1)
-            if len(headers) < 10 or headers[9] != "Receipt ID":
-                ws.update_cell(1, 10, "Receipt ID")
-        except Exception:
-            pass
-        # Safety: always normalize date right before writing
-        expense_date = _normalize_date(expense_date)
-        _maybe_insert_month_separator(ws, expense_date, 9)
-        row_data = [
-            "'" + expense_date,  # apostrophe prefix forces Sheets to keep as text, not reformat
-            item_name,
-            qty,
-            f"{display_unit_price:.2f}",
-            f"{total:.2f}",
-            cat.capitalize(),
-            supplier,
-            paid_by,
-            _fmt_ts(),
-            receipt_id,
-        ]
-        ws.append_row(row_data, value_input_option="USER_ENTERED", table_range="A1")
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to log expense detail: {e}")
-        return False
+        sheet = ss.worksheet(tab)
+    except gspread.WorksheetNotFound:
+        with _lock:
+            sheet = ss.add_worksheet(title=tab, rows=1000, cols=len(headers))
+            sheet.update([headers], "A1", value_input_option="RAW")
+            ss.batch_update({"requests": format_requests(sheet.id, tab)})
+            log.info("Created tab %s", tab)
+        _checked.add(tab)
+        return sheet
+    if tab not in _checked:
+        first = [h.strip() for h in sheet.row_values(1)]
+        if first[:len(headers)] != headers:
+            raise SheetLayoutError(
+                f"The '{tab}' tab has different columns than expected. "
+                f"Run migrate_sheet.py to update the Sheet layout.")
+        _checked.add(tab)
+    return sheet
 
 
-def _normalize_item_name(name: str) -> str:
-    """Normalize item name for deduplication.
-    Strips punctuation variations so 'Coconut (Toasted, 100g)' and
-    'Coconut - Toasted, 100g' match as the same item."""
-    import re
-    s = name.strip()
-    # Remove content inside parentheses and the parens themselves
-    # "Toasted Coconut (Toasted, 100g)" → "Toasted Coconut Toasted 100g"
-    s = re.sub(r'[(){}[\]]', ' ', s)
-    # Replace dashes, slashes, dots with space
-    s = re.sub(r'[-/\\.,;:]+', ' ', s)
-    # Collapse whitespace
-    s = re.sub(r'\s+', ' ', s).strip().lower()
+def _cell(value):
+    """Make a value safe for USER_ENTERED: text that looks like a formula or a
+    date stays text; numbers stay numbers."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return round(value, 4)
+    s = str(value)
+    if s[:1] in ("=", "+", "-", "@") or (len(s) == 7 and s[4:5] == "-" and s[:4].isdigit()):
+        return "'" + s
     return s
 
 
-def update_monthly_expenses(month: str = None) -> bool:
-    """
-    Aggregate ALL months from Expenses Detail into the Expenses tab.
-    Groups by month + item, sorted newest month first, then alphabetical.
-    Rebuilds the entire Expenses tab each time so it's always in sync.
-    """
-    ss = _get_spreadsheet()
-    if ss is None:
-        return False
+def _append(tab: str, rows: list[list]) -> None:
+    ws(tab).append_rows([[_cell(v) for v in row] for row in rows],
+                        value_input_option="USER_ENTERED", insert_data_option="INSERT_ROWS",
+                        table_range="A1")
 
+
+def records(tab: str) -> list[dict]:
+    # Formatted values: dates come back as YYYY-MM-DD text (not serial numbers);
+    # storage.to_number copes with "1,234.50".
+    return ws(tab).get_all_records(expected_headers=TABS[tab], default_blank="")
+
+
+# ─── Receipts ─────────────────────────────────────────────
+
+def find_duplicate(photo_hash: str, key: str) -> str | None:
+    """Receipt ID of an already-saved copy of this receipt, if any."""
+    for row in records("Receipts"):
+        same_photo = photo_hash and row.get("Photo Hash") == photo_hash
+        row_key = storage.receipt_key({"date": storage.parse_date(row.get("Date")) or "",
+                                       "supplier": row.get("Supplier", ""),
+                                       "total": row.get("Total (RM)")})
+        if same_photo or row_key == key:
+            return str(row.get("Receipt ID") or "?")
+    return None
+
+
+def save_receipt(rid: str, r: dict, photo_link: str, submitted_by: str, photo_hash: str) -> None:
+    month = storage.month_of(r["date"])
+    _append("Receipts", [[rid, r["date"], month, r["supplier"], r["total"], r["paid_by"], r["payment"],
+                          len(r["items"]), photo_link, submitted_by, storage.stamp(), photo_hash]])
     try:
-        ws_detail = ss.worksheet("Expenses Detail")
-        all_rows = ws_detail.get_all_records()
-
-        if not all_rows:
-            return True
-
-        # Aggregate by (month, item) across ALL months
-        # Key: (month_str, norm_name) → {qty, total, category, display_name}
-        agg = {}
-        for row in all_rows:
-            date_str = str(row.get("Date", "")).strip()
-            row_month = _parse_month_from_date(date_str)
-            if not row_month:
-                continue
-
-            item = row.get("Item", "")
-            if not item or not str(item).strip():
-                continue  # skip empty/malformed rows
-            norm = _normalize_item_name(item)
-            try:
-                qty = int(row.get("Qty", 0) or 0)
-            except (ValueError, TypeError):
-                qty = 0
-            try:
-                total = float(row.get("Total (RM)", 0) or row.get("Amount (RM)", 0) or 0)
-            except (ValueError, TypeError):
-                total = 0
-            cat = row.get("Category", "ingredients")
-
-            key = (row_month, norm)
-            if key not in agg:
-                agg[key] = {"qty": 0, "total": 0, "category": cat, "display_name": item, "latest_at": ""}
-            agg[key]["qty"] += qty
-            agg[key]["total"] += total
-            # Track the latest Created At for this item
-            created_at = str(row.get("Created At", ""))
-            if created_at > agg[key]["latest_at"]:
-                agg[key]["latest_at"] = created_at
-
-        # Build rows sorted by month (newest first), then item name
-        header = [
-            "Month", "Item", "Total Qty", "Total Spent (RM)",
-            "Category", "Updated At"
-        ]
-        data_rows = []
-        for (row_month, norm_key), data in agg.items():
-            data_rows.append([
-                row_month,
-                data["display_name"],
-                data["qty"],
-                f"{data['total']:.2f}",
-                data["category"].capitalize(),
-                data["latest_at"] or _fmt_ts(),  # fallback to now if no Created At
-            ])
-
-        # Sort: newest month first, then alphabetical within month
-        data_rows.sort(key=lambda r: (-int(r[0].replace("-", "")), r[1].lower()))
-
-        # Insert month separator rows for visual clarity
-        final_rows = []
-        current_month = None
-        separator_row_indices = []  # track which rows are separators (1-indexed, after header)
-        for row in data_rows:
-            if row[0] != current_month:
-                current_month = row[0]
-                try:
-                    from datetime import datetime as _dt
-                    month_label = _dt.strptime(current_month, "%Y-%m").strftime("%B %Y")
-                except ValueError:
-                    month_label = current_month
-                separator_row_indices.append(len(final_rows) + 2)  # +2 for header row + 1-index
-                final_rows.append([f"═══ {month_label} ═══", "", "", "", "", ""])
-            final_rows.append(row)
-
-        ws_exp = ss.worksheet("Expenses")
-        ws_exp.clear()
-        ws_exp.update("A1", [header] + final_rows)
-        ws_exp.format("A1:F1", {"textFormat": {"bold": True}})
-
-        # Bold the month separator rows
-        import time as _time
-        for row_idx in separator_row_indices:
-            try:
-                ws_exp.format(f"A{row_idx}:F{row_idx}", {
-                    "textFormat": {"bold": True},
-                    "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
-                })
-                _time.sleep(1)  # Rate limit
-            except Exception:
-                pass  # Non-critical formatting
-
-        logger.info(f"Updated expenses: {len(data_rows)} rows across {len(set(k[0] for k in agg))} months")
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to update monthly expenses: {e}")
-        return False
+        _append("Receipt Items", [[rid, r["date"], month, r["supplier"], it["name"], it["category"],
+                                   it["qty"], it["unit_price"], it["line_total"], r["paid_by"]]
+                                  for it in r["items"]])
+    except Exception:
+        _delete_rows_where("Receipts", "Receipt ID", rid)  # don't leave half a receipt
+        raise
 
 
-def delete_expense_rows(supplier: str, expense_date: str) -> int:
-    """Find and delete matching rows from Expenses Detail sheet.
-    Returns count of deleted rows. Re-aggregates monthly after deletion."""
-    ss = _get_spreadsheet()
-    if ss is None:
-        return 0
-
-    try:
-        ws = ss.worksheet("Expenses Detail")
-
-        all_rows = ws.get_all_values()
-        if not all_rows or len(all_rows) < 2:
-            return 0
-
-        header = all_rows[0]
-        # Find supplier and date column indices
-        supplier_col = None
-        date_col = None
-        for i, h in enumerate(header):
-            h_lower = h.lower().strip()
-            if 'supplier' in h_lower:
-                supplier_col = i
-            if 'date' in h_lower:
-                date_col = i
-
-        if supplier_col is None or date_col is None:
-            logger.error("Could not find supplier/date columns in Expenses Detail")
-            return 0
-
-        # Find rows to delete (from bottom up to preserve indices)
-        rows_to_delete = []
-        supplier_norm = supplier.lower().strip()
-        for row_idx, row in enumerate(all_rows[1:], 2):  # row 2 = first data row
-            if len(row) <= max(supplier_col, date_col):
-                continue
-            row_supplier = row[supplier_col].lower().strip()
-            row_date = row[date_col].strip()
-            if supplier_norm in row_supplier or row_supplier in supplier_norm:
-                if row_date == expense_date:
-                    rows_to_delete.append(row_idx)
-
-        # Delete from bottom up
-        deleted = 0
-        for row_idx in sorted(rows_to_delete, reverse=True):
-            try:
-                ws.delete_rows(row_idx)
-                deleted += 1
-            except Exception as e:
-                logger.error(f"Error deleting row {row_idx}: {e}")
-
-        # Re-aggregate monthly expenses
-        if deleted > 0:
-            try:
-                update_monthly_expenses()
-            except Exception as e:
-                logger.error(f"Error re-aggregating after deletion: {e}")
-
-        return deleted
-    except Exception as e:
-        logger.error(f"delete_expense_rows error: {e}")
-        return 0
+def _delete_rows_where(tab: str, column: str, value: str) -> None:
+    sheet = ws(tab)
+    col = TABS[tab].index(column) + 1
+    rows = [i for i, v in enumerate(sheet.col_values(col), 1) if i > 1 and v == value]
+    for i in reversed(rows):
+        sheet.delete_rows(i)
 
 
-def update_expense_by_receipt_id(receipt_id: str, items: list, receipt_data: dict) -> int:
-    """Update expense rows matching a receipt ID with corrected item data.
-    Deletes old rows with this receipt_id and re-inserts corrected ones.
-    Returns count of rows updated."""
-    ss = _get_spreadsheet()
-    if ss is None:
-        return 0
+# ─── Daily sales ──────────────────────────────────────────
 
-    try:
-        ws = ss.worksheet("Expenses Detail")
-        all_rows = ws.get_all_values()
-        if not all_rows or len(all_rows) < 2:
-            return 0
-
-        header = all_rows[0]
-        # Find Receipt ID column (column J, index 9)
-        rid_col = None
-        for i, h in enumerate(header):
-            if 'receipt' in h.lower() and 'id' in h.lower():
-                rid_col = i
-                break
-        if rid_col is None:
-            # Try column J (index 9) as fallback
-            if len(header) > 9:
-                rid_col = 9
-            else:
-                logger.error("Could not find Receipt ID column")
-                return 0
-
-        # Find rows to delete (from bottom up)
-        rows_to_delete = []
-        for row_idx, row in enumerate(all_rows[1:], 2):
-            if len(row) > rid_col and row[rid_col].strip() == receipt_id:
-                rows_to_delete.append(row_idx)
-
-        # Delete old rows (bottom up)
-        for row_idx in sorted(rows_to_delete, reverse=True):
-            ws.delete_rows(row_idx)
-
-        # Re-insert corrected items
-        from storage import clean_item_name
-        supplier = receipt_data.get("supplier", "Unknown")
-        paid_by = receipt_data.get("paid_by", "")
-        expense_date = _normalize_date(receipt_data.get("date", ""))
-        receipt_total = float(receipt_data.get("total") or 0)
-
-        from config import ITEM_CATEGORIES, DEFAULT_CATEGORY
-        import re as _re
-
-        items_merged = _merge_items_for_sheet(items)
-
-        # Sanity check: if item line_totals don't sum to receipt total, proportionally adjust
-        if receipt_total > 0 and len(items_merged) > 1:
-            _item_sum = sum(
-                float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
-                for it in items_merged if clean_item_name(it.get("name", ""))
-            )
-            if _item_sum > 0 and abs(_item_sum - receipt_total) > 1.0:
-                _ratio = receipt_total / _item_sum
-                for it in items_merged:
-                    _old_lt = float(it.get("line_total", float(it.get("price", 0) or 0) * int(it.get("qty", 1) or 1)))
-                    it["line_total"] = round(_old_lt * _ratio, 2)
-                    _q = int(it.get("qty", 1) or 1)
-                    if _q > 0:
-                        it["price"] = round(it["line_total"] / _q, 4)
-                logger.info(f"Sanity fix: item sum {_item_sum:.2f} → scaled to receipt total {receipt_total:.2f}")
-
-        count = 0
-        for item in items_merged:
-            item_name = clean_item_name(item.get("name", ""))
-            if not item_name:
-                continue
-            qty = item.get("qty", 1)
-            price = item.get("price", 0)
-            cat = (item.get("category", DEFAULT_CATEGORY) or DEFAULT_CATEGORY).lower().strip()
-            if cat == "useables":
-                cat = "consumables"
-            if cat not in ITEM_CATEGORIES:
-                cat = DEFAULT_CATEGORY
-
-            try:
-                qty_nums = _re.findall(r'[\d.]+', str(qty))
-                qty_int = int(float(qty_nums[0])) if qty_nums else 1
-            except (ValueError, IndexError):
-                qty_int = 1
-
-            if len(items_merged) == 1 and receipt_total > 0:
-                item_amount = receipt_total
-            elif "line_total" in item:
-                item_amount = float(item["line_total"])
-            else:
-                item_amount = qty_int * (float(price) if price else 0)
-
-            # Derive unit price from item_amount
-            if qty_int > 0 and item_amount > 0:
-                display_unit_price = round(item_amount / qty_int, 4)
-            else:
-                display_unit_price = float(price) if price else 0
-
-            # Safety: always normalize date right before writing
-            safe_date = _normalize_date(expense_date)
-            row_data = [
-                "'" + safe_date,  # apostrophe prefix forces Sheets to keep as text
-                item_name,
-                qty_int,
-                f"{display_unit_price:.2f}",
-                f"{item_amount:.2f}",
-                cat.capitalize(),
-                supplier,
-                paid_by,
-                _fmt_ts(),
-                receipt_id,
-            ]
-            ws.append_row(row_data, value_input_option="USER_ENTERED", table_range="A1")
-            count += 1
-
-        # Re-aggregate monthly
-        try:
-            update_monthly_expenses()
-        except Exception as e:
-            logger.error(f"Monthly re-aggregation after receipt update: {e}")
-
-        logger.info(f"Updated {count} rows for receipt {receipt_id} (deleted {len(rows_to_delete)} old rows)")
-        return count
-
-    except Exception as e:
-        logger.error(f"Failed to update expense by receipt ID: {e}")
-        return 0
+def sales_row_for(day: str) -> int | None:
+    sheet = ws("Daily Sales")
+    for i, v in enumerate(sheet.col_values(1), 1):
+        if i > 1 and storage.parse_date(v) == day:
+            return i
+    return None
 
 
-def _merge_items_for_sheet(items: list) -> list:
-    """Merge duplicate items for sheet writing (same as _merge_receipt_items in bot.py)."""
-    from storage import normalize_item_name
-    merged = {}
-    for item in items:
-        name = item.get("name", "").strip()
-        if not name:
-            continue
-        key = normalize_item_name(name)
-        if key in merged:
-            try:
-                merged[key]["qty"] = int(merged[key].get("qty", 1)) + int(item.get("qty", 1))
-            except (ValueError, TypeError):
-                merged[key]["qty"] = int(merged[key].get("qty", 1)) + 1
-            try:
-                existing_price = float(merged[key].get("price", 0) or 0)
-                new_price = float(item.get("price", 0) or 0)
-                if new_price > existing_price:
-                    merged[key]["price"] = new_price
-            except (ValueError, TypeError):
-                pass
-            # Sum line_totals when merging
-            try:
-                existing_lt = float(merged[key].get("line_total", 0) or 0)
-                new_lt = float(item.get("line_total", float(item.get("price", 0) or 0) * int(item.get("qty", 1) or 1)))
-                merged[key]["line_total"] = round(existing_lt + new_lt, 2)
-            except (ValueError, TypeError):
-                pass
+def sales_row(s: dict, recorded_by: str) -> list:
+    pay = {"cash": 0.0, "card": 0.0, "duitnow": 0.0, "tng": 0.0, "grab": 0.0}
+    other = 0.0
+    for p in s.get("payments") or []:
+        method = storage.name_key(p.get("method"))
+        amount = storage.to_number(p.get("amount")) or 0.0
+        key = ("cash" if "cash" in method else
+               "card" if any(w in method for w in ("card", "credit", "debit", "visa", "master", "amex")) else
+               "duitnow" if "duit" in method or "qr" in method else
+               "tng" if "tng" in method or "touch" in method or "t g" in method else
+               "grab" if "grab" in method else None)
+        if key:
+            pay[key] += amount
         else:
-            merged[key] = dict(item)
-    return list(merged.values())
+            other += amount
+    num = storage.to_number
+    return [s["date"], num(s.get("total_sales")) or 0.0, int(num(s.get("bills")) or 0), int(num(s.get("pax")) or 0),
+            pay["cash"], pay["card"], pay["duitnow"], pay["tng"], pay["grab"], other,
+            num(s.get("discount")) or 0.0, num(s.get("void")) or 0.0, num(s.get("refund")) or 0.0,
+            storage.clean_name(s.get("cashier")), recorded_by, "", storage.stamp()]
 
 
-def get_expenses_detail(month: str = None) -> list:
-    """Get all expense detail rows for a month (YYYY-MM format)."""
-    ss = _get_spreadsheet()
-    if ss is None:
-        return []
-
-    if month is None:
-        month = _now().date().strftime("%Y-%m")
-
-    try:
-        ws = ss.worksheet("Expenses Detail")
-        all_rows = ws.get_all_records()
-        return [r for r in all_rows if str(r.get("Date", "")).startswith(month)]
-    except Exception as e:
-        logger.error(f"Failed to get expenses detail: {e}")
-        return []
+def save_sales(s: dict, recorded_by: str, replace_row: int | None = None) -> None:
+    row = sales_row(s, recorded_by)
+    if replace_row:
+        ws("Daily Sales").update([[_cell(v) for v in row]], f"A{replace_row}", value_input_option="USER_ENTERED")
+    else:
+        _append("Daily Sales", [row])
 
 
-def get_repayment_summary(month: str = None) -> dict:
-    """
-    Calculate how much each person paid vs the total, so you know
-    who to reimburse and how much.
+# ─── Stock ────────────────────────────────────────────────
 
-    Returns:
-    {
-        "month": "2026-08",
-        "total_spent": 1234.56,
-        "by_person": {
-            "Ali": {"paid": 500.00, "items": 12, "categories": {"Ingredients": 400, ...}},
-            "Kendrick": {"paid": 734.56, "items": 18, ...},
-        }
-    }
-    """
-    expenses = get_expenses_detail(month)
-    if not expenses:
-        return {}
-
-    total_spent = 0
-    by_person = {}
-
-    for row in expenses:
-        try:
-            amount = float(row.get("Total (RM)", 0) or 0)
-        except (ValueError, TypeError):
-            amount = 0
-
-        total_spent += amount
-        person = row.get("Paid By", "Unknown") or "Unknown"
-        cat = row.get("Category", "Other") or "Other"
-
-        if person not in by_person:
-            by_person[person] = {"paid": 0, "items": 0, "categories": {}}
-
-        by_person[person]["paid"] += amount
-        by_person[person]["items"] += 1
-        by_person[person]["categories"][cat] = (
-            by_person[person]["categories"].get(cat, 0) + amount
-        )
-
-    return {
-        "month": month or _now().date().strftime("%Y-%m"),
-        "total_spent": total_spent,
-        "by_person": by_person,
-    }
+def stock() -> list[dict]:
+    return [r for r in records("Stock") if storage.clean_name(r.get("Item"))]
 
 
-def log_daily_sales(
-    report_date: str,
-    total_sales: float,
-    bill_count: int,
-    total_pax: int,
-    payment_breakdown: list,
-    total_discount: float = 0,
-    total_void: float = 0,
-    total_refund: float = 0,
-    other_charge: float = 0,
-    cashier: str = "",
-    recorded_by: str = "",
-    notes: str = "",
-) -> bool:
-    """Log a daily POS sales report to the Daily Sales worksheet."""
-    ss = _get_spreadsheet()
-    if ss is None:
-        return False
-
-    try:
-        ws = ss.worksheet("Daily Sales")
-        _maybe_insert_month_separator(ws, report_date, 17)
-
-        # Extract payment amounts by method
-        pay_map = {}
-        for p in payment_breakdown:
-            method = (p.get("method", "") or "").lower()
-            amount = float(p.get("amount", 0) or 0)
-            pay_map[method] = pay_map.get(method, 0) + amount
-
-        cash = pay_map.get("cash", 0)
-        card = sum(v for k, v in pay_map.items()
-                   if any(w in k for w in ("card", "credit", "debit", "visa", "master")))
-        duitnow = sum(v for k, v in pay_map.items()
-                      if "duitnow" in k or "duit now" in k)
-        tng = sum(v for k, v in pay_map.items()
-                  if "tng" in k or "touch" in k or "t&g" in k)
-        grabpay = sum(v for k, v in pay_map.items()
-                      if "grab" in k)
-        # Everything else
-        known = cash + card + duitnow + tng + grabpay
-        other_pay = max(0, total_sales - known) if total_sales > known else 0
-
-        ws.append_row([
-            report_date,
-            f"{total_sales:.2f}",
-            bill_count,
-            total_pax,
-            f"{cash:.2f}",
-            f"{card:.2f}",
-            f"{duitnow:.2f}",
-            f"{tng:.2f}",
-            f"{grabpay:.2f}",
-            f"{other_pay:.2f}",
-            f"{total_discount:.2f}",
-            f"{total_void:.2f}",
-            f"{total_refund:.2f}",
-            cashier,
-            recorded_by,
-            notes,
-            _fmt_ts(),
-        ])
-        logger.info(f"Logged daily sales: {report_date} RM{total_sales:.2f}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to log daily sales: {e}")
-        return False
-
-
-def log_pos_report(
-    month: str,
-    total_sales: float,
-    transaction_count: int,
-    avg_transaction: float,
-    top_items: str,
-    peak_hours: str,
-    notes: str = "",
-    analysis: str = "",
-    file_link: str = "",
-) -> bool:
-    """Log monthly POS report data."""
-    ss = _get_spreadsheet()
-    if ss is None:
-        return False
-
-    try:
-        ws = ss.worksheet("POS Reports")
-        ws.append_row([
-            month,
-            f"{total_sales:.2f}",
-            transaction_count,
-            f"{avg_transaction:.2f}",
-            top_items,
-            peak_hours,
-            notes,
-            analysis[:500],
-            file_link,
-            _fmt_ts(),
-        ])
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to log POS report: {e}")
-        return False
-
-
-def get_pl_summary(month: str = None) -> dict:
-    """Calculate P&L for a month using Expenses Detail + Daily Sales."""
-    if month is None:
-        month = _now().date().strftime("%Y-%m")
-
-    expenses = get_expenses_detail(month)
-    total_expenses = 0
-    suppliers = {}
-
-    for row in expenses:
-        try:
-            amount = float(row.get("Total (RM)", 0) or 0)
-        except (ValueError, TypeError):
-            amount = 0
-        total_expenses += amount
-        supplier = row.get("Supplier", "Unknown")
-        suppliers[supplier] = suppliers.get(supplier, 0) + amount
-
-    # Revenue from Daily Sales
-    daily_sales = get_daily_sales_for_month(month)
-    total_revenue = 0
-    for ds in daily_sales:
-        try:
-            total_revenue += float(ds.get("Total Sales (RM)", 0) or 0)
-        except (ValueError, TypeError):
-            pass
-
-    top_supplier = max(suppliers, key=suppliers.get) if suppliers else "N/A"
-
-    return {
-        "month": month,
-        "total_expenses": total_expenses,
-        "total_revenue": total_revenue,
-        "gross_profit": total_revenue - total_expenses,
-        "margin": ((total_revenue - total_expenses) / total_revenue * 100)
-                  if total_revenue > 0 else 0,
-        "transaction_count": len(expenses),
-        "top_supplier": top_supplier,
-    }
-
-
-def get_daily_sales_for_month(month: str = None) -> list:
-    """Get all daily sales entries for a month (YYYY-MM format)."""
-    ss = _get_spreadsheet()
-    if ss is None:
-        return []
-
-    if month is None:
-        month = _now().date().strftime("%Y-%m")
-
-    try:
-        ws = ss.worksheet("Daily Sales")
-        all_rows = ws.get_all_records()
-        return [r for r in all_rows if str(r.get("Date", "")).startswith(month)]
-    except Exception as e:
-        logger.error(f"Failed to get daily sales: {e}")
-        return []
-
-
-def generate_monthly_summary(month: str = None) -> dict:
-    """
-    Calculate and write a monthly P&L summary to the Monthly Summary tab.
-    Combines expenses (Expenses Detail) + revenue (Daily Sales).
-    Returns the summary dict.
-    """
-    if month is None:
-        month = _now().date().strftime("%Y-%m")
-
-    # Get expense data from Expenses Detail
-    pl = get_pl_summary(month)
-    total_expenses = pl.get("total_expenses", 0) if pl else 0
-    top_supplier = pl.get("top_supplier", "N/A") if pl else "N/A"
-    expense_count = pl.get("transaction_count", 0) if pl else 0
-
-    # Get revenue data from Daily Sales
-    daily_sales = get_daily_sales_for_month(month)
-    total_revenue = 0
-    total_bills = 0
-    total_pax = 0
-    payment_totals = {}
-    sales_days = 0
-
-    for row in daily_sales:
-        try:
-            sales = float(row.get("Total Sales (RM)", 0) or 0)
-            total_revenue += sales
-            total_bills += int(row.get("Bills", 0) or 0)
-            total_pax += int(row.get("Pax", 0) or 0)
-            sales_days += 1
-
-            # Aggregate payment methods
-            for col in ["Cash (RM)", "Card (RM)", "DuitNow (RM)",
-                        "TnG (RM)", "GrabPay (RM)", "Other (RM)"]:
-                method = col.replace(" (RM)", "")
-                val = float(row.get(col, 0) or 0)
-                payment_totals[method] = payment_totals.get(method, 0) + val
-        except (ValueError, TypeError):
+def update_stock(updates: list[dict], by: str) -> tuple[list[str], list[dict]]:
+    """Set counts for known items. Returns (updated names, unknown updates)."""
+    sheet = ws("Stock")
+    names = sheet.col_values(1)
+    index = {storage.name_key(n): i for i, n in enumerate(names, 1) if i > 1}
+    cells, done, unknown = [], [], []
+    for u in updates:
+        row = index.get(storage.name_key(u["item"]))
+        if not row:
+            unknown.append(u)
             continue
-
-    gross_profit = total_revenue - total_expenses
-    margin = (gross_profit / total_revenue * 100) if total_revenue > 0 else 0
-    avg_daily = total_revenue / sales_days if sales_days > 0 else 0
-    avg_bill = total_revenue / total_bills if total_bills > 0 else 0
-
-    # Top payment method
-    top_payment = max(payment_totals, key=payment_totals.get) if payment_totals else "N/A"
-
-    summary = {
-        "month": month,
-        "total_expenses": total_expenses,
-        "total_revenue": total_revenue,
-        "gross_profit": gross_profit,
-        "margin": margin,
-        "expense_count": expense_count,
-        "sales_days": sales_days,
-        "total_bills": total_bills,
-        "total_pax": total_pax,
-        "avg_daily_sales": avg_daily,
-        "avg_bill": avg_bill,
-        "top_supplier": top_supplier,
-        "top_payment": top_payment,
-        "payment_totals": payment_totals,
-    }
-
-    # Write to Monthly Summary sheet
-    ss = _get_spreadsheet()
-    if ss:
-        try:
-            ws = ss.worksheet("Monthly Summary")
-
-            # Check if this month already has an entry — update or append
-            existing = ws.get_all_records()
-            row_idx = None
-            for i, r in enumerate(existing):
-                if r.get("Month", "") == month:
-                    row_idx = i + 2  # +1 for header, +1 for 1-indexed
-                    break
-
-            notes = (
-                f"{sales_days} trading days, "
-                f"{total_bills} bills, "
-                f"{total_pax} pax, "
-                f"Avg bill RM{avg_bill:.2f}, "
-                f"Top payment: {top_payment}"
-            )
-
-            row_data = [
-                month,
-                f"{total_expenses:.2f}",
-                f"{total_revenue:.2f}",
-                f"{gross_profit:.2f}",
-                f"{margin:.1f}",
-                expense_count,
-                top_supplier,
-                top_payment,
-                notes,
-                _fmt_ts(),
-            ]
-
-            if row_idx:
-                # Update existing row
-                ws.update(f"A{row_idx}:J{row_idx}", [row_data])
-                logger.info(f"Updated Monthly Summary for {month}")
-            else:
-                ws.append_row(row_data)
-                logger.info(f"Added Monthly Summary for {month}")
-
-        except Exception as e:
-            logger.error(f"Failed to write monthly summary: {e}")
-
-    return summary
+        cells += [{"range": f"B{row}", "values": [[u["qty"]]]},
+                  {"range": f"F{row}:G{row}", "values": [[storage.stamp(), by]]}]
+        done.append(names[row - 1])
+    if cells:
+        sheet.batch_update(cells, value_input_option="USER_ENTERED")
+    return done, unknown
 
 
-def get_all_data_for_ai(month: str = None) -> str:
-    """Pull all Sheets data into a text block for AI to analyze."""
-    parts = []
+def add_stock_item(name: str, qty: float, by: str, minimum: float | None = None) -> None:
+    _append("Stock", [[storage.clean_name(name), qty, minimum if minimum is not None else "", "", "",
+                       storage.stamp(), by]])
 
-    # P&L summary (from Expenses Detail + Daily Sales)
-    pl = get_pl_summary(month)
-    if pl:
-        parts.append(
-            f"P&L for {pl['month']}:\n"
-            f"  Expenses: RM{pl['total_expenses']:.2f}\n"
-            f"  Revenue: RM{pl['total_revenue']:.2f}\n"
-            f"  Gross Profit: RM{pl['gross_profit']:.2f}\n"
-            f"  Margin: {pl['margin']:.1f}%\n"
-            f"  Expense Items: {pl['transaction_count']}\n"
-            f"  Top Supplier: {pl['top_supplier']}"
-        )
 
-    # Daily Sales (per-day revenue breakdown)
-    daily_sales = get_daily_sales_for_month(month)
-    if daily_sales:
-        lines = [f"Daily Sales ({len(daily_sales)} days recorded):"]
-        total_rev = 0
-        for ds in daily_sales[-15:]:  # last 15 days
-            day_total = 0
-            try:
-                day_total = float(ds.get("Total Sales (RM)", 0) or 0)
-                total_rev += day_total
-            except (ValueError, TypeError):
-                pass
-            lines.append(
-                f"  {ds.get('Date', '?')}: RM{day_total:.2f}, "
-                f"{ds.get('Bills', '?')} bills, "
-                f"{ds.get('Pax', '?')} pax, "
-                f"Cash RM{ds.get('Cash (RM)', 0)}, "
-                f"Card RM{ds.get('Card (RM)', 0)}, "
-                f"DuitNow RM{ds.get('DuitNow (RM)', 0)}"
-            )
-        lines.append(f"  → Month total revenue from Daily Sales: RM{total_rev:.2f}")
-        parts.append("\n".join(lines))
+# ─── Shopping list ────────────────────────────────────────
 
-    # Expenses Detail (itemised purchases with categories & who paid)
-    expenses_detail = get_expenses_detail(month)
-    if expenses_detail:
-        lines = [f"Expenses Detail ({len(expenses_detail)} items this month):"]
-        by_cat = {}
-        by_person = {}
-        by_item = {}
-        for ed in expenses_detail[-30:]:
-            cat = ed.get("Category", "?")
-            person = ed.get("Paid By", "?")
-            item_name = ed.get("Item", "?")
-            try:
-                amt = float(ed.get("Total (RM)", 0) or 0)
-                qty = int(ed.get("Qty", 0) or 0)
-            except (ValueError, TypeError):
-                amt = 0
-                qty = 0
-            by_cat[cat] = by_cat.get(cat, 0) + amt
-            by_person[person] = by_person.get(person, 0) + amt
-            if item_name not in by_item:
-                by_item[item_name] = {"qty": 0, "total": 0}
-            by_item[item_name]["qty"] += qty
-            by_item[item_name]["total"] += amt
-            lines.append(
-                f"  {ed.get('Date', '?')} | {item_name} x{qty} "
-                f"| RM{amt:.2f} | {cat} | {ed.get('Supplier', '?')} | Paid: {person}"
-            )
-        lines.append("  By category: " + ", ".join(
-            f"{k}: RM{v:.2f}" for k, v in sorted(by_cat.items())))
-        lines.append("  By person: " + ", ".join(
-            f"{k}: RM{v:.2f}" for k, v in sorted(by_person.items())))
-        # Monthly totals per item (for price comparison)
-        lines.append("  Monthly totals by item:")
-        for item, data in sorted(by_item.items()):
-            lines.append(f"    {item}: {data['qty']} units, RM{data['total']:.2f}")
-        parts.append("\n".join(lines))
+def shopping_open() -> list[tuple[int, dict]]:
+    """Open items as (sheet row number, record)."""
+    rows = records("Shopping List")
+    return [(i, r) for i, r in enumerate(rows, 2) if r.get("Status") != DONE and storage.clean_name(r.get("Item"))]
 
-    # Repayment summary
-    repay = get_repayment_summary(month)
-    if repay and repay.get("by_person"):
-        lines = [f"Repayment Summary ({repay['month']}):"]
-        lines.append(f"  Total spent: RM{repay['total_spent']:.2f}")
-        for person, info in repay["by_person"].items():
-            lines.append(f"  {person}: paid RM{info['paid']:.2f} ({info['items']} items)")
-        parts.append("\n".join(lines))
 
-    # POS reports
-    ss = _get_spreadsheet()
-    if ss:
-        try:
-            ws = ss.worksheet("POS Reports")
-            pos_rows = ws.get_all_records()
-            if pos_rows:
-                lines = ["POS Reports:"]
-                for r in pos_rows[-6:]:
-                    lines.append(
-                        f"  {r.get('Month', '?')}: Sales RM{r.get('Total Sales (RM)', '?')}, "
-                        f"{r.get('Transaction Count', '?')} txns, "
-                        f"Top: {r.get('Top Items', '?')[:40]}"
-                    )
-                parts.append("\n".join(lines))
-        except Exception:
-            pass
+def shopping_add(items: list[str], by: str, note: str = "") -> list[str]:
+    """Add items not already on the open list. Returns the names actually added."""
+    have = {storage.name_key(r.get("Item")) for _, r in shopping_open()}
+    new, seen = [], set()
+    for name in items:
+        key = storage.name_key(name)
+        if key and key not in have and key not in seen:
+            seen.add(key)
+            new.append(storage.clean_name(name))
+    if new:
+        _append("Shopping List", [[n, note, by, storage.stamp(), NEED, "", ""] for n in new])
+    return new
 
-    if not parts:
-        return "No Google Sheets data available yet."
 
+def shopping_done(row: int, by: str) -> str:
+    sheet = ws("Shopping List")
+    item = sheet.acell(f"A{row}").value or ""
+    sheet.update([[DONE, by, storage.stamp()]], f"E{row}:G{row}", value_input_option="USER_ENTERED")
+    return item
+
+
+# ─── Reading for questions ────────────────────────────────
+
+def read_tab(name: str) -> list[list[str]]:
+    try:
+        return _spreadsheet().worksheet(name).get_all_values()
+    except Exception:
+        return []
+
+
+def table_text(rows: list[list], limit: int = 400) -> str:
+    rows = [r for r in rows if any(str(c).strip() for c in r)]
+    return "\n".join(" | ".join(str(c) for c in r) for r in rows[:limit])
+
+
+def reference_context() -> str:
+    """Recipes, checklists, inspection and stock: safe for everyone."""
+    parts = [f"## {tab}\n{table_text(read_tab(tab))}" for tab in REFERENCE_TABS]
+    stock_rows = [[r.get("Item"), r.get("Current"), r.get("Min"), r.get("Unit"), r.get("Location")] for r in stock()]
+    parts.append("## Stock (Item | Current | Min | Unit | Location)\n" + table_text(stock_rows))
+    parts.append("## Shopping list (open)\n" + "\n".join(r["Item"] for _, r in shopping_open()))
     return "\n\n".join(parts)
 
 
-# ═══════════════════════════════════════════════════════════
-#  📁 GOOGLE DRIVE — Receipt Image Storage
-# ═══════════════════════════════════════════════════════════
-
-RECEIPTS_FOLDER_NAME = "CafeManager_Receipts"
-
-
-def _get_drive_service():
-    """Lazy-init Google Drive API service."""
-    global _drive_service
-    if _drive_service is not None:
-        return _drive_service
-
-    creds = _get_credentials()
-    if creds is None:
-        return None
-
-    try:
-        from googleapiclient.discovery import build
-        _drive_service = build("drive", "v3", credentials=creds)
-        logger.info("Connected to Google Drive")
-        return _drive_service
-    except ImportError:
-        logger.warning(
-            "google-api-python-client not installed — Drive uploads disabled. "
-            "Install with: pip install google-api-python-client"
-        )
-        return None
-    except Exception as e:
-        logger.error(f"Google Drive error: {e}")
-        return None
-
-
-def _get_or_create_receipts_folder() -> Optional[str]:
-    """Get or create the receipts folder on Google Drive. Returns folder ID."""
-    service = _get_drive_service()
-    if service is None:
-        return None
-
-    try:
-        # Check if folder exists
-        query = (
-            f"name='{RECEIPTS_FOLDER_NAME}' and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"trashed=false"
-        )
-        results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
-        folders = results.get("files", [])
-
-        if folders:
-            return folders[0]["id"]
-
-        # Create it
-        folder_meta = {
-            "name": RECEIPTS_FOLDER_NAME,
-            "mimeType": "application/vnd.google-apps.folder",
-        }
-        folder = service.files().create(body=folder_meta, fields="id").execute()
-        folder_id = folder.get("id")
-        logger.info(f"Created receipts folder on Drive: {folder_id}")
-        return folder_id
-
-    except Exception as e:
-        logger.error(f"Drive folder error: {e}")
-        return None
-
-
-def _get_or_create_month_subfolder(month: str) -> Optional[str]:
-    """Get or create a monthly subfolder (e.g. '2026-08') inside receipts folder."""
-    service = _get_drive_service()
-    parent_id = _get_or_create_receipts_folder()
-    if service is None or parent_id is None:
-        return None
-
-    try:
-        query = (
-            f"name='{month}' and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"'{parent_id}' in parents and "
-            f"trashed=false"
-        )
-        results = service.files().list(q=query, spaces="drive", fields="files(id)").execute()
-        folders = results.get("files", [])
-
-        if folders:
-            return folders[0]["id"]
-
-        folder_meta = {
-            "name": month,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        }
-        folder = service.files().create(body=folder_meta, fields="id").execute()
-        return folder.get("id")
-
-    except Exception as e:
-        logger.error(f"Drive subfolder error: {e}")
-        return None
-
-
-def upload_receipt_to_drive(
-    image_bytes: bytes,
-    filename: str,
-    mime_type: str = "image/jpeg",
-    description: str = "",
-) -> Optional[str]:
-    """
-    Upload a receipt image to Google Drive.
-    Returns the web view link (shareable URL).
-    Files are organized: CafeManager_Receipts/2026-08/filename
-    """
-    service = _get_drive_service()
-    if service is None:
-        return None
-
-    month = _now().date().strftime("%Y-%m")
-    folder_id = _get_or_create_month_subfolder(month)
-    if folder_id is None:
-        return None
-
-    try:
-        from googleapiclient.http import MediaInMemoryUpload
-
-        # Build filename: 2026-08-22_receipt_supplier.jpg
-        file_meta = {
-            "name": filename,
-            "parents": [folder_id],
-            "description": description[:500],
-        }
-        media = MediaInMemoryUpload(image_bytes, mimetype=mime_type)
-
-        uploaded = service.files().create(
-            body=file_meta,
-            media_body=media,
-            fields="id, webViewLink",
-        ).execute()
-
-        link = uploaded.get("webViewLink", "")
-        file_id = uploaded.get("id", "")
-
-        # Make viewable by anyone with link
-        try:
-            service.permissions().create(
-                fileId=file_id,
-                body={"type": "anyone", "role": "reader"},
-            ).execute()
-        except Exception:
-            pass  # Still works, just not shareable
-
-        logger.info(f"Receipt uploaded to Drive: {filename}")
-        return link
-
-    except Exception as e:
-        logger.error(f"Drive upload error: {e}")
-        return None
-
-
-def upload_file_to_drive(
-    file_bytes: bytes,
-    filename: str,
-    mime_type: str = "application/octet-stream",
-    subfolder: str = "POS_Reports",
-) -> Optional[str]:
-    """Upload any file to Drive (for POS reports etc). Returns web view link."""
-    service = _get_drive_service()
-    parent_id = _get_or_create_receipts_folder()
-    if service is None or parent_id is None:
-        return None
-
-    try:
-        from googleapiclient.http import MediaInMemoryUpload
-
-        # Get or create subfolder
-        query = (
-            f"name='{subfolder}' and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"'{parent_id}' in parents and "
-            f"trashed=false"
-        )
-        results = service.files().list(q=query, spaces="drive", fields="files(id)").execute()
-        folders = results.get("files", [])
-        if folders:
-            folder_id = folders[0]["id"]
-        else:
-            folder_meta = {
-                "name": subfolder,
-                "mimeType": "application/vnd.google-apps.folder",
-                "parents": [parent_id],
-            }
-            folder = service.files().create(body=folder_meta, fields="id").execute()
-            folder_id = folder.get("id")
-
-        file_meta = {"name": filename, "parents": [folder_id]}
-        media = MediaInMemoryUpload(file_bytes, mimetype=mime_type)
-
-        uploaded = service.files().create(
-            body=file_meta, media_body=media, fields="id, webViewLink"
-        ).execute()
-
-        link = uploaded.get("webViewLink", "")
-
-        # Make viewable
-        try:
-            service.permissions().create(
-                fileId=uploaded["id"],
-                body={"type": "anyone", "role": "reader"},
-            ).execute()
-        except Exception:
-            pass
-
-        return link
-
-    except Exception as e:
-        logger.error(f"Drive file upload error: {e}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════
-#  🎉 HOLIDAY SYSTEM
-# ═══════════════════════════════════════════════════════════
-
-def fetch_google_calendar_holidays(year: int) -> list:
-    """Fetch public holidays from Google Calendar API for MY + SG.
-    Uses the existing service account credentials.
-    Returns list of {"date": "YYYY-MM-DD", "name": str, "country": str}."""
-    holidays = []
-    try:
-        creds = _get_credentials()
-        if not creds:
-            return holidays
-
-        from googleapiclient.discovery import build
-        service = build('calendar', 'v3', credentials=creds)
-
-        time_min = f"{year}-01-01T00:00:00Z"
-        time_max = f"{year}-12-31T23:59:59Z"
-
-        for country, cal_id in config.HOLIDAY_CALENDAR_IDS.items():
-            try:
-                events = service.events().list(
-                    calendarId=cal_id,
-                    timeMin=time_min,
-                    timeMax=time_max,
-                    singleEvents=True,
-                    orderBy='startTime',
-                ).execute()
-
-                for event in events.get('items', []):
-                    start = event.get('start', {})
-                    date_str = start.get('date', start.get('dateTime', '')[:10])
-                    if date_str:
-                        holidays.append({
-                            "date": date_str,
-                            "name": event.get('summary', 'Public Holiday'),
-                            "country": country,
-                            "source": "google_calendar",
-                        })
-            except Exception as e:
-                logger.error(f"Google Calendar error for {country}: {e}")
-    except Exception as e:
-        logger.error(f"fetch_google_calendar_holidays error: {e}")
-
-    return holidays
-
-
-def fetch_calendarific_holidays(year: int) -> list:
-    """Fetch state-level holidays from Calendarific API (free tier).
-    Returns list of {"date": "YYYY-MM-DD", "name": str, "state": str}."""
-    holidays = []
-    api_key = config.CALENDARIFIC_API_KEY
-    if not api_key:
-        logger.info("No CALENDARIFIC_API_KEY — skipping state holidays")
-        return holidays
-
-    import urllib.request
-    import json as _json
-
-    for loc in config.CALENDARIFIC_LOCATIONS:
-        try:
-            country = loc["country"]
-            state = loc.get("state", "")
-            url = (
-                f"https://calendarific.com/api/v2/holidays"
-                f"?api_key={api_key}&country={country}&year={year}"
-            )
-            if state:
-                url += f"&location={state}"
-
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = _json.loads(resp.read().decode())
-
-            for h in data.get("response", {}).get("holidays", []):
-                date_info = h.get("date", {})
-                iso_date = date_info.get("iso", "")[:10]
-                if iso_date:
-                    holidays.append({
-                        "date": iso_date,
-                        "name": h.get("name", "Holiday"),
-                        "state": state or country,
-                        "source": "calendarific",
-                    })
-        except Exception as e:
-            logger.error(f"Calendarific error for {loc}: {e}")
-
-    return holidays
-
-
-def refresh_holiday_cache() -> dict:
-    """Combine all holiday sources, deduplicate, save to data/holidays.json."""
-    import json as _json
-    from pathlib import Path
-
-    cache_file = Path(__file__).parent / "data" / "holidays.json"
-    cache_file.parent.mkdir(exist_ok=True)
-    current_year = _now().year
-    next_year = current_year + 1
-
-    all_holidays = []
-
-    # Google Calendar holidays
-    for year in (current_year, next_year):
-        try:
-            all_holidays.extend(fetch_google_calendar_holidays(year))
-        except Exception as e:
-            logger.error(f"Google Calendar fetch failed for {year}: {e}")
-
-    # Calendarific state holidays
-    for year in (current_year, next_year):
-        try:
-            all_holidays.extend(fetch_calendarific_holidays(year))
-        except Exception as e:
-            logger.error(f"Calendarific fetch failed for {year}: {e}")
-
-    # School holidays
-    school_lists = {
-        current_year: getattr(config, f"SCHOOL_HOLIDAYS_{current_year}", []),
-        next_year: getattr(config, f"SCHOOL_HOLIDAYS_{next_year}", []),
-    }
-    for year, school_list in school_lists.items():
-        for start, end, label in school_list:
-            all_holidays.append({
-                "date": start,
-                "end_date": end,
-                "name": label,
-                "source": "school_holidays",
-            })
-
-    # Deduplicate by (date, name)
-    seen = set()
-    unique = []
-    for h in all_holidays:
-        key = (h["date"], h["name"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(h)
-
-    # Sort by date
-    unique.sort(key=lambda x: x["date"])
-
-    cache_data = {
-        "last_updated": _fmt_ts(),
-        "holidays": unique,
-    }
-
-    cache_file.parent.mkdir(exist_ok=True)
-    with open(cache_file, "w") as f:
-        _json.dump(cache_data, f, indent=2)
-
-    logger.info(f"Holiday cache refreshed: {len(unique)} holidays")
-    return cache_data
-
-
-def fetch_public_holidays(force: bool = False) -> list:
-    """Fetch MY + SG public holidays from Nager.Date API. Cached for 24h."""
-    import json as _json
-    import urllib.request
-    import urllib.error
-    from pathlib import Path
-    from datetime import timedelta
-
-    cache_file = Path(__file__).parent / "data" / "holidays.json"
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # Check cache freshness
-    if not force and cache_file.exists():
-        try:
-            with open(cache_file) as f:
-                cache = _json.load(f)
-            fetched = cache.get("fetched_at", "")
-            if fetched:
-                fetched_dt = datetime.strptime(fetched, "%Y-%m-%d %H:%M")
-                if _now().replace(tzinfo=None) - fetched_dt < timedelta(hours=24):
-                    return cache.get("holidays", [])
-        except Exception:
-            pass  # stale or corrupt cache — re-fetch
-
-    # Fetch from API
-    holidays = []
-    current_year = _now().year
-    for year in [current_year, current_year + 1]:
-        for country, label in [("MY", "MY public holiday"), ("SG", "SG public holiday")]:
-            url = f"https://date.nager.at/api/v3/PublicHolidays/{year}/{country}"
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "CafeBot/1.0"})
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = _json.loads(resp.read().decode())
-                for h in data:
-                    holidays.append({
-                        "date": h["date"],
-                        "name": h.get("localName") or h.get("name", "Holiday"),
-                        "source": label,
-                    })
-            except Exception as e:
-                logger.warning(f"Failed to fetch holidays for {country}/{year}: {e}")
-
-    # Deduplicate by date+name
-    seen = set()
-    unique = []
-    for h in holidays:
-        key = (h["date"], h["name"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(h)
-
-    # Save cache (even if partially failed — better than nothing)
-    if unique:
-        try:
-            cache_data = {
-                "fetched_at": _now().strftime("%Y-%m-%d %H:%M"),
-                "holidays": sorted(unique, key=lambda x: x["date"]),
-            }
-            with open(cache_file, "w") as f:
-                _json.dump(cache_data, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to write holiday cache: {e}")
-        return sorted(unique, key=lambda x: x["date"])
-
-    # If fetch failed entirely, try to return stale cache
-    if cache_file.exists():
-        try:
-            with open(cache_file) as f:
-                return _json.load(f).get("holidays", [])
-        except Exception:
-            pass
-    return []
-
-
-def get_upcoming_holidays(days_ahead: int = 90) -> list:
-    """Read holiday cache + school holidays. Return holidays in the next N days."""
-    import json as _json
-    from pathlib import Path
-    from datetime import timedelta
-
-    cache_file = Path(__file__).parent / "data" / "holidays.json"
-    today = _now().date()
-    cutoff = today + timedelta(days=days_ahead)
-
-    upcoming = []
-
-    # Read cache
-    if cache_file.exists():
-        try:
-            with open(cache_file) as f:
-                cache = _json.load(f)
-            for h in cache.get("holidays", []):
-                try:
-                    h_date = datetime.strptime(h["date"], "%Y-%m-%d").date()
-                    h_end = None
-                    if h.get("end_date"):
-                        h_end = datetime.strptime(h["end_date"], "%Y-%m-%d").date()
-
-                    # Include if: single-day holiday in range, OR multi-day holiday overlaps range
-                    if h_end:
-                        if h_date <= cutoff and h_end >= today:
-                            upcoming.append(h)
-                    else:
-                        if today <= h_date <= cutoff:
-                            upcoming.append(h)
-                except (ValueError, KeyError):
-                    continue
-        except Exception as e:
-            logger.error(f"Error reading holiday cache: {e}")
-
-    # Always check school holidays from config as a fallback, regardless of
-    # whether the cache file exists or is populated. Check both the current
-    # year and the next year so holidays near a year boundary aren't missed.
-    current_year = today.year
-    next_year = current_year + 1
-    school_lists = {
-        current_year: getattr(config, f"SCHOOL_HOLIDAYS_{current_year}", []),
-        next_year: getattr(config, f"SCHOOL_HOLIDAYS_{next_year}", []),
-    }
-    for _year, school_list in school_lists.items():
-        for start, end, label in school_list:
-            try:
-                s_date = datetime.strptime(start, "%Y-%m-%d").date()
-                e_date = datetime.strptime(end, "%Y-%m-%d").date()
-                if s_date <= cutoff and e_date >= today:
-                    entry = {"date": start, "end_date": end, "name": label, "source": "school_holidays"}
-                    # Avoid duplicates
-                    if not any(h["date"] == start and h["name"] == label for h in upcoming):
-                        upcoming.append(entry)
-            except ValueError:
-                continue
-
-    # Malaysia public holidays from config (hardcoded, reliable)
-    for year in range(current_year, current_year + 2):
-        my_holidays = getattr(config, f"MY_PUBLIC_HOLIDAYS_{year}", [])
-        for h_date_str, h_name in my_holidays:
-            try:
-                h_date = datetime.strptime(h_date_str, "%Y-%m-%d").date()
-                if today <= h_date <= cutoff:
-                    entry = {"date": h_date_str, "name": h_name, "source": "MY public holiday"}
-                    if not any(h["date"] == h_date_str and h["name"] == h_name for h in upcoming):
-                        upcoming.append(entry)
-            except ValueError:
-                continue
-
-    # SG public holidays from API (Nager.Date — free, no key needed)
-    try:
-        public = fetch_public_holidays()
-        for h in public:
-            try:
-                h_date = datetime.strptime(h["date"], "%Y-%m-%d").date()
-                if today <= h_date <= cutoff:
-                    # Avoid duplicates
-                    if not any(existing["date"] == h["date"] and existing["name"] == h["name"] for existing in upcoming):
-                        upcoming.append(h)
-            except (ValueError, KeyError):
-                continue
-    except Exception as e:
-        logger.warning(f"Public holiday fetch error: {e}")
-
-    upcoming.sort(key=lambda x: x["date"])
-    return upcoming
+def money_context(month: str) -> str:
+    """Receipts and sales for a month and the one before. Owners only."""
+    y, m = int(month[:4]), int(month[5:7])
+    prev = f"{y - 1}-12" if m == 1 else f"{y}-{m - 1:02d}"
+    keep = (month, prev)
+    rec = [r for r in records("Receipts") if storage.month_of(storage.parse_date(r.get("Date")) or "") in keep]
+    items = [r for r in records("Receipt Items") if storage.month_of(storage.parse_date(r.get("Date")) or "") in keep]
+    sales = [r for r in records("Daily Sales") if storage.month_of(storage.parse_date(r.get("Date")) or "") in keep]
+
+    def rows(data, cols):
+        return table_text([cols] + [[r.get(c, "") for c in cols] for r in data], limit=1500)
+
+    return "\n\n".join([
+        f"## Receipts ({prev} and {month})\n" + rows(rec, ["Date", "Supplier", "Total (RM)", "Paid By", "Payment"]),
+        "## Receipt items\n" + rows(items, ["Date", "Supplier", "Item", "Category", "Qty", "Line Total (RM)"]),
+        "## Daily sales\n" + rows(sales, TABS["Daily Sales"][:13]),
+    ])
