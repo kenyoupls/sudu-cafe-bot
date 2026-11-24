@@ -286,8 +286,10 @@ def table_text(rows: list[list], limit: int = 400) -> str:
 
 
 def reference_context() -> str:
-    """Recipes, checklists, inspection and stock: safe for everyone."""
-    parts = [f"## {tab}\n{table_text(read_tab(tab))}" for tab in REFERENCE_TABS]
+    """Opening hours, recipes, checklists, inspection and stock: safe for everyone."""
+    import places
+    parts = ["## Café info\n" + places.as_text(places.cafe_info())]
+    parts += [f"## {tab}\n{table_text(read_tab(tab))}" for tab in REFERENCE_TABS]
     stock_rows = [[r.get("Item"), r.get("Current"), r.get("Min"), r.get("Unit"), r.get("Location")] for r in stock()]
     parts.append("## Stock (Item | Current | Min | Unit | Location)\n" + table_text(stock_rows))
     parts.append("## Shopping list (open)\n" + "\n".join(r["Item"] for _, r in shopping_open()))

@@ -1,5 +1,5 @@
 """
-Sudu CafÃ© Bot: the cafÃ©'s back-office helper on Telegram.
+Sudu Café Bot: the café's back-office helper on Telegram.
 
 Staff group:   receipt photos, POS sales photos, stock counts, shopping list,
                recipes/checklists questions. No money answers.
@@ -36,10 +36,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("sudu")
 
 HTML = ParseMode.HTML
-OWNERS_ONLY = "ðŸ”’ That's for the owners. Ask in the owners chat."
+OWNERS_ONLY = "🔒 That's for the owners. Ask in the owners chat."
 
 
-# â”€â”€â”€ Who may do what â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Who may do what ──────────────────────────────────────
 
 def is_owner(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in config.OWNER_USER_IDS)
@@ -73,19 +73,19 @@ def guarded(handler):
     async def run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not chat_allowed(update):
             if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE and update.message:
-                await update.message.reply_text(f"Hi! I'm the private helper of {config.CAFE_NAME} cafÃ©.")
+                await update.message.reply_text(f"Hi! I'm the private helper of {config.CAFE_NAME} café.")
             return
         try:
             await handler(update, ctx)
         except sheet.SheetLayoutError as e:
-            await reply(update, f"âš ï¸ {e}")
+            await reply(update, f"⚠️ {e}")
         except sheet.SheetNotConfigured:
-            await reply(update, "âš ï¸ The Google Sheet isn't connected (credentials.json missing).")
+            await reply(update, "⚠️ The Google Sheet isn't connected (credentials.json missing).")
         except ai.AIUnavailable:
-            await reply(update, "â³ The AI is busy or out of free requests right now. Try again in a minute.")
+            await reply(update, "⏳ The AI is busy or out of free requests right now. Try again in a minute.")
         except Exception:
             log.exception("Handler %s failed", handler.__name__)
-            await reply(update, "ðŸ˜• Something went wrong. Please try again; if it keeps happening, tell the owners.")
+            await reply(update, "😕 Something went wrong. Please try again; if it keeps happening, tell the owners.")
     return run
 
 
@@ -124,21 +124,22 @@ def photo_link(chat_id: int, message_id: int) -> str:
     return f"https://t.me/c/{s[4:]}/{message_id}" if s.startswith("-100") else "Telegram photo"
 
 
-# â”€â”€â”€ Help â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Help ─────────────────────────────────────────────────
 
-HELP_STAFF = """ðŸ‘‹ <b>Sudu helper</b>
+HELP_STAFF = """👋 <b>Sudu helper</b>
 
-ðŸ§¾ <b>Receipt</b>: send a photo. Check it, then tap âœ… Save.
-   Fix mistakes by replying to my message: <code>2 qty 12</code> Â· <code>2 price 7.29</code> Â· <code>paid by Ali</code> Â· <code>delete 3</code>
-ðŸ“Š <b>Daily sales</b>: send the POS closing report photo.
-ðŸ“¦ <b>Stock</b>: /stock shows what's low Â· /count shows everything
+🧾 <b>Receipt</b>: send a photo. Check it, then tap ✅ Save.
+   Fix mistakes by replying to my message: <code>2 qty 12</code> · <code>2 price 7.29</code> · <code>paid by Ali</code> · <code>delete 3</code>
+📊 <b>Daily sales</b>: send the POS closing report photo.
+📦 <b>Stock</b>: /stock shows what's low · /count shows everything
    Update: <code>stock full cream milk 120, condensed 17</code>
-ðŸ›’ <b>Shopping</b>: /buy shows the list Â· <code>buy ice, straws</code> adds items
-ðŸ“– <b>Ask</b>: /recipe cendol Â· /checklist opening Â· or /ask anything about recipes and procedures"""
+🛒 <b>Shopping</b>: /buy shows the list · <code>buy ice, straws</code> adds items
+🕐 <b>Hours</b>: /hours (live from Google)
+📖 <b>Ask</b>: /recipe cendol · /checklist opening · or /ask anything about recipes, hours and procedures"""
 
 HELP_OWNER = """
 
-ðŸ”’ <b>Owners</b>
+🔒 <b>Owners</b>
 /spend: this month's spending by category and shop
 /sales: this month's sales
 /payback: who paid for supplies and how much
@@ -160,7 +161,7 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
 
 
-# â”€â”€â”€ Photos: receipts and sales reports â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Photos: receipts and sales reports ───────────────────
 
 def _bot_mentioned(update: Update, ctx) -> bool:
     msg = update.effective_message
@@ -179,11 +180,11 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     caption = msg.caption or ""
     in_group = update.effective_chat.type != ChatType.PRIVATE
 
-    status = await msg.reply_text("ðŸ‘€ Readingâ€¦")
+    status = await msg.reply_text("👀 Reading…")
     try:
         result = await ai.read_photo(image, caption)
     except ai.AIUnavailable:
-        await status.edit_text("â³ The AI is busy or out of free requests right now. Please resend the photo in a minute.")
+        await status.edit_text("⏳ The AI is busy or out of free requests right now. Please resend the photo in a minute.")
         return
 
     if result["kind"] == "receipt" and result["receipt"]:
@@ -193,7 +194,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif in_group and not _bot_mentioned(update, ctx):
         await status.delete()  # just a normal photo in the group: stay quiet
     else:
-        await status.edit_text("ðŸ¤” That doesn't look like a receipt or a sales report. "
+        await status.edit_text("🤔 That doesn't look like a receipt or a sales report. "
                                "Try a clearer, straight-on photo with the whole receipt in view.")
 
 
@@ -202,7 +203,7 @@ async def _show_receipt(update, ctx, status, image: bytes, caption: str, result:
     r = storage.normalize_receipt(result["receipt"], who(update))
     check = storage.check_receipt(r)
     if not check["ok"]:  # second, careful read with the stronger model
-        await status.edit_text("ðŸ”Ž Numbers don't add up yet, taking a closer lookâ€¦")
+        await status.edit_text("🔎 Numbers don't add up yet, taking a closer look…")
         second = await ai.reread_receipt(image, caption, check["reason"])
         if second:
             r2 = storage.normalize_receipt(second, who(update))
@@ -214,9 +215,9 @@ async def _show_receipt(update, ctx, status, image: bytes, caption: str, result:
     photo_hash = hashlib.sha256(image).hexdigest()[:16]
     dup = await run_sync(sheet.find_duplicate, photo_hash, storage.receipt_key(r))
     text = storage.receipt_text(r, check, rid)
-    buttons = [Btn("âœ… Save", callback_data=f"rs:{rid}"), Btn("âŒ Cancel", callback_data=f"rx:{rid}")]
+    buttons = [Btn("✅ Save", callback_data=f"rs:{rid}"), Btn("❌ Cancel", callback_data=f"rx:{rid}")]
     if dup:
-        text = f"âš ï¸ <b>Looks already saved</b> as {esc(dup)}.\n\n" + text
+        text = f"⚠️ <b>Looks already saved</b> as {esc(dup)}.\n\n" + text
         buttons[0] = Btn("Save anyway", callback_data=f"rs:{rid}")
     await status.edit_text(text, parse_mode=HTML, reply_markup=InlineKeyboardMarkup([buttons]))
     pending(ctx, "receipts")[rid] = {
@@ -251,21 +252,21 @@ async def on_receipt_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "rx":
         pending(ctx, "receipts").pop(rid, None)
         await q.answer("Cancelled")
-        await q.edit_message_text("âŒ Cancelled, nothing was saved.")
+        await q.edit_message_text("❌ Cancelled, nothing was saved.")
         return
-    await q.answer("Savingâ€¦")
+    await q.answer("Saving…")
     r = p["r"]
     try:
         await run_sync(sheet.save_receipt, rid, r, p["photo"], p["by"], p["hash"])
     except Exception as e:
         log.exception("save receipt")
-        await q.message.reply_text(f"âš ï¸ Couldn't save to the Sheet: {str(e)[:150]}\nTap âœ… Save again in a minute.")
+        await q.message.reply_text(f"⚠️ Couldn't save to the Sheet: {str(e)[:150]}\nTap ✅ Save again in a minute.")
         return
     pending(ctx, "receipts").pop(rid, None)
     note = await _tick_shopping(r, who(update))
     await q.edit_message_text(
-        f"âœ… <b>Saved</b> {esc(rid)}\n{esc(r['supplier'])} Â· {esc(r['date'])} Â· <b>{rm(r['total'])}</b>\n"
-        f"{len(r['items'])} items Â· paid by {esc(r['paid_by'])} Â· saved by {esc(who(update))}{note}",
+        f"✅ <b>Saved</b> {esc(rid)}\n{esc(r['supplier'])} · {esc(r['date'])} · <b>{rm(r['total'])}</b>\n"
+        f"{len(r['items'])} items · paid by {esc(r['paid_by'])} · saved by {esc(who(update))}{note}",
         parse_mode=HTML)
 
 
@@ -281,7 +282,7 @@ async def _tick_shopping(r: dict, by: str) -> str:
                 row = next(i for i, rec in open_items if rec["Item"] == hit)
                 await run_sync(sheet.shopping_done, row, by)
                 ticked.append(hit)
-        return f"\nðŸ›’ Ticked off the shopping list: {esc(', '.join(ticked))}" if ticked else ""
+        return f"\n🛒 Ticked off the shopping list: {esc(', '.join(ticked))}" if ticked else ""
     except Exception:
         log.exception("tick shopping")
         return ""
@@ -294,21 +295,21 @@ async def _edit_receipt(update: Update, ctx, rid: str, p: dict):
     try:
         await ctx.bot.edit_message_text(
             storage.receipt_text(r, check, rid), chat_id=p["chat_id"], message_id=p["msg_id"], parse_mode=HTML,
-            reply_markup=InlineKeyboardMarkup([[Btn("âœ… Save", callback_data=f"rs:{rid}"),
-                                                Btn("âŒ Cancel", callback_data=f"rx:{rid}")]]))
+            reply_markup=InlineKeyboardMarkup([[Btn("✅ Save", callback_data=f"rs:{rid}"),
+                                                Btn("❌ Cancel", callback_data=f"rx:{rid}")]]))
     except Exception as e:  # "message is not modified" when nothing changed
         log.info("edit receipt message: %s", e)
     if problems:
-        await reply(update, "âš ï¸ " + "; ".join(esc(x) for x in problems) +
-                    "\nExamples: <code>2 qty 12</code> Â· <code>2 price 7.29</code> Â· <code>2 total 87.48</code> Â· "
-                    "<code>2 name Low Fat Milk 1L</code> Â· <code>2 cat consumables</code> Â· <code>delete 3</code> Â· "
-                    "<code>add Ice 2 x 5.00</code> Â· <code>date 12/11</code> Â· <code>shop Lotus's</code> Â· "
-                    "<code>total 152.95</code> Â· <code>paid by Ali</code>")
+        await reply(update, "⚠️ " + "; ".join(esc(x) for x in problems) +
+                    "\nExamples: <code>2 qty 12</code> · <code>2 price 7.29</code> · <code>2 total 87.48</code> · "
+                    "<code>2 name Low Fat Milk 1L</code> · <code>2 cat consumables</code> · <code>delete 3</code> · "
+                    "<code>add Ice 2 x 5.00</code> · <code>date 12/11</code> · <code>shop Lotus's</code> · "
+                    "<code>total 152.95</code> · <code>paid by Ali</code>")
     else:
-        await reply(update, "âœï¸ Updated. Check the receipt above and tap âœ… Save.")
+        await reply(update, "✏️ Updated. Check the receipt above and tap ✅ Save.")
 
 
-# â”€â”€â”€ Daily sales â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Daily sales ──────────────────────────────────────────
 
 SALES_FIELDS = {"date": "date", "total": "total_sales", "sales": "total_sales", "bills": "bills", "pax": "pax",
                 "discount": "discount", "void": "void", "refund": "refund", "cashier": "cashier"}
@@ -316,11 +317,11 @@ PAY_WORDS = ["cash", "card", "duitnow", "tng", "grab"]
 
 
 def sales_text(s: dict, sid: str) -> str:
-    lines = [f"ðŸ“Š <b>Daily sales</b> Â· {esc(s['date'])}", "",
-             f"ðŸ’° <b>Total: {rm(s.get('total_sales'))}</b>",
-             f"ðŸ§¾ Bills: {s.get('bills') or '-'}   ðŸ‘¥ Pax: {s.get('pax') or '-'}"]
+    lines = [f"📊 <b>Daily sales</b> · {esc(s['date'])}", "",
+             f"💰 <b>Total: {rm(s.get('total_sales'))}</b>",
+             f"🧾 Bills: {s.get('bills') or '-'}   👥 Pax: {s.get('pax') or '-'}"]
     for p in s.get("payments") or []:
-        lines.append(f"   â€¢ {esc(p.get('method'))}: {rm(p.get('amount'))}")
+        lines.append(f"   • {esc(p.get('method'))}: {rm(p.get('amount'))}")
     for k in ("discount", "void", "refund"):
         if storage.to_number(s.get(k)):
             lines.append(f"{k.capitalize()}: {rm(s.get(k))}")
@@ -337,12 +338,12 @@ async def _show_sales(update, ctx, status, raw: dict):
     sid = new_id("S")
     existing = await run_sync(sheet.sales_row_for, s["date"])
     text = sales_text(s, sid)
-    save_label = "âœ… Save"
+    save_label = "✅ Save"
     if existing:
-        text = f"âš ï¸ Sales for {esc(s['date'])} are already saved. Saving will <b>replace</b> them.\n\n" + text
-        save_label = "â™»ï¸ Replace"
+        text = f"⚠️ Sales for {esc(s['date'])} are already saved. Saving will <b>replace</b> them.\n\n" + text
+        save_label = "♻️ Replace"
     await status.edit_text(text, parse_mode=HTML, reply_markup=InlineKeyboardMarkup(
-        [[Btn(save_label, callback_data=f"ss:{sid}"), Btn("âŒ Cancel", callback_data=f"sx:{sid}")]]))
+        [[Btn(save_label, callback_data=f"ss:{sid}"), Btn("❌ Cancel", callback_data=f"sx:{sid}")]]))
     pending(ctx, "sales")[sid] = {"s": s, "msg_id": status.message_id, "chat_id": status.chat_id, "by": who(update)}
     _trim(pending(ctx, "sales"))
 
@@ -358,18 +359,18 @@ async def on_sales_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if action == "sx":
         await q.answer("Cancelled")
-        await q.edit_message_text("âŒ Cancelled, nothing was saved.")
+        await q.edit_message_text("❌ Cancelled, nothing was saved.")
         return
-    await q.answer("Savingâ€¦")
+    await q.answer("Saving…")
     s = p["s"]
     try:
         row = await run_sync(sheet.sales_row_for, s["date"])
         await run_sync(sheet.save_sales, s, p["by"], row)
     except Exception as e:
         pending(ctx, "sales")[sid] = p
-        await q.message.reply_text(f"âš ï¸ Couldn't save to the Sheet: {str(e)[:150]}")
+        await q.message.reply_text(f"⚠️ Couldn't save to the Sheet: {str(e)[:150]}")
         return
-    await q.edit_message_text(f"âœ… <b>Daily sales saved</b> Â· {esc(s['date'])} Â· {rm(s.get('total_sales'))}"
+    await q.edit_message_text(f"✅ <b>Daily sales saved</b> · {esc(s['date'])} · {rm(s.get('total_sales'))}"
                               f"{' (replaced)' if row else ''}", parse_mode=HTML)
 
 
@@ -393,17 +394,17 @@ async def _edit_sales(update: Update, ctx, sid: str, p: dict):
             bad.append(part.strip())
     await ctx.bot.edit_message_text(sales_text(s, sid), chat_id=p["chat_id"], message_id=p["msg_id"],
                                     parse_mode=HTML, reply_markup=InlineKeyboardMarkup(
-                                        [[Btn("âœ… Save", callback_data=f"ss:{sid}"),
-                                          Btn("âŒ Cancel", callback_data=f"sx:{sid}")]]))
-    await reply(update, ("âš ï¸ Didn't understand: " + esc("; ".join(bad))) if bad else "âœï¸ Updated. Tap âœ… Save.")
+                                        [[Btn("✅ Save", callback_data=f"ss:{sid}"),
+                                          Btn("❌ Cancel", callback_data=f"sx:{sid}")]]))
+    await reply(update, ("⚠️ Didn't understand: " + esc("; ".join(bad))) if bad else "✏️ Updated. Tap ✅ Save.")
 
 
-# â”€â”€â”€ Stock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Stock ────────────────────────────────────────────────
 
 def _stock_line(r: dict) -> str:
     unit = f" {r['Unit']}" if r.get("Unit") else ""
     mn = f" (min {storage.qty_text(r['Min'])})" if storage.to_number(r.get("Min")) is not None else ""
-    return f"â€¢ {esc(r['Item'])}: <b>{storage.qty_text(r.get('Current')) if r.get('Current') != '' else '?'}</b>{esc(unit)}{mn}"
+    return f"• {esc(r['Item'])}: <b>{storage.qty_text(r.get('Current')) if r.get('Current') != '' else '?'}</b>{esc(unit)}{mn}"
 
 
 @guarded
@@ -415,13 +416,13 @@ async def cmd_stock(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = await run_sync(sheet.stock)
     out = [r for r in rows if storage.stock_status(r.get("Current"), r.get("Min")) == "out"]
     low = [r for r in rows if storage.stock_status(r.get("Current"), r.get("Min")) == "low"]
-    lines = ["ðŸ“¦ <b>Stock</b>"]
+    lines = ["📦 <b>Stock</b>"]
     if out:
-        lines += ["", "ðŸ”´ <b>Out</b>"] + [_stock_line(r) for r in out]
+        lines += ["", "🔴 <b>Out</b>"] + [_stock_line(r) for r in out]
     if low:
-        lines += ["", "ðŸŸ¡ <b>Low</b>"] + [_stock_line(r) for r in low]
+        lines += ["", "🟡 <b>Low</b>"] + [_stock_line(r) for r in low]
     if not out and not low:
-        lines.append("\nâœ… Nothing is low.")
+        lines.append("\n✅ Nothing is low.")
     lines.append("\n/count shows every item. Update with e.g. <code>stock full cream milk 120, condensed 17</code>")
     await reply(update, "\n".join(lines))
 
@@ -432,7 +433,7 @@ async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     groups: dict[str, list] = {}
     for r in rows:
         groups.setdefault(r.get("Location") or "Other", []).append(r)
-    lines = ["ðŸ“‹ <b>Stock count</b>: reply with new numbers, e.g. <code>stock milk 120, cups 400</code>"]
+    lines = ["📋 <b>Stock count</b>: reply with new numbers, e.g. <code>stock milk 120, cups 400</code>"]
     for loc, items in groups.items():
         lines += ["", f"<b>{esc(loc)}</b>"] + [_stock_line(r) for r in items]
     await reply(update, "\n".join(lines))
@@ -444,20 +445,20 @@ async def _stock_update(update: Update, ctx, text: str):
     current = {r["Item"]: r.get("Current") for r in rows}
     updates = await ai.parse_stock(text, known)
     if not updates:
-        await reply(update, "ðŸ¤” I couldn't find any item + number. Example: <code>stock full cream milk 120</code>")
+        await reply(update, "🤔 I couldn't find any item + number. Example: <code>stock full cream milk 120</code>")
         return
     sid = new_id("K")
-    lines = ["ðŸ“¦ <b>Update stock?</b>", ""]
+    lines = ["📦 <b>Update stock?</b>", ""]
     for u in updates:
         if u["item"] in current:
             old = current[u["item"]]
-            lines.append(f"â€¢ {esc(u['item'])}: {storage.qty_text(old) if old != '' else '?'} â†’ <b>{storage.qty_text(u['qty'])}</b>")
+            lines.append(f"• {esc(u['item'])}: {storage.qty_text(old) if old != '' else '?'} → <b>{storage.qty_text(u['qty'])}</b>")
         else:
-            lines.append(f"â€¢ ðŸ†• {esc(u['item'])}: <b>{storage.qty_text(u['qty'])}</b> <i>(new item)</i>")
+            lines.append(f"• 🆕 {esc(u['item'])}: <b>{storage.qty_text(u['qty'])}</b> <i>(new item)</i>")
     pending(ctx, "stock")[sid] = {"updates": updates, "by": who(update)}
     _trim(pending(ctx, "stock"))
     await reply(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(
-        [[Btn("âœ… Update", callback_data=f"ks:{sid}"), Btn("âŒ Cancel", callback_data=f"kx:{sid}")]]))
+        [[Btn("✅ Update", callback_data=f"ks:{sid}"), Btn("❌ Cancel", callback_data=f"kx:{sid}")]]))
 
 
 @guarded
@@ -471,9 +472,9 @@ async def on_stock_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if action == "kx":
         await q.answer("Cancelled")
-        await q.edit_message_text("âŒ Cancelled, stock not changed.")
+        await q.edit_message_text("❌ Cancelled, stock not changed.")
         return
-    await q.answer("Updatingâ€¦")
+    await q.answer("Updating…")
     done, unknown = await run_sync(sheet.update_stock, p["updates"], who(update))
     for u in unknown:
         await run_sync(sheet.add_stock_item, u["item"], u["qty"], who(update))
@@ -482,13 +483,13 @@ async def on_stock_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     need = [r["Item"] for r in rows if storage.name_key(r["Item"]) in changed
             and storage.stock_status(r.get("Current"), r.get("Min")) in ("low", "out")]
     added = await run_sync(sheet.shopping_add, need, "Stock check", "low stock") if need else []
-    text = f"âœ… Stock updated: {len(done)} item(s)" + (f", {len(unknown)} new" if unknown else "")
+    text = f"✅ Stock updated: {len(done)} item(s)" + (f", {len(unknown)} new" if unknown else "")
     if added:
-        text += f"\nðŸ›’ Added to shopping list: {esc(', '.join(added))}"
+        text += f"\n🛒 Added to shopping list: {esc(', '.join(added))}"
     await q.edit_message_text(text, parse_mode=HTML)
 
 
-# â”€â”€â”€ Shopping list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Shopping list ────────────────────────────────────────
 
 @guarded
 async def cmd_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -497,11 +498,11 @@ async def cmd_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     items = await run_sync(sheet.shopping_open)
     if not items:
-        await reply(update, "ðŸ›’ The shopping list is empty. Add with <code>buy ice, straws</code>")
+        await reply(update, "🛒 The shopping list is empty. Add with <code>buy ice, straws</code>")
         return
-    rows = [[Btn(f"âœ… {r['Item'][:40]}" + (f" ({r['Note'][:20]})" if r.get("Note") else ""),
+    rows = [[Btn(f"✅ {r['Item'][:40]}" + (f" ({r['Note'][:20]})" if r.get("Note") else ""),
                  callback_data=f"bd:{i}")] for i, r in items[:40]]
-    await reply(update, f"ðŸ›’ <b>Shopping list</b> ({len(items)})\nTap an item when it's bought.",
+    await reply(update, f"🛒 <b>Shopping list</b> ({len(items)})\nTap an item when it's bought.",
                 reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -509,7 +510,7 @@ async def _shopping_add(update: Update, text: str):
     names = [storage.clean_name(x) for x in re.split(r"[\n,;]+", text) if storage.clean_name(x)]
     added = await run_sync(sheet.shopping_add, names, who(update))
     skipped = len(names) - len(added)
-    msg = f"ðŸ›’ Added: {esc(', '.join(added))}" if added else "ðŸ›’ Nothing new to add."
+    msg = f"🛒 Added: {esc(', '.join(added))}" if added else "🛒 Nothing new to add."
     if skipped:
         msg += f"\n({skipped} already on the list)"
     await reply(update, msg)
@@ -520,15 +521,15 @@ async def on_buy_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     row = int(q.data.split(":", 1)[1])
     item = await run_sync(sheet.shopping_done, row, who(update))
-    await q.answer(f"âœ… {item} bought")
+    await q.answer(f"✅ {item} bought")
     items = await run_sync(sheet.shopping_open)
-    rows = [[Btn(f"âœ… {r['Item'][:40]}", callback_data=f"bd:{i}")] for i, r in items[:40]]
+    rows = [[Btn(f"✅ {r['Item'][:40]}", callback_data=f"bd:{i}")] for i, r in items[:40]]
     await q.edit_message_text(
-        f"ðŸ›’ <b>Shopping list</b> ({len(items)})\nâœ”ï¸ {esc(item)} bought by {esc(who(update))}",
+        f"🛒 <b>Shopping list</b> ({len(items)})\n✔️ {esc(item)} bought by {esc(who(update))}",
         parse_mode=HTML, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 
-# â”€â”€â”€ Recipes, checklists, questions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Recipes, checklists, questions ───────────────────────
 
 @guarded
 async def cmd_recipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -537,24 +538,24 @@ async def cmd_recipe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     other = await run_sync(sheet.read_tab, "Other Recipes")
     names = sorted({r[0] for r in bingsu[1:] if r} | {r[1] for r in other[1:] if len(r) > 1})
     if not want:
-        await reply(update, "ðŸ“– Recipes: " + esc(", ".join(names)) + "\nExample: <code>/recipe cendol</code>")
+        await reply(update, "📖 Recipes: " + esc(", ".join(names)) + "\nExample: <code>/recipe cendol</code>")
         return
     hit = storage.match_name(want, names, cutoff=0.6)
     if not hit:
-        await reply(update, f"ðŸ¤” No recipe called â€œ{esc(want)}â€. Try: " + esc(", ".join(names[:30])))
+        await reply(update, f"🤔 No recipe called “{esc(want)}”. Try: " + esc(", ".join(names[:30])))
         return
-    lines = [f"ðŸ“– <b>{esc(hit)}</b>"]
+    lines = [f"📖 <b>{esc(hit)}</b>"]
     batch = None
     for r in bingsu[1:]:
         if r and r[0] == hit:
             if r[1] != batch:
                 batch = r[1]
                 lines.append(f"\n<b>{esc(batch)}</b>")
-            lines.append(f"â€¢ {esc(r[2])}: {esc(r[3])}")
+            lines.append(f"• {esc(r[2])}: {esc(r[3])}")
     method = []
     for r in other[1:]:
         if len(r) > 4 and r[1] == hit:
-            lines.append(f"â€¢ {esc(r[3])}: {esc(r[4])}")
+            lines.append(f"• {esc(r[3])}: {esc(r[4])}")
             if len(r) > 5 and r[5] and r[5] not in method:
                 method.append(r[5])
     if method:
@@ -569,11 +570,27 @@ async def cmd_checklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     want = storage.name_key(" ".join(ctx.args or []))
     hit = storage.match_name(want, kinds, cutoff=0.6) if want else None
     if not hit:
-        await reply(update, "âœ… Checklists: " + esc(", ".join(kinds)) + "\nExample: <code>/checklist opening</code>")
+        await reply(update, "✅ Checklists: " + esc(", ".join(kinds)) + "\nExample: <code>/checklist opening</code>")
         return
     steps = [r for r in rows[1:] if r and r[0] == hit]
-    await reply(update, f"âœ… <b>{esc(hit.capitalize())} checklist</b>\n" +
+    await reply(update, f"✅ <b>{esc(hit.capitalize())} checklist</b>\n" +
                 "\n".join(f"{esc(r[1])}. {esc(r[2])}" for r in steps))
+
+
+@guarded
+async def cmd_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import places
+    info = await run_sync(places.cafe_info)
+    if not info:
+        await reply(update, "🕐 Opening hours aren't connected (Google Places key or place ID missing in .env).")
+        return
+    lines = ["🕐 <b>Opening hours</b> <i>(live from Google)</i>"]
+    if info["open_now"] is not None:
+        lines.append("🟢 Open now" if info["open_now"] else "🔴 Closed now")
+    lines += [""] + [esc(h) for h in info["hours"]]
+    if info["regular"] and info["regular"] != info["hours"]:
+        lines += ["", "<i>Usual hours:</i>"] + [esc(h) for h in info["regular"]]
+    await reply(update, "\n".join(lines))
 
 
 @guarded
@@ -595,7 +612,7 @@ async def _answer(update: Update, question: str):
     await reply(update, esc(text))
 
 
-# â”€â”€â”€ Owner reports â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Owner reports ────────────────────────────────────────
 
 def owners_only(handler):
     @wraps(handler)
@@ -613,10 +630,10 @@ async def cmd_payback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     month = storage.parse_month(" ".join(ctx.args or []))
     totals = storage.payback(await run_sync(sheet.records, "Receipts"), month)
     if not totals:
-        await reply(update, f"ðŸ’¸ No receipts saved for {month}.")
+        await reply(update, f"💸 No receipts saved for {month}.")
         return
-    lines = [f"ðŸ’¸ <b>Who paid for supplies Â· {month}</b>", ""]
-    lines += [f"â€¢ {esc(k)}: <b>{rm(v)}</b>" for k, v in totals.items()]
+    lines = [f"💸 <b>Who paid for supplies · {month}</b>", ""]
+    lines += [f"• {esc(k)}: <b>{rm(v)}</b>" for k, v in totals.items()]
     lines.append(f"\nTotal: <b>{rm(sum(totals.values()))}</b>")
     await reply(update, "\n".join(lines))
 
@@ -631,11 +648,11 @@ async def cmd_spend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     by_shop = storage.sum_by(receipts, month, "Supplier", "Total (RM)")
     total = sum(by_shop.values())
     if not total:
-        await reply(update, f"ðŸ§¾ No spending saved for {month}.")
+        await reply(update, f"🧾 No spending saved for {month}.")
         return
-    lines = [f"ðŸ§¾ <b>Spending Â· {month}</b>: <b>{rm(total)}</b>", "", "<b>By category</b>"]
-    lines += [f"â€¢ {esc(k)}: {rm(v)}" for k, v in by_cat.items()]
-    lines += ["", "<b>Top shops</b>"] + [f"â€¢ {esc(k)}: {rm(v)}" for k, v in list(by_shop.items())[:8]]
+    lines = [f"🧾 <b>Spending · {month}</b>: <b>{rm(total)}</b>", "", "<b>By category</b>"]
+    lines += [f"• {esc(k)}: {rm(v)}" for k, v in by_cat.items()]
+    lines += ["", "<b>Top shops</b>"] + [f"• {esc(k)}: {rm(v)}" for k, v in list(by_shop.items())[:8]]
     await reply(update, "\n".join(lines))
 
 
@@ -646,13 +663,13 @@ async def cmd_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = [r for r in await run_sync(sheet.records, "Daily Sales")
             if storage.month_of(storage.parse_date(r.get("Date")) or "") == month]
     if not rows:
-        await reply(update, f"ðŸ“Š No daily sales saved for {month}.")
+        await reply(update, f"📊 No daily sales saved for {month}.")
         return
     totals = [(storage.parse_date(r["Date"]), storage.to_number(r.get("Total Sales (RM)")) or 0) for r in rows]
     total = sum(t for _, t in totals)
     best = max(totals, key=lambda x: x[1])
     spend = sum(storage.sum_by(await run_sync(sheet.records, "Receipts"), month, "Supplier", "Total (RM)").values())
-    await reply(update, f"ðŸ“Š <b>Sales Â· {month}</b>\n\n"
+    await reply(update, f"📊 <b>Sales · {month}</b>\n\n"
                         f"Total: <b>{rm(total)}</b> over {len(totals)} days\n"
                         f"Average day: {rm(total / len(totals))}\n"
                         f"Best day: {best[0]} ({rm(best[1])})\n"
@@ -660,7 +677,7 @@ async def cmd_sales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         f"<i>Sales minus supplies: {rm(total - spend)} (before rent, wages, etc.)</i>")
 
 
-# â”€â”€â”€ Plain text: corrections, stock, shopping, questions â”€â”€
+# ─── Plain text: corrections, stock, shopping, questions ──
 
 @guarded
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -693,7 +710,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _answer(update, text)
 
 
-# â”€â”€â”€ Start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Start ────────────────────────────────────────────────
 
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
@@ -711,6 +728,7 @@ def main():
     app.add_handler(CommandHandler("recipe", cmd_recipe))
     app.add_handler(CommandHandler("checklist", cmd_checklist))
     app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler(["hours", "open"], cmd_hours))
     app.add_handler(CommandHandler("payback", cmd_payback))
     app.add_handler(CommandHandler(["spend", "expenses"], cmd_spend))
     app.add_handler(CommandHandler("sales", cmd_sales))

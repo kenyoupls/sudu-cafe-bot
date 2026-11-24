@@ -57,6 +57,10 @@ GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
 AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "60"))
 
+# ─── Google Places (live opening hours from your Google listing) ──
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
+GOOGLE_PLACE_ID = os.getenv("GOOGLE_PLACE_ID", "")
+
 # ─── Café ─────────────────────────────────────────────────
 CAFE_NAME = os.getenv("CAFE_NAME", "Sudu")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kuala_Lumpur")
